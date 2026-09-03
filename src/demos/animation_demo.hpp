@@ -179,6 +179,7 @@ void test_animation_demo() {
     bool paused = false;
     bool muted = false;
     float step_cooldown = 0.0f;
+    float rumble = 0.0f;
 
     while (!window.should_close) {
         pix_update_window(window);
@@ -190,9 +191,32 @@ void test_animation_demo() {
         if (dt > 0.1f) dt = 0.1f;
         fps += ((dt > 0.0f ? 1.0f / dt : fps) - fps) * 0.1f;
         if (step_cooldown > 0.0f) step_cooldown -= dt;
+        if (rumble > 0.0f) {
+            rumble -= dt * 2.2f;
+            if (rumble < 0.0f) rumble = 0.0f;
+            pix_set_gamepad_rumble(window, 0, rumble * 0.6f, rumble);
+        }
 
-        // --- input ---
-        if (window.keystates[(int)' '].pressed) paused = !paused;
+        // --- input (keyboard + pad 0) ---
+        const pix_gamepad& gp = window.gamepads[0];
+        if (window.keystates[(int)' '].pressed || gp.buttons[PAD_A].pressed) paused = !paused;
+        if (gp.buttons[PAD_Y].pressed) {
+            muted = !muted;
+            set_master_volume(audio, muted ? 0.0f : 0.7f);
+        }
+        // bumpers step through the clips
+        int pad_clip = -1;
+        if (gp.buttons[PAD_RIGHT_BUMPER].pressed) pad_clip = (int)((actors[0].anim.clip + 1) % 3);
+        if (gp.buttons[PAD_LEFT_BUMPER].pressed)  pad_clip = (int)((actors[0].anim.clip + 2) % 3);
+        if (pad_clip >= 0) {
+            for (size_t i = 0; i < actor_count; i++)
+                if ((size_t)pad_clip < actors[i].anim.clip_count) {
+                    animator_play(actors[i].anim, (idx)pad_clip);
+                    actors[i].last_step = -1;
+                }
+            play_sound(audio, snd_chime, 1.0f);
+        }
+
         if (window.keystates[(int)'M'].pressed) {
             muted = !muted;
             set_master_volume(audio, muted ? 0.0f : 0.7f);
@@ -207,17 +231,27 @@ void test_animation_demo() {
                 play_sound(audio, snd_chime, 1.0f, 1.0f + (float)k * 0.06f);
             }
 
+        // right stick orbits; falls back to a slow drift when nothing is driving it
+        bool steering = false;
         if (window.keystates[MOUSE_BUTTON_LEFT].held) {
             yaw   += window.mouse_rel_x * 0.005f;
             pitch += window.mouse_rel_y * 0.005f;
-        } else {
-            yaw += dt * 0.15f;
+            steering = true;
         }
+        if (gp.right_x != 0.0f || gp.right_y != 0.0f) {
+            yaw   += gp.right_x * dt * 2.5f;
+            pitch -= gp.right_y * dt * 1.8f;      // stick up tilts the camera up
+            steering = true;
+        }
+        if (!steering) yaw += dt * 0.15f;
         if (pitch < 0.10f) pitch = 0.10f;
         if (pitch > 1.35f) pitch = 1.35f;
         if (window.keystates[KEY_UP].held)   dist -= dt * 300.0f;
         if (window.keystates[KEY_DOWN].held) dist += dt * 300.0f;
+        dist -= gp.right_trigger * dt * 320.0f;   // triggers zoom
+        dist += gp.left_trigger  * dt * 320.0f;
         if (dist < 80.0f) dist = 80.0f;
+        if (dist > 1400.0f) dist = 1400.0f;
 
         // --- animate, and fire a footstep whenever a stride passes a footfall ---
         if (!paused) {
@@ -241,6 +275,7 @@ void test_animation_demo() {
                 if (pan < -1.0f) pan = -1.0f;
                 if (pan >  1.0f) pan =  1.0f;
                 play_sound(audio, snd_step, 0.80f, a.sound_pitch, false, pan);
+                rumble = 0.28f;                              // a light tap, decayed below
             }
         }
 
@@ -273,18 +308,20 @@ void test_animation_demo() {
         char buf[288];
         snprintf(buf, sizeof(buf),
             "%.0f fps   %zu actors   fox %zu bones / man %zu bones   clip '%s'  %.2f/%.2fs%s\n"
-            "audio %s   %zu voices%s   |   1/2/3 clip   space pause   m mute   drag orbit   up/down zoom",
+            "audio %s   %zu voices%s   |   pad: %s   |   1/2/3 clip   space pause   m mute   drag orbit",
             fps, actor_count,
             have_fox ? get_model_skeleton(loader, fox_model)->bone_count : (size_t)0,
             have_man ? get_model_skeleton(loader, man_model)->bone_count : (size_t)0,
             animator_clip_name(lead, lead.clip), lead.time, animator_duration(lead, lead.clip),
             paused ? "   [PAUSED]" : "",
-            audio_ok ? "on" : "unavailable", active_voice_count(audio), muted ? "   [MUTED]" : "");
+            audio_ok ? "on" : "unavailable", active_voice_count(audio), muted ? "   [MUTED]" : "",
+            gp.connected ? "connected (stick orbit, triggers zoom, A pause, LB/RB clip)" : "none");
         hud.position = { 16.0f, 30.0f };
         pix_update_text(hud, buf);
         draw_text(hud, text_shader, ui_proj);
     }
 
+    pix_stop_gamepad_rumble(window);
     pix_destroy_audio(audio);
     pix_destroy_text(hud);
     pix_free_font(hud_font);

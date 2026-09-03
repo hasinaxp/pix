@@ -105,16 +105,60 @@ struct pix_window {
     pix_key_state keystates[256];  // ascii-indexed; mouse/special keys use the codes above
     int mouse_x, mouse_y, mouse_rel_x, mouse_rel_y;
     bool should_close;
+    pix_gamepad gamepads[PIX_MAX_GAMEPADS];   // PIX_MAX_GAMEPADS == 4
 };
 
 pix_window pix_create_window(const char* title, int width, int height);
     // creates a 4.4 core-profile context, shows the window
 void pix_update_window(pix_window& window);
-    // swaps buffers, refreshes pressed/released/held, pumps the message loop
+    // swaps buffers, refreshes pressed/released/held, pumps messages, polls pads
 ```
 
 Call once per frame: `pix_update_window` **swaps first, then pumps**, so it belongs at
 the very top of the loop, before reading `keystates`.
+
+### gamepads
+
+XInput, resolved at runtime from `xinput1_4 / 1_3 / 9_1_0.dll`, so there is no link
+dependency and a machine without it simply reports no pads.
+
+```cpp
+#define PAD_A 0  PAD_B 1  PAD_X 2  PAD_Y 3
+#define PAD_LEFT_BUMPER 4  PAD_RIGHT_BUMPER 5  PAD_BACK 6  PAD_START 7
+#define PAD_LEFT_STICK 8   PAD_RIGHT_STICK 9   // sticks pressed in
+#define PAD_DPAD_UP 10  PAD_DPAD_DOWN 11  PAD_DPAD_LEFT 12  PAD_DPAD_RIGHT 13
+#define PAD_BUTTON_COUNT 14
+
+struct pix_gamepad {
+    bool connected;
+    pix_key_state buttons[PAD_BUTTON_COUNT];  // same edges as keystates
+    float left_x, left_y, right_x, right_y;   // -1..1, radial deadzone applied, +y is up
+    float left_trigger, right_trigger;        // 0..1
+    float rumble_low, rumble_high;            // last values sent to the motors
+};
+
+void pix_set_gamepad_rumble(pix_window&, int pad, float low, float high);  // 0..1, held until changed
+void pix_stop_gamepad_rumble(pix_window&);                                 // all pads
+```
+
+Read it exactly like the keyboard:
+
+```cpp
+const pix_gamepad& gp = window.gamepads[0];
+if (gp.connected && gp.buttons[PAD_A].pressed) jump();
+yaw += gp.right_x * dt * 2.5f;
+```
+
+Notes:
+
+- **Radial deadzone**, not per-axis: the dead area is removed by magnitude and the
+  remainder rescaled to 0..1, so direction is preserved and a full diagonal lands on
+  the unit circle rather than feeling square.
+- **Hot-plug works**, but an unplugged XInput slot is expensive to query, so empty
+  slots are only re-probed every 2s. A pad plugged in mid-game is picked up within
+  that window; connected pads are polled every frame as normal.
+- Unplugging a pad releases its held buttons and zeroes its axes, so nothing sticks.
+- Rumble calls on a disconnected or out-of-range pad are safe no-ops.
 
 ---
 
