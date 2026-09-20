@@ -19,11 +19,28 @@ struct vertex_rigged {
     vec4 bone_weights;  // normalized, sums to 1
 };
 
+// A named `g`/`o` run inside one OBJ file: a contiguous slice of the emitted
+// vertices, plus the centre of its own bounds so the part can be pulled out
+// and rotated about itself. Anything with a moving part authored in place -
+// a wheel, a turret, a door - is shaped like this.
+struct mesh_group {
+    char   name[48];
+    size_t vertex_offset;
+    size_t vertex_count;
+    vec3   pivot;
+};
+
 struct mesh_file_data {
     size_t   vertex_count;
     vertex*  vertex_data;
     size_t   index_count;
     uint16_t* index_data;
+
+    size_t      group_count;
+    mesh_group* groups;
+
+    vec3 bounds_min;   // model space, before any placement scale
+    vec3 bounds_max;
 };
 
 struct image_file_data {
@@ -102,4 +119,19 @@ struct model_file_data {
     int32_t first_animation;
     size_t  animation_count;
     int32_t image;                  // embedded base colour texture, -1 if absent/undecodable
+    // `image` is a generated colour palette (one cell per material) rather than
+    // a uv-mapped texture, so it must be sampled with NEAREST or neighbouring
+    // cells bleed into each other
+    bool    image_is_palette;
+    // Where a single-node load's geometry stood in the file it came out of.
+    //
+    // A one-node load is re-based on that node's own origin (see
+    // gltf_load_file) so a prop pulled out of a gallery row does not arrive
+    // still offset by where it was parked next to its siblings. That is the
+    // right default and it throws away the one thing a caller assembling a
+    // model out of several of its own nodes needs: a part has to go back on
+    // the spot it came off. This is that translation, kept rather than
+    // discarded. Zero for a whole-file load, where it is baked into the
+    // vertices instead.
+    vec3    node_offset;
 };

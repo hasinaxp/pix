@@ -1,4 +1,5 @@
 #pragma once
+#include <stdio.h>
 #include <windows.h>
 #include "dtype.hpp"
 #include "opengl_api.hpp"
@@ -6,6 +7,23 @@
 #define TEXTURE_PIXELATED 1
 #define TEXTURE_LINEAR    2
 #define TEXTURE_BILINEAR  3 // linear + mipmaps
+
+// A shader that will not build is fatal to the frame, so it is reported three
+// ways: to stderr, which is all an unattended run can see; to a file, which
+// survives the process; and in a message box for somebody sitting in front of
+// it.
+//
+// The box alone was actively misleading. An unattended run would sit on it for
+// as long as it was given, looking exactly like a hang, with the reason waiting
+// behind a window nobody was there to click. Printing first means the log says
+// what happened either way.
+static void opengl__shader_failed(const char* what, const char* log) {
+    fprintf(stderr, "%s\n%s\n", what, log);
+    fflush(stderr);
+    FILE* f = fopen("shader_error.txt", "a");
+    if (f) { fprintf(f, "%s\n%s\n\n", what, log); fclose(f); }
+    MessageBoxA(0, log, what, MB_OK);
+}
 
 static idx opengl__compile(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -16,7 +34,7 @@ static idx opengl__compile(GLenum type, const char* src) {
     if (!ok) {
         char log[1024] = {};
         glGetShaderInfoLog(s, sizeof(log), 0, log);
-        MessageBoxA(0, log, "shader compile error", MB_OK);
+        opengl__shader_failed("shader compile error", log);
     }
     return s;
 }
@@ -33,7 +51,7 @@ static idx opengl_create_shader(const char* vsrc, const char* fsrc) {
     if (!ok) {
         char log[1024] = {};
         glGetProgramInfoLog(p, sizeof(log), 0, log);
-        MessageBoxA(0, log, "shader link error", MB_OK);
+        opengl__shader_failed("shader link error", log);
     }
     glDeleteShader(v);
     glDeleteShader(f);

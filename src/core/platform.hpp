@@ -25,6 +25,29 @@ struct pix_key_state {
 #define KEY_RIGHT 204
 #define KEY_ESC   205
 #define KEY_TAB   206
+// VK_OEM_4 / VK_OEM_6 on a US layout; remapped out of the OEM range so a key
+// code never collides with an ascii letter
+#define KEY_LEFT_BRACKET  207
+#define KEY_RIGHT_BRACKET 208
+// function keys already land on their own VK codes (see pix__map_vk's
+// passthrough); these just give the commonly bound ones names
+#define KEY_F1 0x70
+#define KEY_F2 0x71
+#define KEY_F3 0x72
+#define KEY_F4 0x73
+#define KEY_F5 0x74
+#define KEY_F6 0x75
+#define KEY_F7 0x76
+#define KEY_F8 0x77
+#define KEY_F9 0x78
+#define KEY_F10 0x79
+#define KEY_F11 0x7A
+#define KEY_F12 0x7B
+#define KEY_RETURN 0x0D
+// these keep their windows virtual key codes, which pix__map_vk passes through
+#define KEY_SHIFT 16
+#define KEY_CTRL  17
+#define KEY_SPACE 32
 
 // ---- gamepads ----
 // XInput, resolved at runtime so there is no link dependency and a machine
@@ -68,6 +91,8 @@ struct pix_window {
     pix_key_state keystates[256];   // ascii-indexed; mouse buttons + special keys use the codes above
     int mouse_x;      int mouse_y;
     int mouse_rel_x;  int mouse_rel_y;
+    int mouse_wheel;                 // notches this frame, +1 per detent forward; see WM_MOUSEWHEEL
+    bool mouse_captured;            // cursor hidden and re-centred every frame
     bool should_close;
 
     pix_gamepad gamepads[PIX_MAX_GAMEPADS];
@@ -76,6 +101,17 @@ struct pix_window {
 static pix_window pix_create_window(const char* title, int width, int height);
 static void pix_update_window(pix_window& window);   // pump events + refresh input state
 static void pix_swap_buffers(pix_window& window);
+
+// Hides the cursor and warps it back to the middle of the client area after
+// every frame, so mouse_rel keeps accumulating without the pointer ever
+// reaching a screen edge - what a mouselook camera needs.
+static void pix_set_mouse_capture(pix_window& window, bool captured);
+
+// Buffer swap pacing. Off means the frame rate is uncapped, which is what you
+// want while measuring - vsync pins a scene that would run at 150fps to a flat
+// 60 and it reads exactly like a real bottleneck. On is what a shipped game
+// wants. The window starts uncapped; call this to change it.
+static void pix_set_vsync(pix_window& window, bool enabled);
 
 // low = the heavy motor, high = the light one; both 0..1, held until changed
 static void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float high);
@@ -97,6 +133,9 @@ static void pix_stop_gamepad_rumble(pix_window& window);   // all pads, e.g. on 
 
 typedef HGLRC(WINAPI* PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int*);
 typedef BOOL (WINAPI* PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int*, const FLOAT*, UINT, int*, UINT*);
+typedef BOOL (WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int);
+// resolved once the real context exists; null on a driver without the extension
+static PFNWGLSWAPINTERVALEXTPROC pix__swap_interval;
 
 
 // -------------------- implementation --------------------
@@ -263,6 +302,8 @@ static int pix__map_vk(int vk) {
         case VK_RIGHT:  return KEY_RIGHT;
         case VK_ESCAPE: return KEY_ESC;
         case VK_TAB:    return KEY_TAB;
+        case VK_OEM_4:  return KEY_LEFT_BRACKET;
+        case VK_OEM_6:  return KEY_RIGHT_BRACKET;
     }
     if (vk > 0 && vk < 253) return vk; // letters/digits land on their ascii code
     return -1;
@@ -302,6 +343,10 @@ static LRESULT CALLBACK pix__wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_MID);   return 0;
         case WM_MBUTTONUP:   pix__key_up  (w, MOUSE_BUTTON_MID);   return 0;
 
+        case WM_MOUSEWHEEL:
+            w->mouse_wheel += GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            return 0;
+
         case WM_MOUSEMOVE: {
             int nx = GET_X_LPARAM(lp);
             int ny = GET_Y_LPARAM(lp);
@@ -322,7 +367,7 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     wc.lpfnWndProc = pix__wndproc;
     wc.hInstance = GetModuleHandleA(0);
     wc.lpszClassName = "pix_window_class";
-    wc.hCursor = LoadCursorA(0, IDC_ARROW);
+    wc.hCursor = LoadCursor(0, IDC_ARROW);
     RegisterClassA(&wc);
 
     // dummy context so we can resolve the modern WGL entry points
@@ -386,6 +431,12 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     win.gl_context = rc;
     wglMakeCurrent(win.dc, rc);
 
+    // The driver's default is vsync on; start uncapped so a fresh window
+    // reports what the engine actually costs rather than what the monitor
+    // allows. pix_set_vsync puts it back.
+    pix__swap_interval = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
+    pix_set_vsync(win, false);
+
     ShowWindow(win.handle, SW_SHOW);
 
     pix__load_xinput();   // absent xinput just means no pads are ever reported
@@ -399,6 +450,17 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     return win;
 }
 
+static void pix_set_vsync(pix_window& window, bool enabled) {
+    (void)window;   // one context per window here, and it is already current
+    if (pix__swap_interval) pix__swap_interval(enabled ? 1 : 0);
+}
+
+static void pix_set_mouse_capture(pix_window& window, bool captured) {
+    if (window.mouse_captured == captured) return;
+    window.mouse_captured = captured;
+    ShowCursor(captured ? FALSE : TRUE);
+}
+
 static void pix_update_window(pix_window& window) {
     // clear per-frame edges before draining this frame's events
     SwapBuffers(window.dc);
@@ -409,6 +471,7 @@ static void pix_update_window(pix_window& window) {
     }
     window.mouse_rel_x = 0;
     window.mouse_rel_y = 0;
+    window.mouse_wheel = 0;
 
     pix__active = &window;
     MSG msg;
@@ -419,5 +482,18 @@ static void pix_update_window(pix_window& window) {
     pix__active = 0;
 
     pix__update_gamepads(window);   // polled, not message driven
+
+    // Re-centre last: the deltas above were measured against the previous
+    // centre, and moving the pointer now also moves the reference point, so
+    // the warp itself never shows up as motion.
+    if (window.mouse_captured && GetForegroundWindow() == window.handle) {
+        RECT rc;
+        GetClientRect(window.handle, &rc);
+        POINT centre = { (rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2 };
+        window.mouse_x = centre.x;
+        window.mouse_y = centre.y;
+        ClientToScreen(window.handle, &centre);
+        SetCursorPos(centre.x, centre.y);
+    }
 }
 

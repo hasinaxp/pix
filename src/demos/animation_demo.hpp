@@ -291,14 +291,14 @@ void test_animation_demo() {
         pix_render_instance ground = {};
         ground.mesh = ground_mesh;
         ground.material = ground_mat;
-        ground.trainsform = mat4_identity();
+        ground.transform = mat4_identity();
         push_instance(renderer, ground);
 
         for (size_t i = 0; i < actor_count; i++) {
             pix_render_instance inst = {};
             inst.mesh = actors[i].mesh;
             inst.material = actors[i].material;
-            inst.trainsform = actors[i].transform;
+            inst.transform = actors[i].transform;
             push_animated_instance(renderer, inst, actors[i].anim.pose);
         }
 

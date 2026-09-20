@@ -2,6 +2,36 @@
 #include <math.h>
 #include "dtype.hpp"
 
+// ---- SSE, where the compiler offers it ----
+//
+// Only one thing in this file is worth hand-vectorising, and it is
+// mat4_mul: a character rig is sixty-odd bones deep in matrix products, a
+// frame poses a crowd of them, and the scalar version is sixty-four scalar
+// multiplies where SSE does the same work in sixteen. Everything else here is
+// three or four floats at a time, where the shuffling costs more than it
+// saves - a vec3 in four lanes wastes a quarter of every instruction and the
+// compiler's own auto-vectorisation already does better with the plain code.
+//
+// Loads are unaligned on purpose. A mat4 is a bare float[16] that lives inside
+// larger structs, in arrays, and in the middle of vertex buffers, so nothing
+// guarantees it is on a sixteen-byte boundary; on anything since Nehalem an
+// unaligned load off an aligned address costs nothing, and off an unaligned
+// one it is the only thing that works at all.
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+  #if defined(__has_include)
+    #if __has_include(<immintrin.h>)
+      #include <immintrin.h>
+      #define PIX_MATH_SSE 1
+    #endif
+  #else
+    #include <immintrin.h>
+    #define PIX_MATH_SSE 1
+  #endif
+#endif
+#ifndef PIX_MATH_SSE
+  #define PIX_MATH_SSE 0
+#endif
+
 static vec3 v3(float x, float y, float z) { vec3 r = { x, y, z }; return r; }
 static vec3 v3add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
 static vec3 v3sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
@@ -17,6 +47,15 @@ static vec3 v3norm(vec3 a) {
 }
 
 static vec4 v4(float x, float y, float z, float w) { vec4 r = { x, y, z, w }; return r; }
+
+static vec2 v2(float x, float y) { vec2 r = { x, y }; return r; }
+// a vec3's horizontal part - the plane collision and steering queries live in
+static vec2 v2xz(vec3 a) { vec2 r = { a.x, a.z }; return r; }
+static vec2 v2add(vec2 a, vec2 b) { return v2(a.x + b.x, a.y + b.y); }
+static vec2 v2sub(vec2 a, vec2 b) { return v2(a.x - b.x, a.y - b.y); }
+static vec2 v2scale(vec2 a, float s) { return v2(a.x * s, a.y * s); }
+static float v2dot(vec2 a, vec2 b) { return a.x * b.x + a.y * b.y; }
+static float v2len(vec2 a) { return sqrtf(a.x * a.x + a.y * a.y); }
 
 static vec3 v3lerp(vec3 a, vec3 b, float t) {
     return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
@@ -64,6 +103,31 @@ static mat4 mat4_identity() {
 }
 
 // r = a * b  (column-major, index = col*4 + row)
+//
+// Column-major is what makes the SSE form so direct: a column of the result is
+// a linear combination of a's four columns, weighted by the four scalars in
+// the matching column of b. So each output column is four broadcasts and four
+// multiply-adds over whole columns, with no transposing and no horizontal adds
+// - the shape the scalar loop below spells out one element at a time.
+#if PIX_MATH_SSE
+static mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    __m128 a0 = _mm_loadu_ps(a.data + 0);
+    __m128 a1 = _mm_loadu_ps(a.data + 4);
+    __m128 a2 = _mm_loadu_ps(a.data + 8);
+    __m128 a3 = _mm_loadu_ps(a.data + 12);
+
+    for (int c = 0; c < 4; c++) {
+        __m128 bc = _mm_loadu_ps(b.data + c * 4);
+        __m128 out =                _mm_mul_ps(a0, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(0, 0, 0, 0)));
+        out = _mm_add_ps(out,       _mm_mul_ps(a1, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(1, 1, 1, 1))));
+        out = _mm_add_ps(out,       _mm_mul_ps(a2, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(2, 2, 2, 2))));
+        out = _mm_add_ps(out,       _mm_mul_ps(a3, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(3, 3, 3, 3))));
+        _mm_storeu_ps(r.data + c * 4, out);
+    }
+    return r;
+}
+#else
 static mat4 mat4_mul(mat4 a, mat4 b) {
     mat4 r = {};
     for (int c = 0; c < 4; c++)
@@ -74,6 +138,7 @@ static mat4 mat4_mul(mat4 a, mat4 b) {
         }
     return r;
 }
+#endif
 
 static mat4 mat4_translate(float x, float y, float z) {
     mat4 m = mat4_identity();
@@ -195,4 +260,174 @@ static void mat4_decompose(const mat4& m, vec3* t, quat* r, vec3* s) {
         q.w = (m01 - m10) / k; q.x = (m20 + m02) / k; q.y = (m21 + m12) / k; q.z = 0.25f * k;
     }
     *r = quat_norm(q);
+}
+
+// ---------------- extra rotations ----------------
+
+static mat4 mat4_rotate_x(float radians) {
+    mat4 m = mat4_identity();
+    float c = cosf(radians), s = sinf(radians);
+    m.data[5] = c; m.data[9] = -s;
+    m.data[6] = s; m.data[10] = c;
+    return m;
+}
+
+static mat4 mat4_rotate_z(float radians) {
+    mat4 m = mat4_identity();
+    float c = cosf(radians), s = sinf(radians);
+    m.data[0] = c; m.data[4] = -s;
+    m.data[1] = s; m.data[5] = c;
+    return m;
+}
+
+// the common "place a prop" transform, built without three mat4_mul calls
+static mat4 mat4_trs_y(vec3 position, float yaw, float scale) {
+    mat4 m = {};
+    float c = cosf(yaw) * scale, s = sinf(yaw) * scale;
+    m.data[0] = c;  m.data[8]  = s;
+    m.data[5] = scale;
+    m.data[2] = -s; m.data[10] = c;
+    m.data[12] = position.x; m.data[13] = position.y; m.data[14] = position.z;
+    m.data[15] = 1.0f;
+    return m;
+}
+
+// same, with an independent vertical scale (squash/stretch a prop without a second mul)
+static mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y) {
+    mat4 m = mat4_trs_y(position, yaw, scale_xz);
+    m.data[5] = scale_y;
+    return m;
+}
+
+// same again, with all three axes independent.
+//
+// What this is for is fitting a model to a footprint it was not authored at.
+// Scaling uniformly to fill a slot means anything shallower than the slot
+// comes out narrow, leaving a gap beside it; stretching along one local axis
+// closes that gap without changing how deep the model sits on the others. A
+// yaw and three scales is the whole of it, still as one matrix rather than
+// three multiplied together.
+static mat4 mat4_trs_y3(vec3 position, float yaw, float scale_x, float scale_y, float scale_z) {
+    mat4 m = {};
+    float c = cosf(yaw), s = sinf(yaw);
+    m.data[0] = c * scale_x;  m.data[2]  = -s * scale_x;
+    m.data[5] = scale_y;
+    m.data[8] = s * scale_z;  m.data[10] = c * scale_z;
+    m.data[12] = position.x; m.data[13] = position.y; m.data[14] = position.z;
+    m.data[15] = 1.0f;
+    return m;
+}
+
+// Full 4x4 inverse (cofactor expansion). Wanted for turning a view-projection
+// back into camera rays, and for undoing a bind pose; not on any hot path, so
+// clarity over speed.
+static mat4 mat4_inverse(const mat4& m) {
+    const float* a = m.data;
+    mat4 out;
+    float* o = out.data;
+
+    o[0]  =  a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    o[4]  = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    o[8]  =  a[4]*a[9]*a[15]  - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    o[12] = -a[4]*a[9]*a[14]  + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+
+    o[1]  = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    o[5]  =  a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    o[9]  = -a[0]*a[9]*a[15]  + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    o[13] =  a[0]*a[9]*a[14]  - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+
+    o[2]  =  a[1]*a[6]*a[15]  - a[1]*a[7]*a[14]  - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7]  - a[13]*a[3]*a[6];
+    o[6]  = -a[0]*a[6]*a[15]  + a[0]*a[7]*a[14]  + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7]  + a[12]*a[3]*a[6];
+    o[10] =  a[0]*a[5]*a[15]  - a[0]*a[7]*a[13]  - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7]  - a[12]*a[3]*a[5];
+    o[14] = -a[0]*a[5]*a[14]  + a[0]*a[6]*a[13]  + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6]  + a[12]*a[2]*a[5];
+
+    o[3]  = -a[1]*a[6]*a[11]  + a[1]*a[7]*a[10]  + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7]   + a[9]*a[3]*a[6];
+    o[7]  =  a[0]*a[6]*a[11]  - a[0]*a[7]*a[10]  - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7]   - a[8]*a[3]*a[6];
+    o[11] = -a[0]*a[5]*a[11]  + a[0]*a[7]*a[9]   + a[4]*a[1]*a[11] - a[4]*a[3]*a[9]  - a[8]*a[1]*a[7]   + a[8]*a[3]*a[5];
+    o[15] =  a[0]*a[5]*a[10]  - a[0]*a[6]*a[9]   - a[4]*a[1]*a[10] + a[4]*a[2]*a[9]  + a[8]*a[1]*a[6]   - a[8]*a[2]*a[5];
+
+    float det = a[0]*o[0] + a[1]*o[4] + a[2]*o[8] + a[3]*o[12];
+    if (det > -1e-12f && det < 1e-12f) return mat4_identity();
+    float inv = 1.0f / det;
+    for (int i = 0; i < 16; i++) o[i] *= inv;
+    return out;
+}
+
+static vec3 mat4_mul_point(const mat4& m, vec3 p) {
+    return v3(m.data[0] * p.x + m.data[4] * p.y + m.data[8]  * p.z + m.data[12],
+              m.data[1] * p.x + m.data[5] * p.y + m.data[9]  * p.z + m.data[13],
+              m.data[2] * p.x + m.data[6] * p.y + m.data[10] * p.z + m.data[14]);
+}
+
+static float v3len(vec3 a) { return sqrtf(v3dot(a, a)); }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+// shortest signed difference between two headings, wrapped to (-pi, pi]
+static float angle_delta(float from, float to) {
+    float d = to - from;
+    while (d >  3.14159265f) d -= 6.28318531f;
+    while (d < -3.14159265f) d += 6.28318531f;
+    return d;
+}
+
+// exponential smoothing that behaves the same at any framerate
+static float damp(float current, float target, float rate, float dt) {
+    return lerpf(current, target, 1.0f - expf(-rate * dt));
+}
+
+// the same, but taking the short way round the circle so a heading never spins
+// the long way to get somewhere a few degrees away
+static float damp_angle(float current, float target, float rate, float dt) {
+    return current + angle_delta(current, target) * (1.0f - expf(-rate * dt));
+}
+
+// ---------------- frustum ----------------
+
+// six half-spaces in world space, each stored as (nx, ny, nz, d) with the
+// interior on the positive side. Extracted from a view-projection with the
+// standard Gribb/Hartmann row combinations.
+struct frustum { vec4 planes[6]; };
+
+static frustum frustum_from_viewproj(const mat4& m) {
+    frustum f;
+    // rows of a column-major matrix: row r = (m[r], m[4+r], m[8+r], m[12+r])
+    float row[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) row[r][c] = m.data[c * 4 + r];
+
+    static const int SRC[6] = { 0, 0, 1, 1, 2, 2 };
+    static const float SIGN[6] = { 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f };
+    for (int i = 0; i < 6; i++) {
+        int s = SRC[i];
+        float sg = SIGN[i];
+        vec4 p = v4(row[3][0] + sg * row[s][0], row[3][1] + sg * row[s][1],
+                    row[3][2] + sg * row[s][2], row[3][3] + sg * row[s][3]);
+        float len = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+        if (len > 1e-8f) { p.x /= len; p.y /= len; p.z /= len; p.w /= len; }
+        f.planes[i] = p;
+    }
+    return f;
+}
+
+static bool frustum_test_sphere(const frustum& f, vec3 c, float radius) {
+    for (int i = 0; i < 6; i++) {
+        const vec4& p = f.planes[i];
+        if (p.x * c.x + p.y * c.y + p.z * c.z + p.w < -radius) return false;
+    }
+    return true;
+}
+
+// Positive-vertex test: for each plane, only the box corner furthest along the
+// plane normal can keep the box inside, so one corner per plane decides it.
+static bool frustum_test_aabb(const frustum& f, vec3 min_corner, vec3 max_corner) {
+    for (int i = 0; i < 6; i++) {
+        const vec4& p = f.planes[i];
+        vec3 positive = v3(p.x >= 0.0f ? max_corner.x : min_corner.x,
+                           p.y >= 0.0f ? max_corner.y : min_corner.y,
+                           p.z >= 0.0f ? max_corner.z : min_corner.z);
+        if (p.x * positive.x + p.y * positive.y + p.z * positive.z + p.w < 0.0f)
+            return false;
+    }
+    return true;
 }

@@ -19,15 +19,59 @@
 // Not handled: sparse accessors, base64 `data:` uris, morph targets, and
 // non-PNG embedded textures (the decoder here is PNG-only).
 
+// A model whose materials are plain baseColorFactors (no texture) gets a
+// generated palette image instead: one cell per distinct colour, and every
+// vertex's uv pointed at its own cell. That collapses a character authored as
+// four meshes and eight materials into a single textured draw.
+#define GLTF_PALETTE_DIM 16
+#define GLTF_PALETTE_MAX (GLTF_PALETTE_DIM * GLTF_PALETTE_DIM)
+
 struct gltf_result {
     skinned_mesh_file_data    mesh;
     skeleton_file_data        skeleton;
     animation_clip_file_data* clips;
     size_t                    clip_count;
     image_file_data           image; // .data == 0 when absent or not decodable
+    bool                      image_is_palette; // sample it with NEAREST, not LINEAR
+    // The world translation an `only_node` load re-based the geometry off.
+    // Zero otherwise. See model_file_data::node_offset for what wants it.
+    vec3                      node_offset;
 };
 
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out);
+// `only_node` restricts the load to one mesh node instead of merging every
+// one the file has - see the definition for why a library file needs this.
+//
+// `only_material` restricts it further, to the primitives painted with one
+// glTF material. A model built out of two materials - a trunk's bark and its
+// leaves, say - has two textures, and a merged single-texture draw can only
+// ever wear one of them: the leaves come out painted in tiled bark, which is
+// what makes such a model render as scribble. The caller loads such
+// a file once per material and draws the results together; see
+// the material it wants, once per material.
+//
+// `skip_nodes` is the opposite of `only_node`: every mesh node *except* these
+// is merged. A vehicle is the case it exists for - the shell has to be one
+// mesh and its wheels have to be their own, and there is often no single node
+// that is "the shell" to ask for by index (a detailed model is thirty of
+// them). Listing the wheels and taking everything else is the only way round
+// that does not
+// depend on how finely the artist split the bodywork.
+static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+                           int only_node = -1, int only_material = -1,
+                           const int* skip_nodes = 0, int skip_count = 0);
+
+// The distinct materials used by a file's mesh primitives, in first-seen
+// order. `node` narrows it to one mesh node, or -1 for the whole file.
+// Returns how many were written, capped at `max_out`.
+static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+                               int* out, int max_out);
+
+// Every mesh-carrying node's name and index, for a caller that needs to pick
+// one out of a file by name before it can hand that index to gltf_load_file
+// as `only_node`, once per node the caller wants. Returns
+// the number of names written, capped at `max_out`.
+struct gltf_node_info { char name[64]; int node; };
+static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out);
 
 // ---------------- json ----------------
 
@@ -499,9 +543,123 @@ static int gltf__cmp_float(const void* a, const void* b) {
     return (x > y) - (x < y);
 }
 
+// ---------------- materials ----------------
+
+static int gltf__material(const gltf_file& g, int mat_index) {
+    return js_at(g.json, js_get(g.json, g.root, "materials"), mat_index);
+}
+
+// glTF baseColorFactor is linear and defaults to opaque white
+static vec3 gltf__base_color(const gltf_file& g, int mat_index) {
+    const js_doc& d = g.json;
+    int pbr = js_get(d, gltf__material(g, mat_index), "pbrMetallicRoughness");
+    int f = js_get(d, pbr, "baseColorFactor");
+    if (f < 0) return v3(1.0f, 1.0f, 1.0f);
+    return v3(js_float(d, js_at(d, f, 0), 1.0f),
+              js_float(d, js_at(d, f, 1), 1.0f),
+              js_float(d, js_at(d, f, 2), 1.0f));
+}
+
+static int gltf__base_color_texture(const gltf_file& g, int mat_index) {
+    const js_doc& d = g.json;
+    int pbr = js_get(d, gltf__material(g, mat_index), "pbrMetallicRoughness");
+    return js_int(d, js_get(d, js_get(d, pbr, "baseColorTexture"), "index"), -1);
+}
+
+struct gltf__palette {
+    vec3   colors[GLTF_PALETTE_MAX];   // linear
+    size_t count;
+};
+
+static idx gltf__palette_slot(gltf__palette& p, vec3 c) {
+    for (size_t i = 0; i < p.count; i++) {
+        vec3 q = p.colors[i];
+        if (fabsf(q.x - c.x) < 0.002f && fabsf(q.y - c.y) < 0.002f && fabsf(q.z - c.z) < 0.002f)
+            return (idx)i;
+    }
+    if (p.count >= GLTF_PALETTE_MAX) return 0;
+    idx id = (idx)p.count;
+    p.colors[p.count++] = c;
+    return id;
+}
+
+// centre of a palette cell. Unlike the OBJ palette this is *not* V-flipped:
+// VSHDER_SKINNED passes uv through untouched (glTF's uv origin is already
+// top-left), so the row index and the texture row line up directly.
+static vec2 gltf__palette_uv(idx slot) {
+    float col = (float)(slot % GLTF_PALETTE_DIM);
+    float row = (float)(slot / GLTF_PALETTE_DIM);
+    vec2 uv;
+    uv.x = (col + 0.5f) / (float)GLTF_PALETTE_DIM;
+    uv.y = (row + 0.5f) / (float)GLTF_PALETTE_DIM;
+    return uv;
+}
+
+// The surface shader linearises whatever it samples, so the palette has to be
+// written back out in sRGB or every colour comes through twice-darkened.
+static void gltf__palette_pixels(const gltf__palette& p, unsigned char* rgba) {
+    for (int i = 0; i < GLTF_PALETTE_MAX; i++) {
+        vec3 c = ((size_t)i < p.count) ? p.colors[i] : v3(1.0f, 0.0f, 1.0f);
+        const float* v = &c.x;
+        for (int k = 0; k < 3; k++) {
+            float s = powf(v[k] < 0.0f ? 0.0f : v[k], 1.0f / 2.2f);
+            int q = (int)(s * 255.0f + 0.5f);
+            rgba[i * 4 + k] = (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
+        }
+        rgba[i * 4 + 3] = 255;
+    }
+}
+
 // ---------------- load ----------------
 
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out) {
+static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out) {
+    gltf_file g;
+    if (!gltf__open(arena, path, &g)) return 0;
+    const js_doc& d = g.json;
+    int nodes = js_get(d, g.root, "nodes");
+    int node_count = js_len(d, nodes);
+    int found = 0;
+    for (int i = 0; i < node_count && found < max_out; i++) {
+        int n = gltf__node(g, i);
+        if (js_get(d, n, "mesh") < 0) continue;
+        js_str(d, js_get(d, n, "name"), out[found].name, sizeof(out[found].name));
+        out[found].node = i;
+        found++;
+    }
+    return found;
+}
+
+static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+                               int* out, int max_out) {
+    gltf_file g;
+    if (!gltf__open(arena, path, &g)) return 0;
+    const js_doc& d = g.json;
+
+    int found = 0;
+    int node_count = js_len(d, js_get(d, g.root, "nodes"));
+    for (int i = 0; i < node_count && found < max_out; i++) {
+        if (node >= 0 && i != node) continue;
+        int n = gltf__node(g, i);
+        int mesh_index = js_int(d, js_get(d, n, "mesh"), -1);
+        if (mesh_index < 0) continue;
+        int mesh = js_at(d, js_get(d, g.root, "meshes"), mesh_index);
+        int prims = js_get(d, mesh, "primitives");
+        for (int p = 0, pc = js_len(d, prims); p < pc && found < max_out; p++) {
+            int prim = js_at(d, prims, p);
+            if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue;
+            int mat = js_int(d, js_get(d, prim, "material"), -1);
+            if (mat < 0) continue;
+            bool seen = false;
+            for (int k = 0; k < found; k++) if (out[k] == mat) seen = true;
+            if (!seen) out[found++] = mat;
+        }
+    }
+    return found;
+}
+
+static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+                           int only_node, int only_material,
+                           const int* skip_nodes, int skip_count) {
     *out = gltf_result();
     out->skeleton.root_transform = mat4_identity();
 
@@ -525,19 +683,31 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
         }
     }
 
-    // the node carrying the mesh; prefer one that is also skinned
-    int mesh_node = -1, skin_index = -1;
+    // Every node carrying a mesh, not just the first. A character is routinely
+    // authored as several meshes over one armature - body, head, legs, feet -
+    // and taking only one of them loads a torso with no head.
+    //
+    // `only_node` narrows this to one - some packs ship a whole family of
+    // props as siblings in a single file (five variants standing in a row
+    // so an artist could preview them together, say), and merging every
+    // sibling the way a multi-mesh character wants would draw all five
+    // wherever one was asked for. The caller finds the family with
+    // gltf_list_nodes and loads each member on its own by index.
+    int32_t* mesh_nodes = allocate<int32_t>(arena, (size_t)node_count);
+    if (!mesh_nodes) return false;
+    int mesh_node_count = 0, skin_index = -1;
     for (int i = 0; i < node_count; i++) {
+        if (only_node >= 0 && i != only_node) continue;
+        bool skipped = false;
+        for (int k = 0; k < skip_count; k++) if (skip_nodes[k] == i) skipped = true;
+        if (skipped) continue;
         int n = gltf__node(g, i);
         if (js_get(d, n, "mesh") < 0) continue;
+        mesh_nodes[mesh_node_count++] = (int32_t)i;
         int s = js_int(d, js_get(d, n, "skin"), -1);
-        if (mesh_node < 0 || s >= 0) { mesh_node = i; skin_index = s; }
-        if (s >= 0) break;
+        if (s >= 0 && skin_index < 0) skin_index = s;   // the skeleton comes from the first skin
     }
-    if (mesh_node < 0) return false;
-    int mesh = js_at(d, js_get(d, g.root, "meshes"),
-                     js_int(d, js_get(d, gltf__node(g, mesh_node), "mesh"), -1));
-    if (mesh < 0) return false;
+    if (!mesh_node_count) return false;
 
     // ---- skeleton ----
     int32_t* node_to_bone = allocate<int32_t>(arena, (size_t)node_count);
@@ -620,19 +790,32 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
         }
     }
 
-    // ---- skinned mesh (all primitives merged into one buffer) ----
-    int prims = js_get(d, mesh, "primitives");
-    int prim_count = js_len(d, prims);
+    // ---- skinned mesh: every mesh node's primitives merged into one buffer ----
+    //
+    // Two passes. The first only measures, so the vertex and index arrays can be
+    // allocated exactly once; the second fills them. A model that ships no
+    // baseColorTexture anywhere is given a generated palette instead, so its
+    // per-material colours survive the collapse into a single draw.
+    bool any_texture = false;
     size_t total_verts = 0, total_inds = 0;
-    for (int p = 0; p < prim_count; p++) {
-        int prim = js_at(d, prims, p);
-        if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue; // triangles only
-        int pos_acc = js_int(d, js_get(d, js_get(d, prim, "attributes"), "POSITION"), -1);
-        size_t vc = gltf__accessor_count(g, pos_acc);
-        if (!vc) continue;
-        int idx_acc = js_int(d, js_get(d, prim, "indices"), -1);
-        total_verts += vc;
-        total_inds  += (idx_acc >= 0) ? gltf__accessor_count(g, idx_acc) : vc;
+    for (int mn = 0; mn < mesh_node_count; mn++) {
+        int mesh = js_at(d, js_get(d, g.root, "meshes"),
+                         js_int(d, js_get(d, gltf__node(g, mesh_nodes[mn]), "mesh"), -1));
+        int prims = js_get(d, mesh, "primitives");
+        for (int p = 0, pc = js_len(d, prims); p < pc; p++) {
+            int prim = js_at(d, prims, p);
+            if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue; // triangles only
+            if (only_material >= 0
+                && js_int(d, js_get(d, prim, "material"), -1) != only_material) continue;
+            int pos_acc = js_int(d, js_get(d, js_get(d, prim, "attributes"), "POSITION"), -1);
+            size_t vc = gltf__accessor_count(g, pos_acc);
+            if (!vc) continue;
+            int idx_acc = js_int(d, js_get(d, prim, "indices"), -1);
+            total_verts += vc;
+            total_inds  += (idx_acc >= 0) ? gltf__accessor_count(g, idx_acc) : vc;
+            if (gltf__base_color_texture(g, js_int(d, js_get(d, prim, "material"), -1)) >= 0)
+                any_texture = true;
+        }
     }
     if (total_verts == 0) return false;
     if (total_verts > 65535) return false; // renderer draws with GL_UNSIGNED_SHORT
@@ -641,91 +824,160 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
     uint16_t* inds = allocate<uint16_t>(arena, total_inds ? total_inds : 1);
     if (!verts || !inds) return false;
 
+    gltf__palette palette = {};
+    bool use_palette = !any_texture;
+
     size_t vbase = 0, iat = 0;
-    for (int p = 0; p < prim_count; p++) {
-        int prim = js_at(d, prims, p);
-        if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue;
-        int attrs = js_get(d, prim, "attributes");
-        int pos_acc = js_int(d, js_get(d, attrs, "POSITION"), -1);
-        size_t vc = gltf__accessor_count(g, pos_acc);
-        if (!vc) continue;
+    for (int mn = 0; mn < mesh_node_count; mn++) {
+        int node_index = mesh_nodes[mn];
+        int node = gltf__node(g, node_index);
+        int mesh = js_at(d, js_get(d, g.root, "meshes"), js_int(d, js_get(d, node, "mesh"), -1));
+        if (mesh < 0) continue;
 
-        float* tmp3 = allocate<float>(arena, vc * 4);
-        uint32_t* tmpu = allocate<uint32_t>(arena, vc * 4);
-        if (!tmp3 || !tmpu) return false;
-
-        gltf_read_floats(g, pos_acc, tmp3, 3);
-        for (size_t i = 0; i < vc; i++) {
-            verts[vbase + i] = vertex_rigged();
-            verts[vbase + i].position = v3(tmp3[i * 3], tmp3[i * 3 + 1], tmp3[i * 3 + 2]);
+        // JOINTS_0 indexes *this node's own* skin, and a character split across
+        // several meshes usually carries one skin object per mesh. Resolve the
+        // mapping per node rather than assuming everything shares skin 0.
+        int node_skin = js_int(d, js_get(d, node, "skin"), -1);
+        int32_t* jmap = joint_to_bone;
+        int jmap_count = joint_count;
+        if (node_skin >= 0 && node_skin != skin_index && bone_count) {
+            int skin = js_at(d, js_get(d, g.root, "skins"), node_skin);
+            int joints = js_get(d, skin, "joints");
+            int jn = js_len(d, joints);
+            int32_t* local = allocate<int32_t>(arena, (size_t)(jn > 0 ? jn : 1));
+            if (!local) return false;
+            for (int j = 0; j < jn; j++) {
+                int nidx = js_int(d, js_at(d, joints, j), -1);
+                local[j] = (nidx >= 0 && nidx < node_count) ? node_to_bone[nidx] : -1;
+            }
+            jmap = local;
+            jmap_count = jn;
         }
 
-        int nrm_acc = js_int(d, js_get(d, attrs, "NORMAL"), -1);
-        bool have_normals = nrm_acc >= 0 && gltf_read_floats(g, nrm_acc, tmp3, 3) == vc;
-        if (have_normals)
-            for (size_t i = 0; i < vc; i++)
-                verts[vbase + i].normal = v3(tmp3[i * 3], tmp3[i * 3 + 1], tmp3[i * 3 + 2]);
+        // An unskinned mesh node is placed by its own transform; a skinned one
+        // is defined in bind space and its node transform is ignored per spec.
+        mat4 place = mat4_identity();
+        bool bake_place = (node_skin < 0);
+        if (bake_place)
+            for (int n = node_index; n >= 0; n = parent[n])
+                place = mat4_mul(gltf__node_matrix(g, gltf__node(g, n)), place);
+        // Pulled out of a gallery row, a single node keeps its rotation and
+        // scale but drops the translation that used to stand it next to its
+        // siblings - it needs to sit at its own local origin, ready for a
+        // caller's own placement transform, not still offset by where it
+        // happened to be parked in the source file.
+        // Handed back to the caller rather than simply dropped: a caller
+        // rebuilding one model out of several of its own nodes - a body and
+        // its four wheels - needs to know where each one stood.
+        if (only_node >= 0) {
+            out->node_offset = v3(place.data[12], place.data[13], place.data[14]);
+            place.data[12] = 0.0f; place.data[13] = 0.0f; place.data[14] = 0.0f;
+        }
 
-        int uv_acc = js_int(d, js_get(d, attrs, "TEXCOORD_0"), -1);
-        if (uv_acc >= 0 && gltf_read_floats(g, uv_acc, tmp3, 2) == vc)
+        int prims = js_get(d, mesh, "primitives");
+        for (int p = 0, pc = js_len(d, prims); p < pc; p++) {
+            int prim = js_at(d, prims, p);
+            if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue;
+            if (only_material >= 0
+                && js_int(d, js_get(d, prim, "material"), -1) != only_material) continue;
+            int attrs = js_get(d, prim, "attributes");
+            int pos_acc = js_int(d, js_get(d, attrs, "POSITION"), -1);
+            size_t vc = gltf__accessor_count(g, pos_acc);
+            if (!vc) continue;
+
+            float* tmp3 = allocate<float>(arena, vc * 4);
+            uint32_t* tmpu = allocate<uint32_t>(arena, vc * 4);
+            if (!tmp3 || !tmpu) return false;
+
+            gltf_read_floats(g, pos_acc, tmp3, 3);
             for (size_t i = 0; i < vc; i++) {
-                vec2 uv = { tmp3[i * 2], tmp3[i * 2 + 1] };
-                verts[vbase + i].uv = uv;
+                verts[vbase + i] = vertex_rigged();
+                vec3 pos = v3(tmp3[i * 3], tmp3[i * 3 + 1], tmp3[i * 3 + 2]);
+                verts[vbase + i].position = bake_place ? mat4_mul_point(place, pos) : pos;
             }
 
-        int jnt_acc = js_int(d, js_get(d, attrs, "JOINTS_0"), -1);
-        int wgt_acc = js_int(d, js_get(d, attrs, "WEIGHTS_0"), -1);
-        bool have_skin = jnt_acc >= 0 && wgt_acc >= 0 && bone_count > 0;
-        if (have_skin && gltf_read_uints(g, jnt_acc, tmpu, 4) == vc) {
-            for (size_t i = 0; i < vc; i++) {
-                // JOINTS_0 indexes skin.joints; the topo sort re-ordered the bones
-                float r[4];
-                for (int c = 0; c < 4; c++) {
-                    uint32_t j = tmpu[i * 4 + c];
-                    int b = (j < (uint32_t)joint_count) ? joint_to_bone[j] : -1;
-                    r[c] = (float)(b >= 0 ? b : 0);
+            int nrm_acc = js_int(d, js_get(d, attrs, "NORMAL"), -1);
+            bool have_normals = nrm_acc >= 0 && gltf_read_floats(g, nrm_acc, tmp3, 3) == vc;
+            if (have_normals)
+                for (size_t i = 0; i < vc; i++) {
+                    vec3 n = v3(tmp3[i * 3], tmp3[i * 3 + 1], tmp3[i * 3 + 2]);
+                    if (bake_place) {   // rotate/scale only, no translation
+                        n = v3(place.data[0] * n.x + place.data[4] * n.y + place.data[8]  * n.z,
+                               place.data[1] * n.x + place.data[5] * n.y + place.data[9]  * n.z,
+                               place.data[2] * n.x + place.data[6] * n.y + place.data[10] * n.z);
+                        n = v3norm(n);
+                    }
+                    verts[vbase + i].normal = n;
                 }
-                verts[vbase + i].bone_ids = v4(r[0], r[1], r[2], r[3]);
-            }
-        }
-        if (have_skin && gltf_read_floats(g, wgt_acc, tmp3, 4) == vc) {
-            for (size_t i = 0; i < vc; i++) {
-                float w0 = tmp3[i * 4], w1 = tmp3[i * 4 + 1], w2 = tmp3[i * 4 + 2], w3 = tmp3[i * 4 + 3];
-                float sum = w0 + w1 + w2 + w3;
-                if (sum > 1e-6f) { float k = 1.0f / sum; w0 *= k; w1 *= k; w2 *= k; w3 *= k; }
-                else { w0 = 1.0f; w1 = w2 = w3 = 0.0f; }   // unweighted vertex: pin it to bone 0
-                verts[vbase + i].bone_weights = v4(w0, w1, w2, w3);
-            }
-        } else {
-            for (size_t i = 0; i < vc; i++) verts[vbase + i].bone_weights = v4(1.0f, 0.0f, 0.0f, 0.0f);
-        }
 
-        int idx_acc = js_int(d, js_get(d, prim, "indices"), -1);
-        size_t ic = (idx_acc >= 0) ? gltf__accessor_count(g, idx_acc) : 0;
-        if (idx_acc >= 0 && ic) {
-            uint32_t* tmpi = allocate<uint32_t>(arena, ic);
-            if (!tmpi) return false;
-            gltf_read_uints(g, idx_acc, tmpi, 1);
-            for (size_t i = 0; i < ic; i++) inds[iat++] = (uint16_t)(tmpi[i] + vbase);
-        } else {
-            for (size_t i = 0; i < vc; i++) inds[iat++] = (uint16_t)(vbase + i); // non-indexed
-        }
-
-        // derive normals the file didn't ship, area-weighted across shared vertices
-        if (!have_normals) {
-            size_t first = iat - (ic ? ic : vc);
-            for (size_t t = first; t + 2 < iat; t += 3) {
-                vertex_rigged* a = &verts[inds[t]];
-                vertex_rigged* b = &verts[inds[t + 1]];
-                vertex_rigged* c = &verts[inds[t + 2]];
-                vec3 n = v3cross(v3sub(b->position, a->position), v3sub(c->position, a->position));
-                a->normal = v3add(a->normal, n);
-                b->normal = v3add(b->normal, n);
-                c->normal = v3add(c->normal, n);
+            int mat_index = js_int(d, js_get(d, prim, "material"), -1);
+            if (use_palette) {
+                // every vertex of this primitive points at its material's cell
+                vec2 uv = gltf__palette_uv(
+                    gltf__palette_slot(palette, gltf__base_color(g, mat_index)));
+                for (size_t i = 0; i < vc; i++) verts[vbase + i].uv = uv;
+            } else {
+                int uv_acc = js_int(d, js_get(d, attrs, "TEXCOORD_0"), -1);
+                if (uv_acc >= 0 && gltf_read_floats(g, uv_acc, tmp3, 2) == vc)
+                    for (size_t i = 0; i < vc; i++) {
+                        vec2 uv = { tmp3[i * 2], tmp3[i * 2 + 1] };
+                        verts[vbase + i].uv = uv;
+                    }
             }
-            for (size_t i = 0; i < vc; i++) verts[vbase + i].normal = v3norm(verts[vbase + i].normal);
+
+            int jnt_acc = js_int(d, js_get(d, attrs, "JOINTS_0"), -1);
+            int wgt_acc = js_int(d, js_get(d, attrs, "WEIGHTS_0"), -1);
+            bool have_skin = jnt_acc >= 0 && wgt_acc >= 0 && bone_count > 0 && jmap;
+            if (have_skin && gltf_read_uints(g, jnt_acc, tmpu, 4) == vc) {
+                for (size_t i = 0; i < vc; i++) {
+                    float r[4];
+                    for (int c = 0; c < 4; c++) {
+                        uint32_t j = tmpu[i * 4 + c];
+                        int b = (j < (uint32_t)jmap_count) ? jmap[j] : -1;
+                        r[c] = (float)(b >= 0 ? b : 0);
+                    }
+                    verts[vbase + i].bone_ids = v4(r[0], r[1], r[2], r[3]);
+                }
+            }
+            if (have_skin && gltf_read_floats(g, wgt_acc, tmp3, 4) == vc) {
+                for (size_t i = 0; i < vc; i++) {
+                    float w0 = tmp3[i * 4], w1 = tmp3[i * 4 + 1], w2 = tmp3[i * 4 + 2], w3 = tmp3[i * 4 + 3];
+                    float sum = w0 + w1 + w2 + w3;
+                    if (sum > 1e-6f) { float k = 1.0f / sum; w0 *= k; w1 *= k; w2 *= k; w3 *= k; }
+                    else { w0 = 1.0f; w1 = w2 = w3 = 0.0f; }   // unweighted vertex: pin it to bone 0
+                    verts[vbase + i].bone_weights = v4(w0, w1, w2, w3);
+                }
+            } else {
+                for (size_t i = 0; i < vc; i++) verts[vbase + i].bone_weights = v4(1.0f, 0.0f, 0.0f, 0.0f);
+            }
+
+            int idx_acc = js_int(d, js_get(d, prim, "indices"), -1);
+            size_t ic = (idx_acc >= 0) ? gltf__accessor_count(g, idx_acc) : 0;
+            if (idx_acc >= 0 && ic) {
+                uint32_t* tmpi = allocate<uint32_t>(arena, ic);
+                if (!tmpi) return false;
+                gltf_read_uints(g, idx_acc, tmpi, 1);
+                for (size_t i = 0; i < ic; i++) inds[iat++] = (uint16_t)(tmpi[i] + vbase);
+            } else {
+                for (size_t i = 0; i < vc; i++) inds[iat++] = (uint16_t)(vbase + i); // non-indexed
+            }
+
+            // derive normals the file didn't ship, area-weighted across shared vertices
+            if (!have_normals) {
+                size_t first = iat - (ic ? ic : vc);
+                for (size_t t = first; t + 2 < iat; t += 3) {
+                    vertex_rigged* a = &verts[inds[t]];
+                    vertex_rigged* b = &verts[inds[t + 1]];
+                    vertex_rigged* c = &verts[inds[t + 2]];
+                    vec3 n = v3cross(v3sub(b->position, a->position), v3sub(c->position, a->position));
+                    a->normal = v3add(a->normal, n);
+                    b->normal = v3add(b->normal, n);
+                    c->normal = v3add(c->normal, n);
+                }
+                for (size_t i = 0; i < vc; i++) verts[vbase + i].normal = v3norm(verts[vbase + i].normal);
+            }
+            vbase += vc;
         }
-        vbase += vc;
     }
 
     out->mesh.vertex_count = vbase;
@@ -733,6 +985,18 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
     out->mesh.index_count  = iat;
     out->mesh.index_data   = inds;
     out->mesh.skeleton     = bone_count ? 0 : -1;
+
+    if (use_palette && palette.count) {
+        unsigned char* pixels = allocate<unsigned char>(arena, GLTF_PALETTE_MAX * 4);
+        if (pixels) {
+            gltf__palette_pixels(palette, pixels);
+            out->image.width   = GLTF_PALETTE_DIM;
+            out->image.height  = GLTF_PALETTE_DIM;
+            out->image.channel = 4;
+            out->image.data    = (char*)pixels;
+            out->image_is_palette = true;
+        }
+    }
 
     // ---- animation clips ----
     int anims = js_get(d, g.root, "animations");
@@ -848,10 +1112,20 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
     }
 
     // ---- base colour texture, if it is a png we can decode ----
-    int prim0 = js_at(d, prims, 0);
-    int mat_index = js_int(d, js_get(d, prim0, "material"), -1);
-    int mat = js_at(d, js_get(d, g.root, "materials"), mat_index);
-    int tex_index = js_int(d, js_get(d, js_get(d, js_get(d, mat, "pbrMetallicRoughness"), "baseColorTexture"), "index"), -1);
+    if (use_palette) return true;    // the generated palette above is the texture
+
+    int tex_index = -1;
+    if (only_material >= 0) {
+        tex_index = gltf__base_color_texture(g, only_material);
+    } else {
+        // No material was asked for, so the first primitive's is as good a
+        // guess as there is - and is exactly right for the single-material
+        // files that are most of this project's art.
+        int mesh0 = js_at(d, js_get(d, g.root, "meshes"),
+                          js_int(d, js_get(d, gltf__node(g, mesh_nodes[0]), "mesh"), -1));
+        int prim0 = js_at(d, js_get(d, mesh0, "primitives"), 0);
+        tex_index = gltf__base_color_texture(g, js_int(d, js_get(d, prim0, "material"), -1));
+    }
     int tex = js_at(d, js_get(d, g.root, "textures"), tex_index);
     int img_index = js_int(d, js_get(d, tex, "source"), -1);
     int img = js_at(d, js_get(d, g.root, "images"), img_index);

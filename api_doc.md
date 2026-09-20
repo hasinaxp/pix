@@ -5,10 +5,12 @@ Header-only C-style engine, no OOP, no third-party dependencies (only `windows.h
 only translation unit. Windows only, OpenGL 4.4 core profile.
 
 ```
-src/core/     dtype math platform opengl_api opengl_utils shader_sources
-              animation renderer font sprite text
+src/core/     dtype math random platform opengl_api opengl_utils shader_sources
+              lighting framebuffer renderer animation font sprite text
+              colliders physics jobs profile
               platform_audio sound
-src/loader/   asset_types png_loader obj_loader gltf_loader wav_loader data_loader
+src/loader/   asset_types png_loader png_writer obj_loader gltf_loader
+              wav_loader data_loader
 src/demos/    city_demo animation_demo
 ```
 
@@ -16,9 +18,17 @@ Include order matters — later headers assume earlier ones are already visible:
 
 ```
 core/platform -> core/opengl_api -> core/opengl_utils -> core/shader_sources
-              -> core/math -> loader/data_loader -> core/renderer
+              -> core/math -> core/lighting -> core/framebuffer
+              -> loader/data_loader -> core/renderer
               -> core/font -> core/sprite -> core/text
+
+core/math -> core/random
+core/math -> core/colliders -> core/jobs -> core/physics
 ```
+
+Nothing in the simulation half (`colliders`, `physics`, `jobs`, `random`,
+`profile`) touches GL, and nothing in the rendering half touches the simulation.
+A game that only wants one of them pays for one of them.
 
 `loader/data_loader.hpp` is the front door for assets: it pulls in the individual
 format readers (`png_loader`, `obj_loader`, `gltf_loader`, `wav_loader`) and owns
@@ -52,7 +62,10 @@ void arena_reset(mem_arena& arena);                               // size = 0, k
 
 ## math.hpp
 
-Free functions on `vec3`/`mat4`. No SIMD, no operator overloading.
+Free functions on `vec2`/`vec3`/`vec4`/`quat`/`mat4`. No operator overloading.
+`mat4_mul` has an SSE2 path (guarded by `PIX_MATH_SSE`, unaligned loads, chosen
+because a character rig is dozens of matrix products deep); everything else is
+three or four floats wide, where shuffling costs more than it saves.
 
 ```cpp
 vec3 v3(float x, float y, float z);
@@ -65,6 +78,12 @@ vec3 v3norm(vec3);
 vec3 v3lerp(vec3 a, vec3 b, float t);
 vec4 v4(float x, float y, float z, float w);
 
+vec2 v2(float x, float y);
+vec2 v2xz(vec3);                               // the horizontal part of a vec3
+vec2 v2add(vec2, vec2);  vec2 v2sub(vec2, vec2);  vec2 v2scale(vec2, float);
+float v2dot(vec2, vec2); float v2len(vec2);
+float v3len(vec3);
+
 quat quat_identity();
 quat quat_norm(quat);
 quat quat_mul(quat a, quat b);
@@ -74,7 +93,9 @@ mat4 mat4_identity();
 mat4 mat4_mul(mat4 a, mat4 b);                 // a * b
 mat4 mat4_translate(float x, float y, float z);
 mat4 mat4_scale(float x, float y, float z);
+mat4 mat4_rotate_x(float radians);
 mat4 mat4_rotate_y(float radians);
+mat4 mat4_rotate_z(float radians);
 mat4 mat4_perspective(float fovy, float aspect, float near, float far);
 mat4 mat4_ortho(float left, float right, float bottom, float top, float near, float far);
     // maps [left,right]x[bottom,top] to NDC; pass top=0,bottom=height for
@@ -84,7 +105,38 @@ mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up);
 mat4 mat4_from_quat(quat);
 mat4 mat4_from_trs(vec3 t, quat r, vec3 s);    // T * R * S, built directly
 void mat4_decompose(const mat4&, vec3* t, quat* r, vec3* s); // assumes no shear
+mat4 mat4_inverse(const mat4&);                // cofactor expansion; identity if singular
+vec3 mat4_mul_point(const mat4&, vec3);        // transforms a point, w assumed 1
+
+// "place a prop" transforms: a position, a yaw about +Y and a scale, built
+// directly rather than as three mat4_mul calls
+mat4 mat4_trs_y (vec3 position, float yaw, float scale);
+mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y);
+mat4 mat4_trs_y3(vec3 position, float yaw, float sx, float sy, float sz);
+
+float clampf(float v, float lo, float hi);
+float lerpf(float a, float b, float t);
+float angle_delta(float from, float to);       // shortest signed turn, (-pi, pi]
+float damp(float current, float target, float rate, float dt);
+float damp_angle(float current, float target, float rate, float dt);
+    // framerate-independent exponential smoothing; damp_angle takes the short
+    // way round so a heading never spins the long way to get a few degrees over
 ```
+
+### frustum culling
+
+```cpp
+struct frustum { vec4 planes[6]; };            // world space, interior positive
+
+frustum frustum_from_viewproj(const mat4&);    // Gribb/Hartmann row combinations
+bool frustum_test_sphere(const frustum&, vec3 centre, float radius);
+bool frustum_test_aabb(const frustum&, vec3 min_corner, vec3 max_corner);
+    // positive-vertex test: one corner per plane decides it
+```
+
+`begin_frame` builds a frustum from the camera and `end_frame` culls against it,
+so most callers never touch these directly. They are here for game-side culling —
+skipping the AI, the animation sampling or the audio for things nobody can see.
 
 ---
 
@@ -99,19 +151,33 @@ struct pix_key_state { bool pressed, released, held; char code; };
 #define MOUSE_BUTTON_RIGHT 254
 #define MOUSE_BUTTON_MID   253
 #define KEY_UP 201  KEY_DOWN 202  KEY_LEFT 203  KEY_RIGHT 204  KEY_ESC 205  KEY_TAB 206
+#define KEY_LEFT_BRACKET 207  KEY_RIGHT_BRACKET 208
+#define KEY_SHIFT 16  KEY_CTRL 17  KEY_SPACE 32  KEY_RETURN 0x0D
+#define KEY_F1 0x70 ... KEY_F12 0x7B    // function keys keep their VK codes
 
 struct pix_window {
     HWND handle; HDC dc; void* gl_context;
     pix_key_state keystates[256];  // ascii-indexed; mouse/special keys use the codes above
     int mouse_x, mouse_y, mouse_rel_x, mouse_rel_y;
+    int mouse_wheel;              // notches this frame, +1 per detent forward
+    bool mouse_captured;
     bool should_close;
     pix_gamepad gamepads[PIX_MAX_GAMEPADS];   // PIX_MAX_GAMEPADS == 4
 };
 
 pix_window pix_create_window(const char* title, int width, int height);
-    // creates a 4.4 core-profile context, shows the window
+    // creates a 4.4 core-profile context, shows the window, starts vsync off
 void pix_update_window(pix_window& window);
     // swaps buffers, refreshes pressed/released/held, pumps messages, polls pads
+
+void pix_set_mouse_capture(pix_window&, bool captured);
+    // hides the cursor and re-centres it after every frame, so mouse_rel keeps
+    // accumulating without the pointer ever reaching a screen edge — what a
+    // mouselook camera needs. The re-centring happens last in
+    // pix_update_window, so the warp itself never shows up as motion.
+void pix_set_vsync(pix_window&, bool enabled);
+    // off is the default: vsync pins a scene that would run at 150fps to a flat
+    // 60 and it reads exactly like a real bottleneck. Turn it on to ship.
 ```
 
 Call once per frame: `pix_update_window` **swaps first, then pumps**, so it belongs at
@@ -230,7 +296,17 @@ The data model every loader fills in and `data_loader.hpp` stores.
 ```cpp
 struct vertex        { vec3 position; vec3 normal; vec2 uv; };
 struct vertex_rigged { vec3 position; vec3 normal; vec2 uv; vec4 bone_ids; vec4 bone_weights; };
-struct mesh_file_data  { size_t vertex_count; vertex* vertex_data; size_t index_count; uint16_t* index_data; };
+// a named `g`/`o` run inside one OBJ: a contiguous slice of the emitted
+// vertices plus the centre of its own bounds, so a part authored in place (a
+// wheel, a turret, a door) can be pulled out and rotated about itself
+struct mesh_group { char name[48]; size_t vertex_offset, vertex_count; vec3 pivot; };
+
+struct mesh_file_data {
+    size_t vertex_count; vertex* vertex_data;
+    size_t index_count;  uint16_t* index_data;
+    size_t group_count;  mesh_group* groups;
+    vec3 bounds_min, bounds_max;    // model space, before any placement scale
+};
 struct image_file_data { int width, height, channel; char* data; };
 struct sound_file_data { int16_t* samples; size_t frame_count; int channels; int rate; };
 
@@ -296,12 +372,18 @@ pix_data_loader pix_create_data_loader(size_t capacity = 128 * MB);
 void pix_destroy_data_loader(pix_data_loader& loader);
 
 idx load_mesh_obj_file(pix_data_loader&, const char* filepath);
+idx load_mesh_obj_group(pix_data_loader&, idx mesh_file, const char* group, vec3* out_pivot);
+    // splits a named part out of an already-loaded model into a mesh of its own,
+    // centred on its own pivot, so it can be animated apart from the body
 idx load_image_file(pix_data_loader&, const char* filepath, size_t channels);
 idx load_sound_wav_file(pix_data_loader&, const char* filepath);
     // decodes into loader.sound_files; hand the result to sound.hpp's load_sound
-idx load_model_gltf_file(pix_data_loader&, const char* filepath);
+idx load_model_gltf_file(pix_data_loader&, const char* filepath, int only_node = -1,
+                         int only_material = -1,
+                         const int* skip_nodes = 0, int skip_count = 0);
     // fills the skeleton / skinned mesh / animation tables in one call;
-    // returns an index into model_files, or (idx)-1 on failure
+    // returns an index into model_files, or (idx)-1 on failure.
+    // See gltf_loader.hpp for what the three narrowing arguments are for.
 
 skinned_mesh_file_data*   get_model_mesh(pix_data_loader&, idx model);
 skeleton_file_data*       get_model_skeleton(pix_data_loader&, idx model);
@@ -311,6 +393,30 @@ animation_clip_file_data* find_animation(pix_data_loader&, idx model, const char
 
 Everything allocated lives in `loader.arena` and stays valid until it is reset or
 freed. `renderer.hpp` copies what it needs onto the GPU immediately.
+
+### transient loads
+
+```cpp
+struct pix_loader_mark { size_t arena, mesh_files, image_files, skeletons,
+                         skinned_meshes, clips, model_files; };
+
+pix_loader_mark pix_loader_mark_now(const pix_data_loader&);
+void            pix_loader_rewind(pix_data_loader&, const pix_loader_mark&);
+```
+
+A static prop's file is parsed into the arena, uploaded to the GPU, and never
+looked at again — the catalogue keeps a mesh handle, a material handle and a
+bounding box, not one byte of the file. Keeping all of it alive anyway is what
+fills a large arena with a couple of hundred props, since each load copies the
+whole binary chunk plus a JSON token table, and a library file holding five props
+is parsed five times over.
+
+So mark before the load and rewind after: the bump pointer goes back, and so do
+the table counts, because a `model_file` entry left behind would point at vertex
+data the next load is about to overwrite.
+
+**Anything whose CPU-side data is read again later** — a rig's skeleton, its
+clips, the mesh a pose is measured against — must not be loaded this way.
 
 Typical animated-model load:
 
@@ -326,11 +432,24 @@ animation_clip_file_data* run = find_animation(loader, fox, "Run");
 ## loader/obj_loader.hpp
 
 ```cpp
-bool obj_load_file(mem_arena&, const char* path, mesh_file_data* out);
+bool obj_load_file(mem_arena&, const char* path, mesh_file_data* out,
+                   obj_palette* palette = 0);
+int  obj_find_group(const mesh_file_data&, const char* name);
+bool obj_extract_group(mem_arena&, const mesh_file_data& src, size_t group,
+                       mesh_file_data* out, vec3* out_pivot);
 ```
 
 Positions/uvs/normals + polygon faces, fan triangulated, vertices emitted unshared.
-Generates flat normals when the file has none.
+Generates flat normals when the file has none, and records each `g`/`o` run as a
+`mesh_group` plus the whole file's bounds.
+
+`palette` collects the colours named by a companion `.mtl` for materials that
+carry no texture, so one generated image can back every such model instead of one
+material each.
+
+`obj_extract_group` pulls a named part out into its own mesh, re-centred on its
+own pivot — the pivot is taken from the part's bounds centre, where a moving
+part's true axis sits far more reliably than its vertex average would.
 
 ---
 
@@ -358,9 +477,37 @@ struct gltf_result {
     skeleton_file_data        skeleton;
     animation_clip_file_data* clips;  size_t clip_count;
     image_file_data           image;  // .data == 0 when absent/undecodable
+    bool image_is_palette;            // sample it NEAREST, not LINEAR
+    vec3 node_offset;                 // where a one-node load stood in its file
 };
-bool gltf_load_file(mem_arena&, const char* path, gltf_result* out);
+
+bool gltf_load_file(mem_arena&, const char* path, gltf_result* out,
+                    int only_node = -1, int only_material = -1,
+                    const int* skip_nodes = 0, int skip_count = 0);
+
+// the distinct materials a file's primitives use, in first-seen order;
+// `node` narrows it to one mesh node, or -1 for the whole file
+int gltf_list_materials(mem_arena&, const char* path, int node, int* out, int max_out);
+
+// every mesh-carrying node's name and index, for picking one out by name
+struct gltf_node_info { char name[64]; int node; };
+int gltf_list_nodes(mem_arena&, const char* path, gltf_node_info* out, int max_out);
 ```
+
+The three narrowing arguments exist because "one file, one model" is not how asset
+packs ship:
+
+- `only_node` — load a single mesh node instead of merging every one in the file.
+  A library file holding several unrelated props needs this; the usual merge is
+  for one character split across several meshes. A one-node load is re-based on
+  that node's own origin, with the translation it discarded kept in `node_offset`.
+- `only_material` — restrict further to the primitives painted with one glTF
+  material. A model built from two materials has two textures, and a merged
+  single-texture draw can only wear one of them, so the second renders as
+  scribble. Load such a file once per material and draw the results together.
+- `skip_nodes` — the opposite of `only_node`: every mesh node *except* these.
+  Taking a vehicle's shell without its wheels needs this, because there is often
+  no single node that *is* the shell to ask for by index.
 
 What it does for you:
 - **Generates whatever the file omits** — sequential indices when a primitive is
@@ -406,7 +553,7 @@ Runtime half of skinning: turns a clip + a time into one skinning matrix per bon
 
 ```cpp
 #define MAX_ANIM_BONES     128   // must match uBones[] in shader_sources.hpp
-#define MAX_ANIMATOR_CLIPS 16
+#define MAX_ANIMATOR_CLIPS 40    // a rig from an asset pack ships 20-30
 
 struct animation {              // a resolved pose, ready for the GPU
     mat4   bones[MAX_ANIM_BONES];   // bones[i] = global_transform(i) * inverse_bind(i)
@@ -428,6 +575,10 @@ idx  animator_add_clip(animator&, animation_clip_file_data* clip);
 // `time` is wrapped into the clip, so raw elapsed time is fine.
 void animator_sample(const animator&, idx clip, float time, animation* out);
 
+// two clips at once, `weight` of the way from a to b
+void animator_sample_blend(const animator&, idx a_clip, float a_time,
+                           idx b_clip, float b_time, float weight, animation* out);
+
 // convenience playback on top of it
 void animator_play(animator&, idx clip, bool loop = true, float speed = 1.0f);
 void animator_update(animator&, float dt);          // advances time, refills .pose
@@ -435,7 +586,25 @@ void animator_update(animator&, float dt);          // advances time, refills .p
 void  animation_rest_pose(const skeleton_file_data&, animation* out);
 float animator_duration(const animator&, idx clip);
 const char* animator_clip_name(const animator&, idx clip);
+
+// ---- attaching a prop to a bone ----
+int  animator_find_bone(const animator&, const char* const* names, int count);
+    // first name that exists, because rigs disagree about what a wrist is called
+mat4 animation_bone_world(const animator&, const animation& pose, int bone);
+    // the bone's global transform in the character's own model space
 ```
+
+`animator_sample_blend` blends each bone's local T/R/S **before** the hierarchy is
+walked, never the finished skinning matrices — lerping two matrices that differ by
+a large rotation shears and shrinks the limb between them, which between two poses
+that are far apart is worse than the pop it was meant to hide. A weight at either
+extreme falls through to the single-clip path, so it is free to call it always.
+
+A pose holds `global(i) * inverse_bind(i)`, which is what the vertex shader wants
+and is the wrong thing for placing a held prop. `animation_bone_world` multiplies
+the bind pose back in to recover the bone's actual transform; it costs one 4x4
+inverse, so it is a per-attachment call, not something the pose does for all 128
+bones.
 
 Posing is a single linear pass with no recursion and no per-bone track lookup —
 `gltf_loader` guarantees bones are topologically sorted and clip tracks are dense
@@ -529,76 +698,235 @@ Notes:
 ## renderer.hpp
 
 Owns the GPU-side mesh/material/instance pipeline: one shared vertex buffer, one
-shared index buffer, one streamed per-frame instance buffer.
+shared index buffer, one streamed per-frame instance buffer. On top of that sits
+an optional multi-pass path — cascaded shadows, an analytic sky, water with a
+planar reflection, particles, bloom and a tonemap/grade.
 
 ```cpp
 struct mesh     { idx vbo, vertex_offset, vertex_size, vertex_count, index_offset, index_count; };
-struct material { idx shader, texture; vec3 color; float metallic, roughness; };
-struct pix_render_instance { idx mesh, material; mat4 trainsform; };  // [sic]
-struct camera   { vec3 position, direction, up; };
 
-struct pix_renderer {
-    int width, height; vec3 clear_color;
-    pix_render_instance instances[MAX_RENDERABLE];   // MAX_RENDERABLE = 1024
-    mesh meshes[MAX_MESHES]; material materials[MAX_MATERIALS]; idx shaders[MAX_SHADERS];
-    // MAX_MESHES = MAX_MATERIALS = 128, MAX_SHADERS = 32
-    idx shader; size_t mesh_count, material_count, shader_count, renderable_count;
-    idx vertex_cursor, index_cursor;      // bump allocators into the shared buffers
-    mat4 view_matrix, projection_matrix;
-    idx vao, models_vbo, instances_vbo, ebo;
-    idx white_texture; mem_arena tex_arena;
+struct material {
+    idx shader, texture;
+    vec3 color; float metallic, roughness;
+    vec3 emissive;       // linear radiance the surface gives off; what bloom serves
+    float glass;         // how far the texture's dark texels go toward a mirror
+    vec3 window_glow;    // emission weighted toward the dark texels
 };
 
-pix_renderer pix_create_renderer(int width, int height, idx shader,
-                                  vec3 clear_color = { 0.0f, 0.5f, 0.8f });
-void pix_destory_renderer(pix_renderer& renderer);   // [sic] frees tex_arena only
+struct pix_render_instance {
+    idx mesh, material;
+    mat4 transform;
+    uint32_t dist_bucket;   // filled in by the sort; PIX_DIST_BUCKET metre steps
+};
 
-idx load_mesh(pix_renderer& renderer, mesh_file_data& mesh_data);
-    // appends into models_vbo/ebo via glBufferSubData; records vertex/index offsets
-idx load_skinned_mesh(pix_renderer& renderer, skinned_mesh_file_data& mesh_data);
-    // same, into the animated pool; returns an index into skinned_meshes[]
-idx load_material(pix_renderer& renderer, const char* texture_path = nullptr,
-                   vec3 color = {1,1,1}, float metallic = 0.1f, float roughness = 0.5f);
-idx load_material_image(pix_renderer& renderer, image_file_data* image,
-                   vec3 color = {1,1,1}, float metallic = 0.1f, float roughness = 0.5f);
-    // for an already-decoded texture, e.g. one embedded in a .glb
-idx get_default_material(pix_renderer& renderer);     // white, untextured
-idx load_shader(pix_renderer& renderer, const char* vsrc, const char* fsrc);
-
-void begin_frame(pix_renderer& renderer, camera& cam);   // rebuilds view_matrix, resets both instance lists
-void push_instance(pix_renderer& renderer, pix_render_instance& instance);
-void push_animated_instance(pix_renderer& renderer, pix_render_instance& instance,
-                             const animation& pose);
-    // `instance.mesh` indexes skinned_meshes[]; `pose` is referenced, not copied,
-    // so it must stay alive until end_frame (an animator's .pose does)
-void end_frame(pix_renderer& renderer, bool clear_instances = true);
+struct camera { vec3 position, direction, up; };
 ```
 
-`end_frame` runs two passes:
+Pool sizes (all compile-time, all flat arrays inside `pix_renderer`):
 
-- **static** — sorts instances by (mesh, material) and issues one
-  `glDrawElementsInstancedBaseVertex` per (mesh, material) run.
-- **animated** — one draw per instance, with `uModel` and the pose's `uBones[]`
-  uploaded per draw. Instancing buys nothing here because every instance needs its
-  own bone matrices, which is also why the animated path has no instance VBO.
+```
+MAX_RENDERABLE 24576   MAX_ANIMATED 96      MAX_MESHES 512
+MAX_MATERIALS  768     MAX_SHADERS  32      MAX_PARTICLES 4096
+MAX_WATER_INSTANCES 12288
+MESH_POOL_VERTICES/INDICES (1<<21)          SKIN_POOL_VERTICES (1<<18) / INDICES (1<<19)
+```
 
-Both pools live in their own VAO: static meshes use the `vertex` layout
-(pos/normal/uv + per-instance mat4 at locations 3..6), skinned meshes use
-`vertex_rigged` (pos/normal/uv/bone_ids/bone_weights at locations 0..4).
-`pix_create_renderer` compiles `VSHDER_SKINNED + FSHDER_BASIC` into
-`renderer.skinned_shader`; overwrite that field to use your own.
+Running out of a mesh pool is silent from the outside — meshes loaded after it
+fills simply do not exist — so anything loading a large catalogue should report
+how full it is. `load_material` and `load_material_image` bounds-check instead of
+overrunning, because an overrun there corrupts whatever the compiler placed after
+`materials[]` and fails several frames later somewhere else entirely.
+
+### loading
+
+```cpp
+pix_renderer pix_create_renderer(int width, int height, idx shader,
+                                  vec3 clear_color = { 0.0f, 0.5f, 0.8f });
+void pix_destory_renderer(pix_renderer&);   // [sic]
+
+idx load_mesh(pix_renderer&, mesh_file_data&);
+    // appends into models_vbo/ebo via glBufferSubData; records vertex/index offsets
+idx load_skinned_mesh(pix_renderer&, skinned_mesh_file_data&);
+idx load_material(pix_renderer&, const char* texture_path = nullptr,
+                  vec3 color = {1,1,1}, float metallic = 0.1f, float roughness = 0.5f);
+idx load_material_image(pix_renderer&, image_file_data*, vec3 color = {1,1,1},
+                  float metallic = 0.1f, float roughness = 0.5f, bool pixelated = false);
+    // for an already-decoded texture, e.g. one embedded in a .glb. `pixelated`
+    // is for generated colour palettes, where a linear filter blends one
+    // material's cell into the next
+idx clone_material(pix_renderer&, idx source, vec3 color, float metallic, float roughness);
+    // a second material over the *same* GL texture — per-instance tints without
+    // decoding and uploading the image again
+idx get_default_material(pix_renderer&);     // white, untextured
+idx load_shader(pix_renderer&, const char* vsrc, const char* fsrc);
+```
+
+### the frame
+
+```cpp
+void begin_frame(pix_renderer&, camera&);
+    // rebuilds view/projection, extracts the frustum, clears the instance lists
+    // and the light list, fits the shadow cascades
+
+void push_instance(pix_renderer&, pix_render_instance&);
+void push_instance(pix_renderer&, idx mesh, idx material, const mat4& transform);
+void push_animated_instance(pix_renderer&, pix_render_instance&, const animation& pose);
+    // `pose` is referenced, not copied — it must stay alive until end_frame
+    // (an animator's .pose does)
+void push_water(pix_renderer&, idx mesh, idx material, const mat4& transform);
+void push_particle(pix_renderer&, vec3 at, float size, vec3 color, float alpha);
+    // `size` is a half-width in metres; `color` is linear radiance, deliberately
+    // unclamped so a bright spark reaches the bloom threshold
+void push_light(pix_renderer&, const pix_light&);
+
+void end_frame(pix_renderer&, bool clear_instances = true);
+```
+
+Lights are submitted per frame the way draw calls are, and a light that stops
+being submitted stops existing — which is what makes a row of lamps fading up at
+dusk one line of gameplay code rather than a resource to manage. `end_frame`
+keeps the `MAX_SHADER_LIGHTS` nearest the camera (see `lighting.hpp`).
+
+`end_frame` sorts the opaque list by (mesh, material) and then near-to-far inside
+each run, uploads the whole frame's transforms in **one** `glBufferSubData`, and
+issues one `glDrawElementsInstancedBaseVertexBaseInstance` per batch. The
+near-to-far ordering is what lets the shadow and reflection passes take a near
+slice of a batch without compacting a second list for it.
+
+The animated path is one draw per instance with its own `uBones[]`, because every
+instance needs different bone matrices. Static meshes use the `vertex` layout
+(pos/normal/uv, per-instance mat4 at locations 3..6); skinned meshes use
+`vertex_rigged` (pos/normal/uv/bone_ids/bone_weights at 0..4) in their own VAO.
+
+### effects
+
+```cpp
+void pix_enable_effects(pix_renderer&, int shadow_resolution = 2048);
+    // allocates the HDR scene target, the shadow atlas and the bloom chain, and
+    // switches end_frame to the multi-pass path
+void pix_set_time(pix_renderer&, float seconds);        // drives waves, rain, foliage sway
+void pix_set_time_of_day(pix_renderer&, float hour);    // sun, sky, fog, night factor
+void pix_set_weather(pix_renderer&, const pix_weather&);// cloud deck, rain, ground wetness
+```
+
+**Everything above is opt-in.** Skip `pix_enable_effects` and `end_frame` degrades
+to the plain forward draw, with no framebuffers allocated and no extra passes.
+With it on, a frame is: shadow cascades → (reflection, if water was pushed) →
+sky → opaque → water → particles → bloom → post.
+
+Tunables live as plain fields on `pix_renderer`, all safe to write between
+frames: `exposure`, `saturation`, `contrast`, `split_tone`, `vignette`,
+`sharpen`, `bloom_threshold`, `bloom_knee`, `bloom_strength`, `shadow_strength`
+(0 turns shadows off without unbinding anything), `shadow_extent`, `shadow_depth`.
+
+### measuring it
+
+```cpp
+void   pix_enable_gpu_timing(pix_renderer&, bool on);
+double pix_gpu_pass_ms(const pix_renderer&, int pass);   // PIX_GPU_PASS_NAMES[]
+```
+
+`GL_TIME_ELAPSED` around each pass. Off by default: the queries are cheap to keep
+but the driver has to fence around them, and a measurement that changes what it
+measures is only worth taking while somebody is reading it. Nothing measured on
+the CPU can tell one pass from another — every GL call returns long before its
+work does — so this is the only way to find out where a frame actually went.
 
 Typical frame:
 
 ```cpp
 begin_frame(renderer, cam);
-for (...) push_instance(renderer, instance);
+for (...) push_instance(renderer, mesh, material, transform);
+for (...) push_light(renderer, pix_point_light(at, 12.0f, colour));
 
 animator_update(actor, dt);
-push_animated_instance(renderer, fox_instance, actor.pose);
+push_animated_instance(renderer, actor_instance, actor.pose);
 
 end_frame(renderer);
 ```
+
+---
+
+## lighting.hpp
+
+Everything that lights the world, kept apart from the thing that draws it. Three
+kinds of light, deliberately different things rather than one general case.
+
+```cpp
+#define MAX_SCENE_LIGHTS   512   // what a frame may collect before culling
+#define MAX_SHADER_LIGHTS  32    // what one draw uploads and shades with
+#define SHADOW_CASCADES    3
+
+struct pix_light { vec3 position; float radius; vec3 color;
+                   float cos_inner; vec3 direction; float cos_outer; };
+struct pix_sun   { vec3 direction;   // normalised, pointing *toward* the sun
+                   vec3 color; };    // linear radiance, well above 1 in daylight
+struct pix_sky   { vec3 zenith, horizon, ground, diffuse_up, diffuse_down, fog;
+                   float fog_density; };
+struct pix_weather { float overcast, rain, wetness; };   // each 0..1
+
+pix_light pix_point_light(vec3 position, float radius, vec3 color);
+pix_light pix_spot_light (vec3 position, vec3 direction, float radius,
+                          float inner, float outer, vec3 color);
+```
+
+- **sun** — one directional light, the only one that casts a shadow map.
+- **sky** — an environment, not a light: hemisphere irradiance plus a dome colour
+  every glossy surface reflects. Analytic, so the backdrop, a reflection in a
+  glossy surface and a reflection in water are one function evaluated three times.
+- **punctual** — point and spot lights, gathered per frame and culled to the ones
+  nearest the camera. Stored the way the shader wants them, so uploading a frame
+  is three `glUniform4fv` calls and no per-light work.
+
+A light's falloff is *windowed* to reach exactly zero at `radius`, so a light
+leaving the shader's 32 slots never pops.
+
+### time of day and weather
+
+```cpp
+void  pix_daylight_at(float hour, pix_sun*, pix_sky*, float* exposure);
+void  pix_weather_apply(const pix_weather&, pix_sun*, pix_sky*, float* exposure);
+float pix_night_factor(const pix_sun&);   // 0 by day, 1 after dusk
+```
+
+Keyframed rather than derived from a physical sky model, so every hour looks
+deliberately chosen and an hour in between is a straight interpolation of two
+setups that were each picked to look right. The keys wrap, so 23:00 blends into
+05:00 through the night key rather than racing backwards through noon. Exposure
+is part of the hour, not a constant: a night scene carries a hundredth of the
+light a noon scene does and no amount of adding lamps closes that gap.
+
+`pix_weather_apply` runs *after* the hour is chosen and bends that setup toward
+the cloud deck, so a new hour keyframe is automatically correct in the rain.
+`pix_night_factor` is what artificial light should ride on — lamps fading in over
+dusk instead of switching, and deliberately read off the *clear* sun elevation so
+a dark overcast does not switch every lamp in the world on at noon.
+
+---
+
+## framebuffer.hpp
+
+Offscreen render targets. Two shapes cover nearly everything:
+
+```cpp
+struct framebuffer { idx fbo, color, depth; int width, height; bool hdr; };
+
+framebuffer pix_create_render_target(int w, int h, bool hdr = true, bool mipmapped = false);
+framebuffer pix_create_shadow_map(int w, int h);
+void pix_destroy_framebuffer(framebuffer&);
+
+void pix_bind_framebuffer(const framebuffer&);   // also sets the viewport
+void pix_bind_backbuffer(int width, int height);
+void pix_draw_fullscreen(void);                  // no VBO; the VS builds it from gl_VertexID
+```
+
+Depth is always a texture, never a renderbuffer, because fog and any later depth
+effect need to sample it. A shadow map's depth texture is set up for hardware
+comparison sampling (`sampler2DShadow`), which with `GL_LINEAR` gives free 2x2
+percentage-closer filtering, and clamps to a white border so anything outside the
+light's view is lit rather than shadowed. Binding a target sets the viewport,
+since forgetting that is the classic way to spend an hour wondering why half the
+screen is black.
 
 ---
 
@@ -724,6 +1052,314 @@ string means creating a new one (or calling `replace_sprites`/`clear_sprites`
 directly on `text.batch` yourself).
 
 ---
+
+---
+
+## random.hpp
+
+Deterministic, seekable noise. Procedural generation needs the same world every
+run from the same seed, and it needs to ask "what belongs at cell (x, z)?" out of
+order — so alongside the streaming generator there is a stateless hash.
+
+```cpp
+struct rng { uint32_t state; };
+
+rng   rng_seed(uint32_t seed);          // 0 is remapped; it is a xorshift fixed point
+uint32_t rng_u32(rng&);
+float rng_float(rng&);                  // [0, 1)
+float rng_range(rng&, float lo, float hi);
+int   rng_int(rng&, int lo, int hi);    // inclusive both ends
+bool  rng_chance(rng&, float probability);
+
+uint32_t hash_u32(uint32_t);
+uint32_t hash2(int x, int y, uint32_t seed);
+float    hash2_float(int x, int y, uint32_t seed);   // [0, 1) from a coordinate pair
+rng      rng_at(int x, int y, uint32_t seed);        // a whole stream seeded from a cell
+```
+
+`hash2_float` is the workhorse for per-cell decisions; `rng_at` is for when one
+cell needs a sequence of them rather than a single value.
+
+---
+
+## colliders.hpp
+
+Collision shapes and the tests between them. Pure geometry — nothing here knows
+about bodies, mass, velocity or time. `physics.hpp` is the layer that turns these
+answers into motion; anything else needing a shape query (placement checks, camera
+probes, triggers, editor tools) can use this header without the simulation.
+
+Every test that reports an overlap returns the **minimum translation**: a unit
+normal pointing from the first shape toward the second, and the depth to push them
+apart along it. So every contact resolves the same two ways.
+
+### 2D, in the XZ plane
+
+The tests a broadly flat game resolves its motion with — cheaper, and they never
+let a character drift off a floor it is standing on.
+
+```cpp
+struct aabb    { vec3 min, max; };
+struct rect2   { vec2 min, max; };
+struct circle2 { vec2 centre; float radius; };
+struct obb2    { vec2 centre, half; float yaw; };   // yaw matches mat4_rotate_y
+struct contact2 { vec2 normal; float depth; };
+
+aabb  aabb_make(vec3 min, vec3 max);
+aabb  aabb_from_centre(vec3 centre, vec3 half_extents);
+aabb  aabb_from_obb(const obb2&, float base_y, float height);
+vec3  aabb_centre(const aabb&);   vec3 aabb_half(const aabb&);
+float aabb_height(const aabb&);   rect2 aabb_footprint(const aabb&);
+bool  aabb_overlap(const aabb&, const aabb&);
+bool  aabb_contains_xz(const aabb&, vec2 p);
+bool  span_overlap(float a0, float ah, float b0, float bh);   // vertical bands
+
+vec2 closest_point_rect(const rect2&, vec2 p);
+vec2 closest_point_obb (const obb2&,  vec2 p);
+
+bool collide_circle_circle(const circle2&, const circle2&, contact2*);
+bool collide_circle_rect  (const circle2&, const rect2&,   contact2*);
+bool collide_circle_obb   (const circle2&, const obb2&,    contact2*);
+bool collide_obb_obb      (const obb2&,    const obb2&,    contact2*);   // SAT
+bool collide_obb_rect     (const obb2&,    const rect2&,   contact2*);
+
+bool ray_vs_aabb(vec3 origin, vec3 inv_dir, const aabb&, float max_distance, float* out_t);
+    // `inv_dir` is the componentwise reciprocal of a *normalised* direction,
+    // precomputed because a raycast tests one ray against many boxes
+```
+
+### 3D
+
+For the queries a flattened test gets wrong rather than merely approximates — a
+shot arcing over a wall, something standing on a sloped surface, a trigger volume
+a player can jump out of the top of.
+
+```cpp
+struct sphere  { vec3 centre; float radius; };
+struct capsule { vec3 a, b; float radius; };     // a segment swept by a sphere
+struct plane   { vec3 normal; float distance; }; // dot(normal, p) == distance
+struct contact3 { vec3 normal; float depth; };
+
+sphere  sphere_make(vec3 centre, float radius);
+capsule capsule_make(vec3 a, vec3 b, float radius);
+capsule capsule_upright(vec3 base, float height, float radius);
+    // the character case: standing on `base`, `height` tall overall. A height
+    // under two radii cannot be a capsule and collapses to a sphere.
+plane   plane_make(vec3 normal, float distance);
+plane   plane_through(vec3 normal, vec3 point);
+
+aabb  sphere_bounds(const sphere&);
+aabb  capsule_bounds(const capsule&);
+float plane_distance_to(const plane&, vec3 point);   // signed, positive in front
+
+vec3 closest_point_segment(vec3 a, vec3 b, vec3 p);
+vec3 closest_point_aabb(const aabb&, vec3 p);
+vec3 closest_point_plane(const plane&, vec3 point);
+void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2, vec3* c1, vec3* c2);
+
+bool collide_sphere_sphere  (const sphere&,  const sphere&,  contact3*);
+bool collide_sphere_plane   (const sphere&,  const plane&,   contact3*);
+bool collide_sphere_aabb    (const sphere&,  const aabb&,    contact3*);
+bool collide_sphere_capsule (const sphere&,  const capsule&, contact3*);
+bool collide_capsule_capsule(const capsule&, const capsule&, contact3*);
+bool collide_capsule_plane  (const capsule&, const plane&,   contact3*);
+bool collide_capsule_aabb   (const capsule&, const aabb&,    contact3*);
+
+bool ray_vs_sphere (vec3 origin, vec3 dir, const sphere&,  float max_d, float* out_t);
+bool ray_vs_plane  (vec3 origin, vec3 dir, const plane&,   float max_d,
+                    bool two_sided, float* out_t);
+bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule&, float max_d, float* out_t);
+```
+
+Rays take a **normalised** direction and report the near hit distance, clamped to
+0 when the ray starts inside. `ray_vs_plane`'s one-sided default is what a floor
+wants: a ray travelling with the normal passes through rather than hitting the
+underside.
+
+A capsule is stored as a segment rather than centre/height/radius because that is
+the form every test wants, and because it costs nothing to let one lie on its side
+or lean. `collide_capsule_aabb` resolves the capsule as a sphere at the point on
+its axis nearest the box — exact for a face or end-cap contact, which is nearly
+every contact a character makes, and slightly generous on a steep edge hit.
+
+---
+
+## jobs.hpp
+
+The only threading in the library, and deliberately the smallest thing that does
+the job. No work stealing, no futures, no allocation, no job graph.
+
+```cpp
+#define PIX_MAX_WORKERS 15   // plus the calling thread, so up to 16 cores busy
+
+typedef void (*pix_job_fn)(void* user, size_t begin, size_t end, int worker);
+
+void pix_jobs_start(pix_jobs&, int workers = -1);   // -1 = one per hardware core
+void pix_jobs_stop(pix_jobs&);
+void pix_parallel_for(pix_jobs&, size_t count, pix_job_fn, void* user, size_t grain);
+    // runs fn over [0, count) and returns once every item is done. `grain` is the
+    // smallest slice a worker claims; below it the range is run inline.
+
+void pix_task_start(pix_task&);                     // spins the side thread up
+void pix_task_run(pix_task&, void (*fn)(void*), void* user);   // hand it work
+void pix_task_wait(pix_task&);                      // block until that work is done
+void pix_task_stop(pix_task&);
+```
+
+`worker` is 0 for the thread that called `pix_parallel_for` and 1..n for the pool,
+so a job body that needs per-thread scratch (an rng, a scratch buffer) can index
+it without a lock.
+
+`pix_task` is kept apart from the pool because it *overlaps* with it rather than
+feeding off it: the point is that it is still running while the main thread drives
+a `pix_parallel_for` of its own. Sampling a few dozen skeletons alongside the
+physics step is the shape it exists for.
+
+Rules the caller has to keep, since nothing here can enforce them:
+
+- a parallel body writes only to item `i`'s own storage
+- anything that adds or removes an entity stays on the main thread — the pools
+  are not thread safe and making them so would cost more than the work being split
+- anything drawing from a shared rng takes the per-worker one instead
+
+---
+
+## physics.hpp
+
+A small, allocation-light physics world: an immovable set of axis-aligned boxes
+plus a population of upright cylinders (characters) and oriented boxes (vehicles,
+crates) that push against them and each other.
+
+It is deliberately **2.5D**. For a game played on broadly flat ground every
+collision that matters resolves in the XZ plane, and Y is only gravity plus a
+ground clamp. That buys a solver that is a couple of hundred lines, runs a
+thousand bodies in well under a millisecond, and never tunnels at the speeds a
+vehicle reaches. A game that needs true 3D contact wants a different solver, not
+a taller version of this one.
+
+```cpp
+#define PHYS_MAX_BODIES  2048    #define PHYS_MAX_STATICS 32768
+#define PHYS_CELL 10.0f          // metres per broadphase cell
+#define PHYS_CYLINDER 0          // upright; radius wide, height tall, origin at the feet
+#define PHYS_BOX      1          // upright box; `half` extents in local XZ, rotated by yaw
+
+// a body tests a candidate only when (a.collides & b.group) || (b.collides & a.group)
+#define PHYS_LAYER_0..PHYS_LAYER_7        // the engine gives the bits no meaning
+#define PHYS_LAYER_PLAYER    PHYS_LAYER_0 // names most games end up wanting
+#define PHYS_LAYER_CHARACTER PHYS_LAYER_1
+#define PHYS_LAYER_VEHICLE   PHYS_LAYER_2
+#define PHYS_LAYER_PROP      PHYS_LAYER_3
+#define PHYS_LAYER_ALL       0xFFFFu
+
+struct phys_body {
+    vec3 position, velocity;     // position is the XZ centre, Y at the feet
+    float yaw, radius; vec2 half; float height;
+    float inv_mass;              // 0 = immovable
+    float restitution, drag, friction;
+    uint8_t shape;
+    bool active, gravity, on_ground, touched;
+    float impact;                // largest normal impulse this step, in m/s
+    uint16_t group, collides;
+    void* user;                  // the game-side owner, so a hit traces back
+};
+
+void phys_create_world(phys_world&);
+void phys_destroy_world(phys_world&);
+
+void phys_add_static_box(phys_world&, vec3 min, vec3 max);
+void phys_add_static_prop(phys_world&, vec3 position, float yaw, vec2 half, float height);
+void phys_build_statics(phys_world&);    // buckets them into the uniform grid
+void phys_reset_statics(phys_world&);    // drops the statics, keeps the bodies
+
+idx        phys_add_body(phys_world&, const phys_body&);
+phys_body* phys_get_body(phys_world&, idx);
+void       phys_remove_body(phys_world&, idx);
+
+void phys_step(phys_world&, float dt);
+```
+
+### queries
+
+```cpp
+bool   phys_raycast(const phys_world&, vec3 origin, vec3 direction,
+                    float max_distance, float* out_distance);          // statics only
+idx    phys_raycast_bodies(const phys_world&, vec3 origin, vec3 direction,
+                    float max_distance, uint16_t mask, idx ignore, float* out_distance);
+size_t phys_overlap_bodies(const phys_world&, vec3 centre, float radius,
+                    idx* out, size_t capacity);                        // linear scan
+size_t phys_query_neighbours(const phys_world&, vec3 centre, float radius,
+                    idx* out, size_t capacity);                        // via the hash grid
+bool   phys_point_blocked(const phys_world&, vec3 position, float radius, float height);
+```
+
+A projectile needs both raycasts and needs to know which came first, so it asks
+each in turn and keeps the nearer hit. `phys_query_neighbours` reads the dynamic
+grid `phys_step` rebuilt, so game code running between steps can ask it instead of
+walking every body.
+
+### uneven ground
+
+```cpp
+float (*ground_at)(void* user, float x, float z);   // field on phys_world
+void*  ground_user;
+```
+
+One `ground_y` is right for a single flat plane and wrong for a ledge, a slope or
+a bridge deck. Set this and bodies land on whatever height it returns. **It is
+called from the threaded integration phase, so it must only read** — no lazily
+built caches, no allocation, no writing back into the terrain it reads.
+`step_height` is the separate allowance for stepping *up* onto something short
+rather than being stopped by it.
+
+### threading
+
+Hand the world a `pix_jobs*` and two of the three phases split across it. Which
+two is decided by what each phase writes, not by what it costs:
+
+| phase | writes | threaded |
+|---|---|---|
+| integration | body `i` writes body `i` | yes |
+| static contacts | body `i`, reading a grid nothing mutates | yes — and the expensive one |
+| dynamic contacts | resolving a pair writes **both** bodies | no |
+
+Splitting only what is provably independent is why there is not a lock anywhere in
+the step.
+
+---
+
+## profile.hpp
+
+Where the milliseconds went, per section, averaged over a second. It exists
+because the answer is never the one anybody guesses.
+
+```cpp
+#define PIX_PROF_MAX_SECTIONS 16
+
+void pix_profiler_init(pix_profiler&, const char* const* names, int count);
+bool pix_profile_frame(pix_profiler&);   // call once per frame; true on a print frame
+
+PIX_PROFILE(prof, SECTION_ENUM);         // scoped; an early return cannot leak it
+```
+
+Off unless `PIX_PROF` is set in the environment. When it is off the scopes still
+call `QueryPerformanceCounter`, which is tens of nanoseconds against sections
+measured in whole milliseconds and cheaper than the branch mispredicts guarding
+every one of them would cost. It prints one line a second, not one a frame:
+per-frame numbers for a section costing 0.4 ms are noise, and a second of them is
+a measurement. Sections are a plain caller-side enum ending in a count, so this
+file has no idea what a "sim" or a "cull" is.
+
+---
+
+## loader/png_writer.hpp
+
+Writes an RGBA8 buffer out as a PNG — stored (uncompressed) deflate blocks plus
+the CRC and Adler checksums, since the point is a screenshot or a debug dump, not
+a small file.
+
+```cpp
+bool png_write_file(const char* path, int width, int height, const unsigned char* rgba);
+```
 
 ## Typical frame (3D + 2D overlay)
 

@@ -1,5 +1,6 @@
 #pragma once
 #include <math.h>
+#include <string.h>
 #include "dtype.hpp"
 #include "math.hpp"
 #include "../loader/asset_types.hpp"
@@ -12,7 +13,12 @@
 // clip's tracks are dense - tracks[i] belongs to bone i, so there is no lookup.
 
 #define MAX_ANIM_BONES     128  // must match the uBones[] size in shader_sources.hpp
-#define MAX_ANIMATOR_CLIPS 16
+// Clips one animator can hold. A character rig from a typical asset pack
+// ships twenty to thirty of them, and an animator that silently drops the
+// tail of that list is a bug nobody sees until a rarely-played clip turns
+// out to be the bind pose - so the ceiling is set well above one file's
+// worth, with room for clips retargeted onto the rig from elsewhere.
+#define MAX_ANIMATOR_CLIPS 40
 
 // a resolved pose: bones[i] = global_transform(i) * inverse_bind(i)
 struct animation {
@@ -39,6 +45,16 @@ static idx  animator_add_clip(animator& a, animation_clip_file_data* clip);
 // the core query: a clip index and a time in seconds -> every bone's matrix.
 // `time` is wrapped into the clip automatically, so raw elapsed time is fine.
 static void animator_sample(const animator& a, idx clip, float time, animation* out);
+
+// Two clips at once, blended `weight` of the way from `a_clip` to `b_clip`.
+//
+// The blend happens on each bone's local translation/rotation/scale, before the
+// hierarchy is walked - never on the finished skinning matrices. Lerping two
+// matrices that differ by a large rotation shears and shrinks the limb between
+// them, and between two poses that are far apart that is worse than the pop it
+// was meant to hide.
+static void animator_sample_blend(const animator& a, idx a_clip, float a_time,
+                                  idx b_clip, float b_time, float weight, animation* out);
 
 // convenience playback on top of it
 static void animator_play(animator& a, idx clip, bool loop = true, float speed = 1.0f);
@@ -145,6 +161,65 @@ static void animator_sample(const animator& a, idx clip, float time, animation* 
     }
 }
 
+// one bone's local pose out of a clip; falls back to the bind pose when the
+// clip has no track for it
+static void anim__local(const skeleton_file_data& sk, const animation_clip_file_data* c,
+                        size_t i, float time, vec3* p, quat* r, vec3* s) {
+    const bone& b = sk.bones[i];
+    *p = b.local_position; *s = b.local_scale; *r = b.local_rotation;
+    if (!c || i >= c->track_count || !c->tracks[i].keyframe_count) return;
+
+    const bone_animation_track& tr = c->tracks[i];
+    size_t k = anim__find_key(tr.keyframes, tr.keyframe_count, time);
+    const bone_keyframe& k0 = tr.keyframes[k];
+    if (k + 1 >= tr.keyframe_count) { *p = k0.position; *s = k0.scale; *r = k0.rotation; return; }
+
+    const bone_keyframe& k1 = tr.keyframes[k + 1];
+    float span = k1.time - k0.time;
+    float u = (span > 1e-8f) ? (time - k0.time) / span : 0.0f;
+    if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+    *p = v3lerp(k0.position, k1.position, u);
+    *s = v3lerp(k0.scale, k1.scale, u);
+    *r = quat_slerp(k0.rotation, k1.rotation, u);
+}
+
+static float anim__wrap(const animation_clip_file_data* c, float time) {
+    if (!c || c->duration <= 0.0f) return time;
+    time = fmodf(time, c->duration);
+    return time < 0.0f ? time + c->duration : time;
+}
+
+static void animator_sample_blend(const animator& a, idx a_clip, float a_time,
+                                  idx b_clip, float b_time, float weight, animation* out) {
+    if (!a.skeleton) { out->bone_count = 0; return; }
+    if (weight <= 0.001f) { animator_sample(a, a_clip, a_time, out); return; }
+    if (weight >= 0.999f) { animator_sample(a, b_clip, b_time, out); return; }
+
+    const skeleton_file_data& sk = *a.skeleton;
+    const animation_clip_file_data* ca = (a_clip < a.clip_count) ? a.clips[a_clip] : 0;
+    const animation_clip_file_data* cb = (b_clip < a.clip_count) ? a.clips[b_clip] : 0;
+    a_time = anim__wrap(ca, a_time);
+    b_time = anim__wrap(cb, b_time);
+
+    size_t n = sk.bone_count < MAX_ANIM_BONES ? sk.bone_count : MAX_ANIM_BONES;
+    out->bone_count = n;
+
+    mat4 global[MAX_ANIM_BONES];
+    for (size_t i = 0; i < n; i++) {
+        vec3 pa, sa, pb, sb; quat ra, rb;
+        anim__local(sk, ca, i, a_time, &pa, &ra, &sa);
+        anim__local(sk, cb, i, b_time, &pb, &rb, &sb);
+
+        mat4 local = mat4_from_trs(v3lerp(pa, pb, weight),
+                                   quat_slerp(ra, rb, weight),
+                                   v3lerp(sa, sb, weight));
+        const bone& b = sk.bones[i];
+        global[i] = (b.parent < 0) ? mat4_mul(sk.root_transform, local)
+                                   : mat4_mul(global[b.parent], local);
+        out->bones[i] = mat4_mul(global[i], b.inverse_bind);
+    }
+}
+
 static void animator_play(animator& a, idx clip, bool loop, float speed) {
     a.clip = clip;
     a.time = 0.0f;
@@ -165,4 +240,32 @@ static void animator_update(animator& a, float dt) {
         }
     }
     animator_sample(a, a.clip, a.time, &a.pose);
+}
+
+// ---- attaching something to a bone ----
+//
+// A pose holds skinning matrices - global(i) * inverse_bind(i) - because that
+// is what the vertex shader wants and nothing else needs more. Parenting a
+// prop to a bone does: a held object has to be placed at the *global*
+// transform of that bone, in the character's own model space, and the skinning
+// matrix is exactly that transform with the bind pose already divided out of
+// it. Multiplying the bind pose back in is what these two do.
+//
+// Bone names differ between rigs, so the lookup takes a list of candidates and
+// returns the first that exists. It costs one 4x4 inverse per call, which is
+// why it is a per-attachment, per-frame call rather than something the pose
+// does for all 128 bones.
+static int animator_find_bone(const animator& a, const char* const* names, int count) {
+    if (!a.skeleton) return -1;
+    for (int n = 0; n < count; n++) {
+        if (!names[n]) break;
+        for (size_t i = 0; i < a.skeleton->bone_count; i++)
+            if (strcmp(a.skeleton->bones[i].name, names[n]) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static mat4 animation_bone_world(const animator& a, const animation& pose, int bone) {
+    if (!a.skeleton || bone < 0 || (size_t)bone >= pose.bone_count) return mat4_identity();
+    return mat4_mul(pose.bones[bone], mat4_inverse(a.skeleton->bones[bone].inverse_bind));
 }

@@ -120,7 +120,7 @@ void test_city_demo() {
             } else {
                 tile.mesh = base_mesh;
             }
-            tile.trainsform = mat4_mul(mat4_translate(x, 0.0f, z), mat4_rotate_y(rot));
+            tile.transform = mat4_mul(mat4_translate(x, 0.0f, z), mat4_rotate_y(rot));
             city[city_count++] = tile;
 
             if (!road && (rand() % 5) != 0) {
@@ -128,7 +128,7 @@ void test_city_demo() {
                 b.material = city_mat;
                 b.mesh = building_mesh[rand() % 8];
                 float s = 0.80f + (float)(rand() % 100) * 0.004f;
-                b.trainsform = mat4_mul(mat4_translate(x, 0.0f, z),
+                b.transform = mat4_mul(mat4_translate(x, 0.0f, z),
                     mat4_mul(mat4_rotate_y((float)(rand() % 4) * HALF_PI), mat4_scale(s, s, s)));
                 city[city_count++] = b;
             }
