@@ -1,81 +1,55 @@
-#pragma once
-#include <string.h>
-#include <stdio.h>
+// pix - built-in GLSL. Everything the renderer draws with, plus the building
+// blocks (scene block, BRDF, lights, shadows) for writing your own surface
+// shaders that light exactly like the built-in one - see load_surface_shader.
+#ifndef PIX_SHADER_SOURCES_HPP
+#define PIX_SHADER_SOURCES_HPP
+#include "dtype.hpp"
 
-// instanced: per-vertex pos/normal/uv (loc 0..2), per-instance model matrix (loc 3..6)
-const char* VSHDER_BASIC = R"(#version 440 core
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec3 aNormal;
-layout(location=2) in vec2 aUV;
-layout(location=3) in mat4 aModel;   // consumes 3..6
-uniform mat4 uViewProj;
-out vec3 vNormal;
-out vec2 vUV;
-out vec3 vWorld;
-void main() {
-    vec4 world = aModel * vec4(aPos, 1.0);
-    vWorld = world.xyz;
-    gl_Position = uViewProj * world;
-    vNormal = mat3(aModel) * aNormal;
-    vUV = vec2(aUV.x, 1.0 - aUV.y); // OBJ/Blender V origin is bottom, GL texture V is top
-}
-)";
-
-// Shared GLSL: an analytic daytime sky and the sRGB<->linear helpers. Prepended
-// to every shader that needs to sample the environment (surface reflections,
-// water reflections, the sky pass itself) so there is exactly one sky in the
-// scene and reflections always agree with the backdrop.
-//
-// sky_env returns *linear* radiance for a view direction: a horizon-to-zenith
-// gradient, a ground half below the horizon, and the sun as a sharp disc with
-// two softer glow lobes around it. Everything downstream tonemaps and gamma
-// encodes in the post pass, so nothing here clamps.
 // ---- the per-frame block ----
 //
-// Everything about the frame that every shader agrees on - where the sun is,
-// what the sky is doing, where the camera stands, how the shadow cascades are
-// laid out - in one std140 uniform buffer, uploaded once and bound for the
-// whole frame.
-//
-// Before this it was thirty-odd glUniform calls *per program per pass*, each
-// one preceded by a glGetUniformLocation, which is a string lookup inside the
-// driver: the surface shader, the skinned shader, the water and the sky each
-// re-sent the same sun direction several times a frame, and the shadow and
-// reflection passes sent it again. None of it was per-draw data and none of it
-// changed between those calls.
-//
-// Everything in here is a vec4 or a mat4 on purpose. std140 pads a vec3 out to
-// sixteen bytes anyway and aligns arrays to sixteen, so packing by hand into
-// vec4s is not a saving - it is how the C side and the GLSL side are kept
-// obviously identical, which is the only real hazard with a uniform block.
-// The names the shaders already used are then macros onto the members, so the
-// bodies below read exactly as they did.
-const char* GLSL_SCENE = R"(
+// Everything about the frame that every shader agrees on - the sun, the sky,
+// the camera, the shadow cascades - in one std140 uniform buffer, uploaded
+// once and bound for the whole frame at binding 0. Every member is a vec4 or
+// mat4 on purpose: std140 pads a vec3 to sixteen bytes anyway, and keeping
+// both sides trivially comparable is the only real defence against the C and
+// GLSL layouts drifting apart. Mirrored by pix_scene_block in renderer.hpp.
+static const char* const GLSL_SCENE = R"(
 layout(std140, binding = 0) uniform SceneBlock {
+    mat4 bViewProj;       // the main camera
+    mat4 bView;
     vec4 bSunDir;         // xyz normalised, toward the sun
     vec4 bSunColor;       // rgb linear radiance
     vec4 bSkyColor;       // rgb hemisphere irradiance from above
     vec4 bGroundColor;    // rgb hemisphere irradiance bounced from below
     vec4 bSkyZenith;      // rgb dome colour straight up
     vec4 bSkyHorizon;     // rgb dome colour at the horizon
-    vec4 bFog;            // rgb colour, w density
-    vec4 bCamera;         // xyz eye, w wetness
-    vec4 bShadow;         // xy one atlas texel, z strength
+    vec4 bSkyGround;      // rgb dome colour below the horizon
+    vec4 bFog;            // rgb linear colour, w density
+    vec4 bCamera;         // xyz eye, w seconds (pix_set_time)
+    vec4 bCameraDir;      // xyz forward
+    vec4 bShadow;         // xy one atlas texel, z strength (0 = off), w PCF radius
     mat4 bLightSpace[3];  // one projection per cascade, near to far
-    vec4 bCascadeFar;     // xyz view distance each cascade ends at
-    vec4 bCascadeTexel;   // xyz one shadow texel in world metres
+    vec4 bCascadeFar;     // xyz view depth each cascade ends at
+    vec4 bCascadeTexel;   // xyz one shadow texel in world units
+    mat4 bReflViewProj;   // the planar mirror's camera
+    vec4 bClipPlane;      // mirror pass: keep dot(n, p) + w >= 0; all zero = no clip
+    vec4 bReflect;        // x planar map ready, y env probe ready, z probe max mip, w probe intensity
+    vec4 bScreen;         // xy one pixel of the render target in uv
+    vec4 bShadowEye;      // xyz the main camera, which the cascades are fitted around
+    vec4 bShadowDir;      // xyz its forward
 };
-
+#define uViewProj       bViewProj
 #define uSunDir         bSunDir.xyz
 #define uSunColor       bSunColor.rgb
 #define uSkyColor       bSkyColor.rgb
 #define uGroundColor    bGroundColor.rgb
 #define uSkyZenith      bSkyZenith.rgb
 #define uSkyHorizon     bSkyHorizon.rgb
+#define uSkyGround      bSkyGround.rgb
 #define uFogColor       bFog.rgb
 #define uFogDensity     bFog.w
 #define uCameraPos      bCamera.xyz
-#define uWetness        bCamera.w
+#define uTime           bCamera.w
 #define uShadowTexel    bShadow.xy
 #define uShadowStrength bShadow.z
 #define uLightSpace     bLightSpace
@@ -83,51 +57,39 @@ layout(std140, binding = 0) uniform SceneBlock {
 #define uCascadeTexel   bCascadeTexel
 )";
 
-const char* GLSL_COMMON = R"(
+static const char* const GLSL_COMMON = R"(
 vec3 srgb_to_linear(vec3 c) { return pow(max(c, 0.0), vec3(2.2)); }
 vec3 linear_to_srgb(vec3 c) { return pow(max(c, 0.0), vec3(1.0 / 2.2)); }
 
-vec3 sky_env(vec3 dir, vec3 sunDir, vec3 sunColor, vec3 zenith, vec3 horizon, vec3 ground) {
+// Linear radiance of the analytic sky along `dir`: a horizon-to-zenith
+// gradient, a ground half below the horizon, and the sun as a disc with two
+// softer glow lobes. The backdrop and every reflection sample this one
+// function, so they always agree.
+vec3 sky_env(vec3 dir) {
     float up = dir.y;
     vec3 sky;
-    if (up >= 0.0) {
-        float t = pow(1.0 - up, 5.0);                 // haze bunched near the horizon
-        sky = mix(zenith, horizon, t);
-    } else {
-        sky = mix(horizon, ground, clamp(-up * 3.0, 0.0, 1.0));
-    }
-    float sd = max(dot(dir, normalize(sunDir)), 0.0);
-    sky += sunColor * pow(sd, 1800.0) * 16.0;         // disc
-    sky += sunColor * pow(sd, 28.0)   * 0.30;         // tight glow
-    sky += sunColor * pow(sd, 5.0)    * 0.06;         // wide forward scatter
+    if (up >= 0.0) sky = mix(uSkyZenith, uSkyHorizon, pow(1.0 - up, 5.0));
+    else           sky = mix(uSkyHorizon, uSkyGround, clamp(-up * 3.0, 0.0, 1.0));
+    float sd = max(dot(dir, normalize(uSunDir)), 0.0);
+    sky += uSunColor * pow(sd, 1800.0) * 16.0;         // disc
+    sky += uSunColor * pow(sd, 28.0)   * 0.30;         // tight glow
+    sky += uSunColor * pow(sd, 5.0)    * 0.06;         // wide forward scatter
     return sky;
+}
+
+vec3 apply_fog(vec3 color, vec3 world) {
+    float d = length(uCameraPos - world);
+    float fog = 1.0 - exp(-d * d * uFogDensity * uFogDensity);
+    return mix(color, uFogColor, clamp(fog, 0.0, 1.0));
 }
 )";
 
-// Splices GLSL_COMMON in immediately after a shader's #version line, so every
-// fragment shader that samples the sky (surfaces, water, the sky pass) shares
-// one definition. Returns a pointer into a static buffer - compile it before
-// calling again.
-static const char* shader_with_common(const char* src) {
-    static char buf[24576];
-    const char* nl = strchr(src, '\n');
-    if (!nl) return src;
-    size_t head = (size_t)(nl - src) + 1;
-    memcpy(buf, src, head);
-    int n = (int)head;
-    n += sprintf(buf + n, "%s\n%s\n", GLSL_SCENE, GLSL_COMMON);
-    sprintf(buf + n, "%s", src + head);
-    return buf;
-}
-
 // ---- shared BRDF ----
 //
-// Split out of the surface shader so the skinned pass, the water and anything
-// added later evaluate exactly the same material model. The pieces are the
-// standard ones and are named after the papers they come from, because the
-// point of a physically based renderer is that a surface behaves the way the
-// published model says it does rather than the way it was tuned to.
-const char* GLSL_BRDF = R"(
+// Standard metallic/roughness model, named after the papers it comes from, so
+// a surface behaves the way the published model says rather than the way it
+// happened to be tuned.
+static const char* const GLSL_BRDF = R"(
 const float PI = 3.14159265359;
 
 // GGX / Trowbridge-Reitz normal distribution (Walter et al. 2007)
@@ -147,9 +109,8 @@ vec3 f_schlick(float u, vec3 f0) {
     float m = clamp(1.0 - u, 0.0, 1.0);
     return f0 + (1.0 - f0) * (m * m * m * m * m);
 }
-// Karis' analytic environment BRDF fit (the "mobile" split-sum approximation),
-// so the ambient specular carries the right Fresnel and roughness weight
-// without a precomputed lookup table
+// Karis' analytic environment BRDF fit, so ambient specular carries the right
+// Fresnel and roughness weight without a lookup table
 vec3 env_brdf(vec3 f0, float rough, float ndv) {
     const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
     const vec4 c1 = vec4( 1.0,  0.0425,  1.04,  -0.04);
@@ -159,8 +120,6 @@ vec3 env_brdf(vec3 f0, float rough, float ndv) {
     return f0 * ab.x + ab.y;
 }
 
-// One evaluation of the full material against one light direction. `radiance`
-// is what arrives at the surface; everything above it is geometry.
 vec3 surface_brdf(vec3 n, vec3 v, vec3 l, vec3 diff_albedo, vec3 f0, float a, vec3 radiance) {
     vec3  h = normalize(l + v);
     float ndl = max(dot(n, l), 0.0);
@@ -168,28 +127,21 @@ vec3 surface_brdf(vec3 n, vec3 v, vec3 l, vec3 diff_albedo, vec3 f0, float a, ve
     float ndv = max(dot(n, v), 1e-4);
     float ndh = max(dot(n, h), 0.0);
     float vdh = max(dot(v, h), 0.0);
-
     vec3 F = f_schlick(vdh, f0);
     vec3 spec = d_ggx(ndh, a) * v_smith(ndv, ndl, a) * F;
     vec3 kd = vec3(1.0) - F;
     return (kd * diff_albedo / PI + spec) * radiance * ndl;
 }
 
-// The direction a rough surface's specular lobe actually points. A perfect
-// mirror reflects along reflect(-v, n); as roughness climbs the lobe leans back
-// toward the normal, and using the mirror direction anyway is what makes rough
-// metal look like a warped mirror instead of like brushed metal.
-// (Frostbite's getSpecularDominantDir, Lagarde & de Rousiers 2014.)
+// Where a rough surface's specular lobe actually points (Lagarde 2014)
 vec3 specular_dominant_dir(vec3 n, vec3 r, float rough) {
     float smoothness = clamp(1.0 - rough, 0.0, 1.0);
     float lerp_factor = smoothness * (sqrt(smoothness) + rough);
     return normalize(mix(n, r, lerp_factor));
 }
 
-// Windowed inverse-square falloff (Karis 2013). Physically an inverse square
-// never reaches zero, which would mean every light in the world touches every
-// pixel; the window pulls it to exactly zero at `radius` so a light can be
-// culled at a known distance without a visible edge where it stops.
+// Windowed inverse-square falloff (Karis 2013): physically correct near the
+// light, exactly zero at `radius` so lights can be culled without a seam.
 float light_falloff(float dist2, float radius) {
     float r2 = radius * radius;
     float f = clamp(1.0 - (dist2 * dist2) / max(r2 * r2, 1e-6), 0.0, 1.0);
@@ -197,16 +149,8 @@ float light_falloff(float dist2, float radius) {
 }
 )";
 
-// ---- punctual lights ----
-//
-// One uniform block shared by the surface and skinned shaders. Lights arrive
-// already reduced to the ones nearest the camera and packed into three vec4
-// arrays, so binding a frame's lighting is three uploads and no per-light work
-// in the draw loop.
-const char* GLSL_LIGHTS = R"(
-// The frame's punctual lights, in a block of their own rather than in the
-// scene block above: this one is rewritten every frame after the light list is
-// packed, and the two have no reason to share an upload.
+// ---- punctual lights, binding 1 ----
+static const char* const GLSL_LIGHTS = R"(
 layout(std140, binding = 1) uniform LightBlock {
     vec4 uLightPosRadius[32];    // xyz position, w radius
     vec4 uLightColorInner[32];   // rgb linear radiance, w cos(inner cone)
@@ -222,19 +166,15 @@ vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, floa
         float d2 = dot(to, to);
         float radius = uLightPosRadius[i].w;
         if (d2 > radius * radius) continue;
-
         vec3  l = to * inversesqrt(max(d2, 1e-8));
         float atten = light_falloff(d2, radius);
-
         float cos_outer = uLightDirOuter[i].w;
         if (cos_outer > -1.0) {                       // a cone, not a bulb
             float cd = dot(-l, uLightDirOuter[i].xyz);
-            float t = clamp((cd - cos_outer)
-                            / max(uLightColorInner[i].w - cos_outer, 1e-4), 0.0, 1.0);
+            float t = clamp((cd - cos_outer) / max(uLightColorInner[i].w - cos_outer, 1e-4), 0.0, 1.0);
             atten *= t * t;
         }
         if (atten <= 0.0) continue;
-
         sum += surface_brdf(n, v, l, diff_albedo, f0, a, uLightColorInner[i].rgb * atten);
     }
     return sum;
@@ -243,687 +183,509 @@ vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, floa
 
 // ---- cascaded shadow maps ----
 //
-// One directional light over a whole world cannot be served by one shadow map:
-// a single 2048 map stretched over the view distance gives texels metres across,
-// and stretched over the near field it stops casting anything past the first few
-// metres. So the view is split by distance into SHADOW_CASCADES slices, each
-// gets its own tightly fitted map, and a fragment picks the nearest slice it
-// falls inside.
-//
-// The three maps live side by side in one texture so the lookup needs one
-// sampler and one bind. Two details do most of the work in making the result
-// look solid rather than crawling:
-//
-//   normal offset  the sample position is pushed along the surface normal by
-//                  about a texel's worth of world space before it is projected.
-//                  A depth-only bias has to grow with the slope until it
-//                  detaches the shadow from whatever cast it; moving sideways
-//                  along the surface instead does not.
-//   cascade blend  the last stretch of each slice cross-fades into the next, so
-//                  the resolution change is a soft band rather than a visible
-//                  line drawn across the ground.
-const char* GLSL_SHADOW = R"(
-// The cascade projections, their ranges and the atlas texel size all live in
-// the scene block (GLSL_SCENE); the sampler is the one thing that cannot.
+// The view is split by depth into three slices, each with its own tightly
+// fitted, texel-snapped map, side by side in one atlas. Normal-offset sampling
+// instead of a large depth bias, and the last stretch of each cascade
+// cross-fades into the next so the resolution change is not a visible line.
+static const char* const GLSL_SHADOW = R"(
 uniform sampler2DShadow uShadowMap;
 
 float shadow_cascade(int c, vec3 world, vec3 n, float ndl) {
-    // normal offset, scaled by how oblique the light is to this surface
     float slope = clamp(1.0 - ndl, 0.0, 1.0);
     vec3 p_world = world + n * (uCascadeTexel[c] * (1.0 + 2.0 * slope) * 1.4);
-
     vec4 lp = uLightSpace[c] * vec4(p_world, 1.0);
     vec3 p = lp.xyz / lp.w * 0.5 + 0.5;
     if (p.z > 1.0 || p.z < 0.0) return 1.0;
-
-    // the cascade's own tile inside the atlas, inset so a filter tap can never
-    // read across into its neighbour
     float inset = uShadowTexel.x * 2.0;
     p.x = clamp(p.x, inset, 1.0 - inset) / 3.0 + float(c) / 3.0;
     p.y = clamp(p.y, uShadowTexel.y * 2.0, 1.0 - uShadowTexel.y * 2.0);
-
-    float bias = 0.0006;
+    float bias = 0.0004;
+    // radius 0 is one hardware-filtered tap (2x2 PCF for free); 1 and 2 widen the kernel
+    int k = int(bShadow.w);
     float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
+    for (int y = -k; y <= k; ++y)
+        for (int x = -k; x <= k; ++x)
             sum += texture(uShadowMap, vec3(p.xy + vec2(float(x) * uShadowTexel.x,
-                                                        float(y) * uShadowTexel.y),
-                                            p.z - bias));
-    return sum * (1.0 / 9.0);
+                                                        float(y) * uShadowTexel.y), p.z - bias));
+    float taps = float((2 * k + 1) * (2 * k + 1));
+    return sum / taps;
 }
 
-float sun_shadow(vec3 world, vec3 n, float ndl, float view_depth) {
+float sun_shadow(vec3 world, vec3 n, float ndl) {
     if (uShadowStrength <= 0.0) return 1.0;
-
+    // measured from the main camera even while rendering a mirror or a probe:
+    // that is who the cascades were fitted around
+    float depth = dot(world - bShadowEye.xyz, bShadowDir.xyz);
+    if (depth > uCascadeFar.z) return 1.0;
     int c = 2;
-    if (view_depth < uCascadeFar.x)      c = 0;
-    else if (view_depth < uCascadeFar.y) c = 1;
-
+    if (depth < uCascadeFar.x)      c = 0;
+    else if (depth < uCascadeFar.y) c = 1;
     float s = shadow_cascade(c, world, n, ndl);
-
-    // cross-fade the last tenth of a cascade into the next one
-    if (c < 2) {
-        float far_edge = (c == 0) ? uCascadeFar.x : uCascadeFar.y;
-        float band = far_edge * 0.12;
-        float t = clamp((view_depth - (far_edge - band)) / band, 0.0, 1.0);
-        if (t > 0.0) s = mix(s, shadow_cascade(c + 1, world, n, ndl), t);
-    }
+    float far_edge = uCascadeFar[c];
+    float band = far_edge * 0.12;
+    float t = clamp((depth - (far_edge - band)) / band, 0.0, 1.0);
+    if (t > 0.0) s = mix(s, c < 2 ? shadow_cascade(c + 1, world, n, ndl) : 1.0, t);
     return mix(1.0, s, uShadowStrength);
 }
 )";
 
-// Splices the sky, the BRDF, the light loop and the shadow lookup into a
-// shader in that order - each depends on the one before it.
-static const char* shader_with_pbr(const char* src) {
-    static char buf[3][32768];
-    static int  slot = 0;
-    char* out = buf[slot];
-    slot = (slot + 1) % 3;
-
-    const char* nl = strchr(src, '\n');
-    if (!nl) return src;
-    size_t head = (size_t)(nl - src) + 1;
-    memcpy(out, src, head);
-    int n = (int)head;
-    n += sprintf(out + n, "%s\n%s\n%s\n%s\n%s\n",
-                 GLSL_SCENE, GLSL_COMMON, GLSL_BRDF, GLSL_LIGHTS, GLSL_SHADOW);
-    sprintf(out + n, "%s", src + head);
-    return out;
+// ---- noise ----
+// Value noise and fbm, for procedural surfaces (water, lava, clouds, dissolve).
+static const char* const GLSL_NOISE = R"(
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
 }
-
-// The surface shader every solid thing in the world is drawn with. Metallic /
-// roughness PBR: a Cook-Torrance specular lobe over a Lambertian diffuse, lit by
-//
-//   * one shadowed directional sun, through the cascades above
-//   * an image based ambient that samples the same analytic sky the backdrop
-//     uses, along the roughness-corrected dominant reflection direction - so a
-//     car roof mirrors the real sky gradient and a brick wall picks up only its
-//     broad tint
-//   * every punctual light near enough to matter, through the same BRDF
-//
-// Albedo and tint arrive in sRGB and are linearised on read; all lighting is
-// done in linear space and the post pass owns the tonemap and the single gamma
-// encode.
-const char* FSHDER_BASIC = R"(#version 440 core
-in vec3 vNormal;
-in vec2 vUV;
-in vec3 vWorld;
-out vec4 frag;
-
-uniform sampler2D uTex;
-uniform vec3  uColor;
-uniform float uMetallic;
-uniform float uRoughness;
-uniform vec3  uEmissive;      // linear radiance added straight to the result
-uniform vec3  uWindowGlow;    // the same, but only out of the texture's dark patches
-uniform float uGlass;         // how far the texture's dark patches go toward glass
-
-// The sun, the sky, the fog and the camera all arrive in the scene block.
-
-// Used only by the water's planar reflection pass (see pix__reflection_pass):
-// a mirrored camera renders this same shader again, and anything below the
-// water's surface has to be discarded there - it is invisible to the real
-// camera, and left in it would show up as a mirrored island hanging in the
-// reflected sky. uClipSign is 0 for every ordinary draw, which multiplies the
-// test away entirely.
-uniform float uClipHeight;
-uniform float uClipSign;
-
-
-// Value noise over world XZ, for breaking the water film into puddles. Ground
-// that is uniformly wet edge to edge is ground that has been given a different
-// material, not ground it has rained on: what says "rain" is that some of it is
-// holding water and some of it has already drained.
-float wet_hash(vec2 p) {
-    return fract(sin(dot(p, vec2(41.7, 289.1))) * 43758.5453);
-}
-float wet_noise(vec2 p) {
+float value_noise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    float a = wet_hash(i), b = wet_hash(i + vec2(1.0, 0.0));
-    float c = wet_hash(i + vec2(0.0, 1.0)), d = wet_hash(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x),
+               mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y);
+}
+float fbm(vec2 p, int octaves) {
+    float sum = 0.0, amp = 0.5;
+    for (int i = 0; i < octaves; ++i) { sum += amp * value_noise(p); p = p * 2.03 + 17.1; amp *= 0.5; }
+    return sum;
+}
+)";
+
+// ---- the standard lit surface ----//
+// shade_surface() is the whole lighting model in one call: sun with cascaded
+// shadows, every punctual light, ambient from the sky (or the reflection probe
+// when one is running), Fresnel-weighted reflections, emission and fog.
+// Custom surface shaders compute their own albedo / normal / roughness and
+// hand them to it. shade_surface_ex adds a planar-mirror weight.
+//
+// Reflection sources, best available first:
+//   planar mirror  exact reflection across r.reflections.plane (uPlanarMap)
+//   probe          the scene around the camera, as a cubemap (uEnvMap)
+//   analytic sky   always there, costs nothing
+static const char* const GLSL_SURFACE = R"(
+uniform samplerCube uEnvMap;
+uniform sampler2D   uPlanarMap;
+uniform sampler2D   uRefractMap;
+uniform sampler2D   uSceneDepth;   // depth of the opaque scene, for see-through surfaces
+
+// view-space distance from a 0..1 depth-buffer value (perspective cameras)
+float linearize_depth(float d) {
+    float n = bScreen.z, f = bScreen.w;
+    return 2.0 * n * f / (f + n - (d * 2.0 - 1.0) * (f - n));
+}
+// how far away the opaque scene is behind this pixel, and how far this pixel is:
+// their difference is the thickness of water / glass / fog volume in between
+float scene_depth_at(vec2 uv) { return linearize_depth(texture(uSceneDepth, uv).r); }
+float fragment_depth() { return linearize_depth(gl_FragCoord.z); }
+vec2  screen_uv() { return gl_FragCoord.xy * bScreen.xy; }
+// the mirror pass renders only what lies on the visible side of the mirror
+void clip_test(vec3 world) {
+    if (dot(bClipPlane.xyz, bClipPlane.xyz) > 0.0 && dot(bClipPlane.xyz, world) + bClipPlane.w < 0.0) discard;
 }
 
-void main() {
-    if (uClipSign > 0.5 && vWorld.y < uClipHeight) discard;
-    vec3 n = normalize(vNormal);
-    vec3 v = normalize(uCameraPos - vWorld);
+// incoming light from direction `dir`, blurred to match `rough`
+vec3 env_specular(vec3 dir, float rough) {
+    if (bReflect.y > 0.5) return textureLod(uEnvMap, dir, rough * bReflect.z).rgb * bReflect.w;
+    vec3 flat_dome = mix(uSkyHorizon, uSkyZenith, clamp(dir.y * 0.5 + 0.5, 0.0, 1.0));
+    return mix(sky_env(dir), flat_dome, rough * rough);
+}
+
+// the mirror image at this surface point; nudged by the normal so ripples and
+// bumps break the reflection up
+vec3 planar_reflection(vec3 world, vec3 n, float rough) {
+    vec4 rc = bReflViewProj * vec4(world + vec3(n.x, 0.0, n.z) * 0.25, 1.0);
+    vec2 uv = clamp(rc.xy / max(rc.w, 1e-4) * 0.5 + 0.5, vec2(0.002), vec2(0.998));
+    return textureLod(uPlanarMap, uv, rough * 6.0).rgb;
+}
+
+// what lies behind this pixel, bent by the surface normal - glass, water, heat haze
+vec3 refraction_color(vec3 n, float strength) {
+    vec2 uv = gl_FragCoord.xy * bScreen.xy;
+    vec3 vn = (bView * vec4(n, 0.0)).xyz;
+    return texture(uRefractMap, clamp(uv + vn.xy * strength, vec2(0.001), vec2(0.999))).rgb;
+}
+
+vec3 shade_surface_ex(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive, float planar) {
+    vec3 v = normalize(uCameraPos - world);
     float ndv = max(dot(n, v), 1e-4);
-
-    // Cut-out foliage.
-    //
-    // Foliage, fences, grates and anything else billboarded onto a quad are
-    // alpha-masked cards: a texture with everything that is not the subject
-    // left transparent. Sampling only .rgb draws those transparent regions as
-    // opaque black, which turns a bush into a ball of black and green shards.
-    // A plain cut-out test costs nothing on an opaque texture, whose alpha is
-    // one everywhere, and is the whole fix for the cards.
-    vec4  tex = texture(uTex, vUV);
-    if (tex.a < 0.5) discard;
-
-    vec3  albedo = srgb_to_linear(tex.rgb * uColor);
-    float rough  = clamp(uRoughness, 0.045, 1.0);
-    float metal  = clamp(uMetallic, 0.0, 1.0);
-
-    // ---- wet ground ----
-    //
-    // A film of water does two opposite things at once, and wet ground only
-    // reads as wet when both are there. It fills the surface roughness in, so
-    // what was a diffuse sheet becomes close to a mirror - that is the
-    // reflection of the sky and of whatever is standing on it, stretching away
-    // from the viewer. And it traps light by internal reflection, so the
-    // surface underneath that mirror goes much darker than it was dry.
-    //
-    // Only faces the rain can land on, hence the n.y weight: a wall stays dry
-    // while the ground it meets shines.
-    // ---- glazing ----
-    //
-    // The windows are painted into the same texture as the wall, so there is
-    // no second material to give a different finish to and the only thing to
-    // go on is what the texel looks like. This finds the panes two ways,
-    // because this art set paints glass two ways.
-    //
-    // The first is darkness. What a camera sees looking into a window in
-    // daylight is mostly a dim room, so a swatch far darker than the wall
-    // around it is glazing. That test was cubed, which made it so selective
-    // that only the very darkest core of a window counted and the frame of
-    // reflective glass around it did not - squared, and with the luminance
-    // knee opened up, a whole pane qualifies instead of the middle of one.
-    //
-    // The second is the one that was missing entirely, and it is the reason
-    // the bakery had no reflective glass at all: its shopfront is not painted
-    // dark, it is painted as a pale blue-white pane with the sky already in
-    // it. That is the other convention this art set uses for glass, and it is
-    // exactly what the darkness test cannot see. A light, blue-leaning swatch
-    // is glazing too - both gates held tight, because a merely blue-grey wall
-    // (which half the downtown kit is) must not come out as a mirror: the
-    // luminance gate is what separates a pale pane from a painted wall, and
-    // the blue gate is what separates it from white plaster.
-    float luma = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
-    float dark = 1.0 - clamp(luma * 4.6, 0.0, 1.0);
-    dark = dark * dark;
-    float blue = albedo.b - max(albedo.r, albedo.g);
-    float pale = smoothstep(0.03, 0.09, blue) * smoothstep(0.45, 0.65, luma);
-    // whichever cue found it; the same term drives the lit-window glow further
-    // down, which is why it is computed once, here, rather than twice
-    float pane = max(dark, pale);
-    float glass = clamp(uGlass, 0.0, 1.0) * pane;
-
-    // What a pane actually does differently from the wall it sits in.
-    //
-    // Sharper: glass is usually the smoothest thing in a scene, and the mirror
-    // image in it survives to a distance nothing else in the frame manages.
-    //
-    // Darker underneath: glass transmits rather than scatters, so almost
-    // nothing comes back off it diffusely. Leaving the diffuse term in was
-    // most of why a window read as a shaded wall - the reflection was there
-    // and it was sitting on top of a lit surface, which is not what looking at
-    // glass is like.
-    //
-    // Stronger: 0.04 is a bare dielectric and glass is nearer 0.08, and the
-    // Fresnel rise off that is steep enough that a facade seen at a glancing
-    // angle goes to a near-mirror at its far end while the pane square in
-    // front of you stays a dim room. That gradient along a row of windows is
-    // the whole difference between glazing and grey paint.
-    rough = mix(rough, 0.028, glass);
-
-    float wet = uWetness * clamp(n.y * 2.2 - 0.5, 0.0, 1.0);
-    // two scales of puddle: broad wet patches, and smaller pools inside them
-    float pud = wet_noise(vWorld.xz * 0.11) * 0.65 + wet_noise(vWorld.xz * 0.37) * 0.35;
-    float sheen = wet * mix(0.5, 1.0, smoothstep(0.3, 0.75, pud));
-    albedo *= mix(1.0, 0.32, sheen);
-    rough   = mix(rough, 0.035, sheen);
-
-    float a      = rough * rough;
-
-    // A water film is its own dielectric surface sitting on top of whatever is
-    // underneath, so its reflectance is water at normal incidence rather than
-    // the surface it covers - and, far more importantly, it is smooth enough
-    // for the Fresnel rise toward grazing angles to actually survive, which is
-    // the whole reason wet ground mirrors a skyline down its length.
+    rough = clamp(rough, 0.02, 1.0);
+    metal = clamp(metal, 0.0, 1.0);
+    float a = rough * rough;
     vec3 f0 = mix(vec3(0.04), albedo, metal);
-    f0 = mix(f0, vec3(0.05), sheen);
-    // glass is a stronger reflector than the plaster around it
-    f0 = mix(f0, vec3(0.08), glass);
-    // and it transmits rather than scatters - see the glazing block above
-    vec3 diff_albedo = albedo * (1.0 - metal) * (1.0 - glass * 0.80);
+    vec3 diff_albedo = albedo * (1.0 - metal);
 
-    // ---- direct sun ----
     vec3  l = normalize(uSunDir);
     float ndl = max(dot(n, l), 0.0);
-    float view_depth = length(uCameraPos - vWorld);
-    float shadow = sun_shadow(vWorld, n, ndl, view_depth);
-    vec3  direct = surface_brdf(n, v, l, diff_albedo, f0, a, uSunColor) * shadow;
+    vec3 direct = vec3(0.0);
+    if (ndl > 0.0) direct = surface_brdf(n, v, l, diff_albedo, f0, a, uSunColor) * sun_shadow(world, n, ndl);
+    direct += punctual_lights(world, n, v, diff_albedo, f0, a);
 
-    // ---- punctual lights ----
-    direct += punctual_lights(vWorld, n, v, diff_albedo, f0, a);
-
-    // ---- ambient, off the analytic sky ----
     float hemi = n.y * 0.5 + 0.5;
-    vec3  amb_diffuse = mix(uGroundColor, uSkyColor, hemi) * diff_albedo;
+    vec3 irradiance = mix(uGroundColor, uSkyColor, hemi);
+    // the probe's blurriest mip is a cheap stand-in for bounced light
+    if (bReflect.y > 0.5) irradiance = mix(irradiance, textureLod(uEnvMap, n, bReflect.z).rgb * bReflect.w, 0.5);
+    vec3 amb_diffuse = irradiance * diff_albedo;
 
     vec3 refl = specular_dominant_dir(n, reflect(-v, n), rough);
-    vec3 mirror = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
-    vec3 flat_dome = mix(uSkyHorizon, uSkyZenith, clamp(refl.y * 0.5 + 0.5, 0.0, 1.0));
-    // the mirror image survives longer on a smooth surface than a straight lerp
-    // on roughness would allow, which is what keeps car paint glossy
-    vec3 env = mix(mirror, flat_dome, rough * rough);
-
-    // a reflection that has bent below the surface it came off cannot be seen
-    // (Frostbite's horizon occlusion)
-    float horizon = clamp(1.0 + dot(reflect(-v, n), n), 0.0, 1.0);
+    vec3 env = env_specular(refl, rough);
+    if (planar > 0.0 && bReflect.x > 0.5) env = mix(env, planar_reflection(world, n, rough), planar);
+    float horizon = clamp(1.0 + dot(reflect(-v, n), n), 0.0, 1.0);   // Frostbite horizon occlusion
     vec3 amb_spec = env * env_brdf(f0, rough, ndv) * (horizon * horizon);
-    // Standing in for a reflection this pass cannot give an arbitrary surface.
-    //
-    // A real film of water reflects the whole scene, and the only environment
-    // a surface can sample here is the analytic sky. Under the overcast that
-    // comes with rain that sky is a flat grey dome, so a physically weighted
-    // mirror of it is indistinguishable from the dry surface underneath.
-    //
-    // The weighting is pushed onto the grazing angles rather than spread flat,
-    // because that is where wet ground actually reads as wet: the surface at
-    // your feet is dark and almost matte, and the mirror builds up with
-    // distance until the far ground is a sheet of reflected sky. Brightening
-    // every angle equally just turns it pale, which is dry, not wet.
-    float graze = 1.0 - ndv;
-    graze *= graze;
-    graze *= graze;
-    amb_spec *= 1.0 + sheen * (0.25 + 5.0 * graze);
-    // The same shape, for the same reason, on glazing: env_brdf's split-sum
-    // fit is a rough surface's answer and it flattens the Fresnel rise that a
-    // near-mirror actually has. A window facing you returns its dim room; the
-    // same window seen along a facade returns the scene outside. Weighting the
-    // boost onto the grazing angles is what gives a row of windows that
-    // gradient rather than uniformly pale glass.
-    amb_spec *= 1.0 + glass * (0.35 + 4.0 * graze);
+    float ao = mix(0.45, 1.0, hemi);   // down-facing crevices see less sky
 
-    // down-facing crevices see less of the sky
-    float ao = mix(0.45, 1.0, hemi);
-
-    // The window term rides on the same darkness test the glazing above uses:
-    // what is glass by day is what lights up after dark.
-    vec3 color = direct + (amb_diffuse + amb_spec) * ao
-               + uEmissive + uWindowGlow * pane;
-
-    float fog = 1.0 - exp(-view_depth * view_depth * uFogDensity * uFogDensity);
-    frag = vec4(mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0)), 1.0);
+    return apply_fog(direct + amb_diffuse * ao + amb_spec * mix(ao, 1.0, planar) + emissive, world);
 }
-)";
 
-// ---- sky pass ----
-//
-// A full-screen triangle drawn before the world, at the far plane, with depth
-// writes off. The fragment shader turns each pixel back into a world-space view
-// ray through the inverse view-projection and asks sky_env what colour that
-// direction is - the same function the surface and water shaders sample for
-// reflections, so the backdrop and every reflection of it are consistent.
-const char* VSHDER_SKY = R"(#version 440 core
-out vec2 vNDC;
-void main() {
-    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
-    vNDC = p;
-    gl_Position = vec4(p, 1.0, 1.0);   // z = w -> sits on the far plane
+vec3 shade_surface(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive) {
+    return shade_surface_ex(world, n, albedo, metal, rough, emissive, 0.0);
 }
-)";
 
-const char* FSHDER_SKY = R"(#version 440 core
-in vec2 vNDC;
-out vec4 frag;
-uniform mat4  uInvViewProj;   // everything else it needs is in the scene block
-void main() {
-    vec4 far = uInvViewProj * vec4(vNDC, 1.0, 1.0);
-    vec3 dir = normalize(far.xyz / far.w - uCameraPos);
-    vec3 col = sky_env(dir, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
-    // let the lower sky settle into the same fog the world fades into, so the
-    // horizon line does not read as a hard seam
-    float haze = smoothstep(0.10, -0.05, dir.y);
-    col = mix(col, srgb_to_linear(uFogColor), haze * 0.85);
-    frag = vec4(col, 1.0);
+// ---- cel / toon shading ----
+// params: x (unused here - the blend amount), y light bands, z rim strength,
+// w hard-highlight size. Band edges are antialiased with fwidth so they stay
+// one pixel wide at any distance. Shadows, lights, ambient and fog all come
+// from the same sources as the PBR path, so the two mix cleanly.
+float toon_step(float x, float bands) {
+    float b = max(bands, 1.0);
+    float s = x * b;
+    float w = max(fwidth(s), 1e-4);
+    return (floor(s) + smoothstep(0.5 - w, 0.5 + w, fract(s))) / b;
 }
-)";
 
-// skinned: per-vertex pos/normal/uv (loc 0..2) + bone ids/weights (loc 3..4).
-// One draw per animated instance, since every instance needs its own uBones,
-// so the model matrix rides along as a uniform rather than an instance buffer.
-// Pairs with FSHDER_BASIC. uBones[] must match MAX_ANIM_BONES in animation.hpp.
-// Note glTF's uv origin is already top-left, so unlike VSHDER_BASIC there is no V flip.
-const char* VSHDER_SKINNED = R"(#version 440 core
+vec3 shade_toon(vec3 world, vec3 n, vec3 albedo, vec4 params, vec3 emissive) {
+    vec3 v = normalize(uCameraPos - world);
+    vec3 l = normalize(uSunDir);
+    float ndl = max(dot(n, l), 0.0);
+    float lit = toon_step(ndl * sun_shadow(world, n, ndl), params.y);
+    vec3 light = uSunColor * lit / PI + mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5);
+
+    for (int i = 0; i < uLightCount; ++i) {
+        vec3  to = uLightPosRadius[i].xyz - world;
+        float d2 = dot(to, to);
+        float radius = uLightPosRadius[i].w;
+        if (d2 > radius * radius) continue;
+        vec3 pl = to * inversesqrt(max(d2, 1e-8));
+        float atten = clamp(1.0 - d2 / (radius * radius), 0.0, 1.0);
+        float cos_outer = uLightDirOuter[i].w;
+        if (cos_outer > -1.0)
+            atten *= clamp((dot(-pl, uLightDirOuter[i].xyz) - cos_outer)
+                           / max(uLightColorInner[i].w - cos_outer, 1e-4), 0.0, 1.0);
+        light += uLightColorInner[i].rgb * toon_step(max(dot(n, pl), 0.0) * atten, params.y) * 0.25;
+    }
+    vec3 color = albedo * light;
+
+    if (params.w > 0.0) {   // a hard, round highlight
+        float spec = dot(n, normalize(l + v));
+        float edge = 1.0 - params.w * 0.08;
+        float w = max(fwidth(spec), 1e-4);
+        color += uSunColor * smoothstep(edge - w, edge + w, spec) * lit * 0.3;
+    }
+    if (params.z > 0.0) {   // rim: a bright outline where the surface turns away
+        float rim = 1.0 - max(dot(n, v), 0.0);
+        float w = max(fwidth(rim), 1e-4);
+        color += (uSkyColor + uSunColor * 0.15) * smoothstep(0.65 - w, 0.65 + w, rim) * params.z;
+    }
+    return apply_fog(color + emissive, world);
+})";
+// ---- static meshes ----
+// per-vertex pos/normal/uv (loc 0..2), per-instance model matrix (loc 3..6)
+// and tint (loc 7). Instanced: one draw per (material, mesh) run.
+static const char* const VSHDER_BASIC = R"(#version 440 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
-layout(location=3) in vec4 aBoneIds;
-layout(location=4) in vec4 aWeights;
-uniform mat4 uViewProj;
-uniform mat4 uModel;
-uniform mat4 uBones[128];
+layout(location=3) in mat4 aModel;   // consumes 3..6
+layout(location=7) in vec4 aTint;
 out vec3 vNormal;
 out vec2 vUV;
 out vec3 vWorld;
+out vec4 vTint;
 void main() {
-    mat4 skin = uBones[int(aBoneIds.x)] * aWeights.x
-              + uBones[int(aBoneIds.y)] * aWeights.y
-              + uBones[int(aBoneIds.z)] * aWeights.z
-              + uBones[int(aBoneIds.w)] * aWeights.w;
-    vec4 world = uModel * (skin * vec4(aPos, 1.0));
+    vec4 world = aModel * vec4(aPos, 1.0);
     vWorld = world.xyz;
     gl_Position = uViewProj * world;
-    vNormal = mat3(uModel) * (mat3(skin) * aNormal);
+    vNormal = mat3(aModel) * aNormal;
     vUV = aUV;
+    vTint = aTint;
 }
 )";
 
-// ---- depth only, for the shadow pass ----
+// ---- skinned meshes: instanced GPU skinning ----
 //
-// The shadow map records how far the sun can see and nothing else, so these
-// carry no varyings and write no colour. They share the instancing and skinning
-// layouts of the shaders above so the same vertex arrays draw both passes.
+// Every animated instance of the frame lives in storage buffers - its model
+// matrix, tint and where its bones start in one shared palette - and each draw
+// names a run of them through a per-view index list. So a crowd sharing a
+// mesh and material is one instanced draw, whatever its size, and a rig's
+// bone count is limited only by memory.
+static const char* const GLSL_SKINNING = R"(
+struct SkinInstance { mat4 model; vec4 tint; uvec4 info; };   // info.x: first bone in the palette
+layout(std430, binding = 8)  readonly buffer PixSkinInstances { SkinInstance skin_instances[]; };
+layout(std430, binding = 9)  readonly buffer PixSkinBones     { mat4 skin_bones[]; };
+layout(std430, binding = 10) readonly buffer PixSkinList       { uint skin_list[]; };
+uniform int uSkinBase;          // where this draw's run starts in skin_list
 
-const char* VSHDER_DEPTH = R"(#version 440 core
-layout(location=0) in vec3 aPos;
-layout(location=3) in mat4 aModel;
-uniform mat4 uViewProj;   // the light's view-projection
-void main() { gl_Position = uViewProj * (aModel * vec4(aPos, 1.0)); }
-)";
-
-const char* VSHDER_DEPTH_SKINNED = R"(#version 440 core
-layout(location=0) in vec3 aPos;
-layout(location=3) in vec4 aBoneIds;
-layout(location=4) in vec4 aWeights;
-uniform mat4 uViewProj;
-uniform mat4 uModel;
-uniform mat4 uBones[128];
-void main() {
-    mat4 skin = uBones[int(aBoneIds.x)] * aWeights.x
-              + uBones[int(aBoneIds.y)] * aWeights.y
-              + uBones[int(aBoneIds.z)] * aWeights.z
-              + uBones[int(aBoneIds.w)] * aWeights.w;
-    gl_Position = uViewProj * (uModel * (skin * vec4(aPos, 1.0)));
+SkinInstance skin_instance() { return skin_instances[skin_list[uSkinBase + gl_InstanceID]]; }
+mat4 skin_matrix(SkinInstance si, vec4 ids, vec4 weights) {
+    uint b = si.info.x;
+    return skin_bones[b + uint(ids.x)] * weights.x + skin_bones[b + uint(ids.y)] * weights.y
+         + skin_bones[b + uint(ids.z)] * weights.z + skin_bones[b + uint(ids.w)] * weights.w;
 }
 )";
 
-const char* FSHDER_DEPTH = R"(#version 440 core
-void main() { }
-)";
-
-// ---- water ----
-//
-// The wave field is one function, GLSL_WAVE, shared by the vertex and fragment
-// stages: the vertex stage uses its height to actually move the surface, the
-// fragment stage uses its gradient for a normal at full pixel resolution. It is
-// evaluated from world position, so neighbouring tiles agree exactly along
-// their shared edge and the river is one continuous sheet rather than a grid of
-// independently rippling squares.
-//
-// Everything that makes water read as water is here:
-//
-//   * the surface moves. A flat plane with a clever shader on it is a painted
-//     floor; a surface whose silhouette rises and falls against the far bank is
-//     immediately liquid. This is the single biggest cue and it needs real
-//     geometry, which is why the tile is subdivided.
-//   * four octaves - two slow swells crossing, two fast chops - because one
-//     sine reads as corrugated metal
-//   * Fresnel drives the mix from body colour to sky reflection: near
-//     transparent underfoot, a mirror toward the horizon
-//   * the body colour is a green-brown that deepens with distance below the
-//     surface, so shallows near a bank read differently from midstream
-//   * a tight specular for sun glitter over a broad one for sheen
-const char* GLSL_WAVE = R"(
-// .xyz is the surface normal, .w the height offset in metres.
-//
-// Six directional waves over three scales. The scales matter as much as the
-// count: the swell moves the silhouette, the chop is what the eye reads as
-// "liquid" from a few metres away, and the ripple is fine enough to keep
-// breaking up the sky reflection out to the far bank. Drop the ripple and a
-// river seen at a glancing angle - which is nearly always, from a camera
-// standing on the bank - turns into one unbroken mirror of a smooth sky
-// gradient, and a mirror that clean reads as sheet metal, not water.
-vec4 wave_field(vec2 p, float time) {
-    // direction, spatial frequency, amplitude (m), speed
-    const vec2  D[6] = vec2[6](vec2( 0.80,  0.60), vec2(-0.45,  0.89),
-                               vec2( 0.99, -0.14), vec2( 0.20,  0.98),
-                               vec2( 0.71, -0.71), vec2(-0.92, -0.39));
-    const float F[6] = float[6](0.085, 0.130, 0.480, 0.730, 1.850, 2.410);
-    const float A[6] = float[6](0.300, 0.190, 0.070, 0.045, 0.016, 0.011);
-    const float S[6] = float[6](0.550, 0.410, 1.700, 2.300, 3.400, 4.100);
-
-    float h = 0.0, dx = 0.0, dz = 0.0;
-    for (int i = 0; i < 6; ++i) {
-        float phase = dot(p, D[i]) * F[i] + time * S[i];
-        h  += A[i] * sin(phase);
-        float c = cos(phase) * A[i] * F[i];
-        dx += c * D[i].x;
-        dz += c * D[i].y;
-    }
-
-    // The gradient of a field this gentle is nearly flat, so the normal is
-    // exaggerated - the ripple has to be visible in the lighting, not merely
-    // present in the geometry.
-    return vec4(normalize(vec3(-dx * 14.0, 1.0, -dz * 14.0)), h);
-}
-
-// Same six waves, but built for a fragment that already knows how many world
-// metres one pixel covers (`footprint`, from fwidth of the world position).
-//
-// A river is looked at nearly edge-on from a walking camera, and world-space
-// derivatives explode toward the far bank the way they do for any ground
-// plane at a grazing angle. wave_field's finer octaves have wavelengths of a
-// couple of metres; once footprint approaches that, each pixel is sampling a
-// different point on the sine mid-cycle and the *unfiltered* normal - and the
-// tight specular lobe built from it - flickers between crest and trough from
-// one pixel to the next. That is the hard-edged diagonal banding a plain
-// wave_field() read on the water: it is aliasing, not ripple.
-//
-// The fix is the standard one for procedural normals: fade each octave out
-// once a pixel can no longer resolve it, so the normal degrades toward the
-// low-frequency swell (which stays smooth at any distance) instead of
-// aliasing. Height is untouched - only the fragment-stage normal needs this.
-vec3 wave_normal_aa(vec2 p, float time, float footprint) {
-    const vec2  D[6] = vec2[6](vec2( 0.80,  0.60), vec2(-0.45,  0.89),
-                               vec2( 0.99, -0.14), vec2( 0.20,  0.98),
-                               vec2( 0.71, -0.71), vec2(-0.92, -0.39));
-    const float F[6] = float[6](0.085, 0.130, 0.480, 0.730, 1.850, 2.410);
-    const float A[6] = float[6](0.300, 0.190, 0.070, 0.045, 0.016, 0.011);
-    const float S[6] = float[6](0.550, 0.410, 1.700, 2.300, 3.400, 4.100);
-
-    float dx = 0.0, dz = 0.0;
-    for (int i = 0; i < 6; ++i) {
-        // ~2 pixels per wavelength is the Nyquist floor; start rolling the
-        // octave off well before that so the fade itself never aliases.
-        float wavelength = 6.28318531 / F[i];
-        float fade = 1.0 - smoothstep(wavelength * 0.25, wavelength * 1.0, footprint);
-        if (fade <= 0.001) continue;
-        float phase = dot(p, D[i]) * F[i] + time * S[i];
-        float c = cos(phase) * A[i] * F[i] * fade;
-        dx += c * D[i].x;
-        dz += c * D[i].y;
-    }
-    return normalize(vec3(-dx * 14.0, 1.0, -dz * 14.0));
-}
-)";
-
-// Splices both GLSL_COMMON and GLSL_WAVE in after the #version line.
-//
-// Unlike shader_with_common this alternates between two buffers, because a
-// vertex and a fragment source have to be live at the same moment to be handed
-// to one opengl_create_shader call - and the water pass is the one place where
-// both stages need the same helper spliced in.
-static const char* shader_with_waves(const char* src) {
-    static char buf[2][24576];
-    static int  slot = 0;
-    char* out = buf[slot];
-    slot ^= 1;
-
-    const char* nl = strchr(src, '\n');
-    if (!nl) return src;
-    size_t head = (size_t)(nl - src) + 1;
-    memcpy(out, src, head);
-    int n = (int)head;
-    n += sprintf(out + n, "%s\n%s\n%s\n", GLSL_SCENE, GLSL_COMMON, GLSL_WAVE);
-    sprintf(out + n, "%s", src + head);
-    return out;
-}
-
-const char* VSHDER_WATER = R"(#version 440 core
+static const char* const VSHDER_SKINNED = R"(#version 440 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
-layout(location=3) in mat4 aModel;
-uniform mat4  uViewProj;
-uniform float uTime;
+layout(location=3) in vec4 aBoneIds;
+layout(location=4) in vec4 aWeights;
+out vec3 vNormal;
+out vec2 vUV;
 out vec3 vWorld;
+out vec4 vTint;
 void main() {
-    vec4 world = aModel * vec4(aPos, 1.0);
-    // Displace in world space, not model space: the tile is scaled by its cell
-    // size, and lifting before that scale would make the waves taller on a
-    // bigger tile.
-    world.y += wave_field(world.xz, uTime).w;
+    SkinInstance si = skin_instance();
+    mat4 skin = skin_matrix(si, aBoneIds, aWeights);
+    vec4 world = si.model * (skin * vec4(aPos, 1.0));
     vWorld = world.xyz;
     gl_Position = uViewProj * world;
+    vNormal = mat3(si.model) * (mat3(skin) * aNormal);
+    vUV = aUV;
+    vTint = si.tint;
 }
 )";
-
-const char* FSHDER_WATER = R"(#version 440 core
+// The default material. Albedo and tint arrive as sRGB and are linearised;
+// all lighting is in linear space and the post pass owns tonemap + encode.
+static const char* const FSHDER_BASIC = R"(#version 440 core
+in vec3 vNormal;
+in vec2 vUV;
 in vec3 vWorld;
+in vec4 vTint;
 out vec4 frag;
-uniform vec3  uShallowColor;
-uniform vec3  uDeepColor;
-uniform float uTime;
-uniform float uBedDepth;      // metres from the surface down to the bed
 
-// The planar reflection captured this frame by pix__reflection_pass: the
-// opaque scene and sky, drawn again from a camera mirrored across the water's
-// surface. A water fragment finds its own reflection the way any projected
-// texture is looked up: run its world position through that camera's own
-// view-projection to get back the screen position *it* was drawn at, and
-// sample there. That is where the reflected scene across the water actually
-// comes from; the analytic sky_env is kept only as what fills the
-// gaps - outside the sun's cone, past the far edge of the frustum, or
-// whenever the pass did not run this frame (effects off, no camera above the
-// water to mirror).
-uniform sampler2D uReflection;
-uniform mat4      uReflViewProj;
-uniform float     uReflectionMix;   // 0 = analytic sky only, 1 = captured reflection
+uniform sampler2D uTex;
+uniform vec4  uColor;         // rgb tint (sRGB), a opacity
+uniform float uMetallic;
+uniform float uRoughness;
+uniform vec3  uEmissive;      // linear radiance added on top
+uniform float uAlphaCutoff;   // > 0: cut-out, texels below it are discarded
+uniform int   uUnlit;
+uniform float uPlanar;        // 0..1: how much of the planar mirror this surface shows
+uniform float uRefraction;    // > 0: see-through, bending what is behind by this much
+uniform vec4  uToon;          // x toon amount (0 PBR .. 1 cel), y bands, z rim, w highlight size
 
 void main() {
-    vec4 wave = wave_field(vWorld.xz, uTime);
-    // How many world metres one screen pixel spans here - large at a distant,
-    // near-grazing view of the surface, small underfoot. Feeds the fade in
-    // wave_normal_aa so the shading normal never carries more ripple detail
-    // than this pixel could actually resolve; see that function for why.
-    float footprint = max(fwidth(vWorld.x), fwidth(vWorld.z));
-    vec3 n = wave_normal_aa(vWorld.xz, uTime, footprint);
-    vec3 view = normalize(uCameraPos - vWorld);
-
-    // Schlick, with the floor raised a little past water's real ~0.02
-    // normal-incidence reflectance: the planar reflection now genuinely
-    // carries the scene, so straight-down water is worth showing more of it
-    // rather than mostly the body colour underneath.
-    float fresnel = 0.06 + 0.94 * pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 5.0);
-
-    // How far the eye is looking through the water: straight down it is the
-    // depth to the bed, at a glancing angle it is far further, and that is what
-    // makes the far side of a river read darker than the near edge. Wave height
-    // rides on top of it, so a crest is lighter than the trough beside it.
-    float through = uBedDepth / max(abs(view.y), 0.06);
-    float murk = 1.0 - exp(-through * 0.30);
-    float crest = clamp(wave.w * 1.3 + 0.5, 0.0, 1.0);
-    vec3 body = mix(srgb_to_linear(uShallowColor), srgb_to_linear(uDeepColor),
-                    clamp(murk - crest * 0.25, 0.0, 1.0));
-    // The body colour is a fixed pigment, but what lights it is not: the same
-    // silty water is bright jade at noon and nearly black by starlight. Tying
-    // it to the sky's own brightness (already on hand as uSkyZenith, for the
-    // reflection above) is what keeps the stretch of river nearest the camera
-    // - where the low fresnel above leaves the body colour dominant - from
-    // reading as a flat, time-of-day-blind black pool in broad daylight.
-    float sky_luma = dot(uSkyZenith, vec3(0.2126, 0.7152, 0.0722));
-    body *= clamp(mix(0.4, 1.6, sky_luma / 1.8), 0.4, 1.7);
-
-    // The reflection is a real mirror sample of the same analytic sky the
-    // backdrop and every other surface use, taken along the wave-perturbed
-    // reflection vector - so the water reflects the actual horizon gradient and
-    // catches the sun where the geometry says it should.
-    //
-    // Scaled down on the way in, because a surface that returns the sky at full
-    // strength is a mirror, and water is not: about four fifths of it comes
-    // back and the rest goes into the body of the water.
-    vec3 refl = reflect(-view, n);
-    refl.y = abs(refl.y);   // waves that tilt the normal below horizontal still see sky
-    vec3 analytic_sky = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
-
-    // Project this point of the surface - nudged sideways by the wave normal,
-    // so the skyline shimmers and breaks up with the same ripple that shapes
-    // the sun glitter below - through the reflection camera's own matrix to
-    // find where it was drawn in reflection_target. Skipped entirely when the
-    // pass did not run this frame: uReflViewProj is then stale, and dividing
-    // by a stale w is exactly the kind of thing that produces a NaN that
-    // mix()'s zero weight would not actually protect against.
-    vec3 captured = vec3(0.0);
-    if (uReflectionMix > 0.5) {
-        vec3 sample_at = vWorld + vec3(n.x, 0.0, n.z) * 0.6;
-        vec4 rc = uReflViewProj * vec4(sample_at, 1.0);
-        vec2 refl_uv = clamp((rc.xy / max(rc.w, 1e-4)) * 0.5 + 0.5, vec2(0.003), vec2(0.997));
-        // A manual mip bias on top of whatever the hardware's own derivative
-        // picks: the UV came out of a perspective divide rather than a plain
-        // varying, so its screen-space derivative - and therefore automatic
-        // mip selection - is not as reliable a measure of this fragment's
-        // real footprint in the capture as it would be for an ordinary
-        // texture lookup. Forcing a couple of extra mips softens it in every
-        // case rather than only the ones the derivative happens to catch.
-        captured = texture(uReflection, refl_uv, 1.6).rgb;
+    clip_test(vWorld);
+    vec4 tex = texture(uTex, vUV);
+    float alpha = tex.a * uColor.a * vTint.a;
+    if (alpha < uAlphaCutoff) discard;
+    vec3 albedo = srgb_to_linear(tex.rgb * uColor.rgb * vTint.rgb);
+    if (uUnlit != 0) { frag = vec4(albedo + uEmissive, alpha); return; }
+    vec3 n = normalize(vNormal);
+    if (!gl_FrontFacing) n = -n;   // double-sided materials light their back faces too
+    vec3 lit;
+    if (uToon.x >= 0.999)     lit = shade_toon(vWorld, n, albedo, uToon, uEmissive);
+    else if (uToon.x > 0.0)   lit = mix(shade_surface_ex(vWorld, n, albedo, uMetallic, uRoughness, uEmissive, uPlanar),
+                                        shade_toon(vWorld, n, albedo, uToon, uEmissive), uToon.x);
+    else                      lit = shade_surface_ex(vWorld, n, albedo, uMetallic, uRoughness, uEmissive, uPlanar);
+    if (uRefraction > 0.0) {
+        // glass: the scene behind, tinted by the surface colour, with the lit
+        // surface (its reflections and highlights) laid over it by opacity
+        frag = vec4(mix(refraction_color(n, uRefraction) * albedo, lit, alpha), 1.0);
+        return;
     }
-    // Pulled down further than the analytic-only version needed: a captured
-    // reflection is a real, high-contrast photo of the scene rather than a
-    // soft sky gradient, and returning it at the same strength read as
-    // polished metal even with the mip-blurred capture and the wave
-    // distortion above. Held back more, and blended with a fifth of the
-    // still-perfectly-smooth analytic sky even when the capture is
-    // available, it settles back into looking like a reflection *in* water
-    // rather than a mirror sitting on top of it.
-    vec3 sky = mix(analytic_sky, mix(analytic_sky, captured, 0.8), uReflectionMix) * 0.62;
-
-    vec3 half_v = normalize(uSunDir + view);
-    // Two lobes, both kept modest. A very tight, very bright highlight on a
-    // surface whose waves are smaller than a pixel at any distance does not
-    // sparkle, it smears into a chrome band across the whole river.
-    //
-    // The glitter lobe's own exponent is widened with distance too, in step
-    // with wave_normal_aa's fade above: a filtered normal removes the
-    // per-pixel flicker in the normal itself, but a pow(x, 200) highlight
-    // built from it can still crawl as the (now-smoother) normal sweeps a
-    // whole lobe-width between neighbouring pixels. Softening the lobe as
-    // footprint grows keeps the sun glitter as a sparkle near the bank and a
-    // calm, broad sheen toward the far side rather than a hard band.
-    float far = clamp(footprint / 3.0, 0.0, 1.0);
-    float glitter_pow = mix(200.0, 24.0, far);
-    float ndh = max(dot(n, half_v), 0.0);
-    float spec = pow(ndh, glitter_pow) * mix(1.6, 0.5, far);   // sun glitter
-    spec += pow(ndh, 18.0) * 0.06;                             // broad sheen
-
-    // Never a pure reflection even edge on. Some of what comes back off water at
-    // a glancing angle is still the water, and holding a little of the body
-    // colour in is what keeps a river reading as a river rather than as a strip
-    // of polished metal laid in the ground.
-    vec3 color = mix(body, sky, fresnel * 0.80) + uSunColor * spec;
-
-    // atmospheric fog only at real distance - the near-field colour above is
-    // left alone so nearby water still reads as water, not haze
-    float dist = length(uCameraPos - vWorld);
-    float fog = 1.0 - exp(-dist * dist * uFogDensity * uFogDensity);
-    color = mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0) * 0.85);
-
-    // Opacity tracks the same view-through-the-water term as the colour: you
-    // can see the bed at your feet and cannot see it across the river.
-    frag = vec4(color, clamp(mix(0.55, 0.98, max(murk, fresnel)), 0.0, 1.0));
+    frag = vec4(lit, alpha);
 }
 )";
 
-// ---- post processing ----
+// ---- built-in water ----
 //
-// One triangle larger than the screen, built from gl_VertexID with no vertex
-// buffer bound at all. A quad made of two triangles would shade the pixels
-// along its shared diagonal twice and can show a seam; this cannot.
-const char* VSHDER_POST = R"(#version 440 core
+// Both water shaders read the same material fields:
+//   color      shallow colour (sRGB)            params0.rgb  deep colour (sRGB)
+//   roughness  reflection blur                  params0.w    depth where it is fully deep
+//   planar_reflection, refraction               params1.x    wave scale (1 = default size)
+//                                               params1.y    wave speed
+//                                               params1.z    foam amount (0 = none)
+//                                               params1.w    wave strength (normal tilt)
+// Depth behind every pixel (uSceneDepth) is what makes water read as water:
+// clear at the shore, deep-coloured in the middle, foam where it meets things.
+static const char* const GLSL_WATER_COMMON = R"(
+in vec3 vNormal;
+in vec2 vUV;
+in vec3 vWorld;
+in vec4 vTint;
+out vec4 frag;
+uniform vec4  uColor;
+uniform float uRoughness;
+uniform float uPlanar;
+uniform float uRefraction;
+uniform vec4  uParams0;
+uniform vec4  uParams1;
+
+float wave_scale() { return uParams1.x > 0.0 ? uParams1.x : 1.0; }
+
+// height of the water surface pattern at p: two swells plus scrolling noise
+// for chop, each octave faded out once a pixel is too coarse to show it
+float water_height(vec2 p, float t, float footprint) {
+    float s = uParams1.y > 0.0 ? uParams1.y : 1.0;
+    float h = 0.0;
+    h += sin(dot(p, vec2(0.62, 0.78)) * 0.9 + t * 1.1 * s) * 0.5;
+    h += sin(dot(p, vec2(-0.71, 0.35)) * 1.4 + t * 1.5 * s) * 0.3;
+    float fade = 1.0 - smoothstep(0.3, 1.5, footprint * 2.0);
+    h += (value_noise(p * 1.7 + vec2(t * 0.35, t * 0.22) * s) - 0.5) * 0.9 * fade;
+    h += (value_noise(p * 3.9 - vec2(t * 0.28, -t * 0.4) * s) - 0.5) * 0.45 * fade;
+    return h;
+}
+
+vec3 water_normal(vec2 p, float t) {
+    float footprint = max(fwidth(p.x), fwidth(p.y));
+    float e = 0.05;
+    float h  = water_height(p, t, footprint);
+    float hx = water_height(p + vec2(e, 0.0), t, footprint);
+    float hz = water_height(p + vec2(0.0, e), t, footprint);
+    float k = (uParams1.w > 0.0 ? uParams1.w : 1.0) * 0.12;
+    // calmer toward the horizon, where per-pixel ripples would only shimmer
+    k *= 1.0 - smoothstep(0.5, 4.0, footprint * 8.0) * 0.8;
+    return normalize(vec3(-(hx - h) / e * k, 1.0, -(hz - h) / e * k));
+}
+
+// thickness of water between this pixel and whatever is behind it
+float water_thickness(vec2 uv) {
+    return max(scene_depth_at(uv) - fragment_depth(), 0.0);
+}
+)";
+
+// Realistic water: Beer-Lambert absorption toward the deep colour, refraction
+// that fades in with depth, Fresnel between the view through and the reflected
+// world, a sharp sun glint and foam in the shallows.
+static const char* const FSHDER_WATER_SURFACE = R"(#version 440 core
+void main() {
+    clip_test(vWorld);
+    vec2 p = vWorld.xz / wave_scale();
+    vec3 n = water_normal(p, uTime);
+    vec3 v = normalize(uCameraPos - vWorld);
+    vec2 uv = screen_uv();
+
+    float depth_scale = uParams0.w > 0.0 ? uParams0.w : 3.0;
+    float thick = water_thickness(uv);
+    // refract less where the water is thin, so the shore does not smear
+    vec2 offs = (bView * vec4(n, 0.0)).xy * uRefraction * clamp(thick, 0.0, 1.0);
+    vec2 ruv = clamp(uv + offs, vec2(0.001), vec2(0.999));
+    // never refract in something that is in front of the water
+    if (scene_depth_at(ruv) < fragment_depth()) ruv = uv;
+    vec3 behind = texture(uRefractMap, ruv).rgb;
+    thick = water_thickness(ruv);
+
+    vec3 shallow = srgb_to_linear(uColor.rgb * vTint.rgb);
+    vec3 deep = srgb_to_linear(uParams0.rgb);
+    float absorb = 1.0 - exp(-thick / depth_scale);
+    vec3 lightness = uSunColor * max(uSunDir.y, 0.0) * 0.25 + uSkyColor;   // what lights the body of the water
+    vec3 through = mix(behind * shallow, deep * lightness, absorb);
+
+    // reflection only: an albedo of zero leaves the specular and environment terms
+    vec3 reflected = shade_surface_ex(vWorld, n, vec3(0.0), 0.0, uRoughness, vec3(0.0), uPlanar);
+    float ndv = clamp(dot(n, v), 0.0, 1.0);
+    float fresnel = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+    vec3 color = through * (1.0 - fresnel) + reflected;
+
+    // sun glint, tighter than the BRDF's so it sparkles on the ripples
+    vec3 h = normalize(normalize(uSunDir) + v);
+    color += uSunColor * pow(max(dot(n, h), 0.0), 600.0) * 4.0 * sun_shadow(vWorld, n, 1.0);
+
+    // foam where the water is shallow, broken up by noise
+    float foam_amt = uParams1.z;
+    if (foam_amt > 0.0) {
+        float edge = 1.0 - smoothstep(0.0, 0.5 * foam_amt, thick);
+        float pattern = value_noise(vWorld.xz * 3.0 + uTime * 0.3) * value_noise(vWorld.xz * 7.0 - uTime * 0.2);
+        float foam = clamp(edge * smoothstep(0.1, 0.35, pattern + edge * 0.3), 0.0, 1.0);
+        color = mix(color, lightness * 1.2 + uSunColor * 0.2, foam * 0.8);
+    }
+    frag = vec4(apply_fog(color, vWorld), 1.0);
+}
+)";
+
+// Cartoon water: flat colour bands by depth, a crisp animated foam line at
+// every shore and around anything standing in it, drifting foam streaks and a
+// cel-shaded sun highlight. Reads the same material fields as the realistic one.
+static const char* const FSHDER_WATER_TOON = R"(#version 440 core
+void main() {
+    clip_test(vWorld);
+    vec2 p = vWorld.xz / wave_scale();
+    float t = uTime * (uParams1.y > 0.0 ? uParams1.y : 1.0);
+    vec2 uv = screen_uv();
+    float thick = water_thickness(uv);
+    float depth_scale = uParams0.w > 0.0 ? uParams0.w : 2.0;
+
+    // three hard bands, shallow to deep
+    float d = clamp(thick / depth_scale, 0.0, 1.0);
+    float band = floor(d * 3.0 + 0.5) / 3.0;
+    vec3 shallow = srgb_to_linear(uColor.rgb * vTint.rgb);
+    vec3 deep = srgb_to_linear(uParams0.rgb);
+    vec3 color = mix(shallow, deep, band);
+
+    // a little see-through in the shallowest band
+    if (band < 0.1 && uRefraction > 0.0) {
+        vec2 wob = vec2(value_noise(p * 2.0 + t), value_noise(p * 2.0 - t)) - 0.5;
+        color = mix(texture(uRefractMap, clamp(uv + wob * uRefraction, 0.001, 0.999)).rgb * shallow, color, 0.45);
+    }
+
+    // lit flat, stepped: one bright and one dark level
+    float lit = max(uSunDir.y, 0.0);
+    color *= mix(uSkyColor * 1.5 + 0.35, uSunColor * 0.45 + uSkyColor, step(0.15, lit));
+
+    // foam line: a wobbling threshold on depth, so it ripples along the shore
+    float foam_amt = uParams1.z > 0.0 ? uParams1.z : 1.0;
+    float wobble = value_noise(p * 4.0 + vec2(t * 0.6, 0.0)) * 0.25;
+    float line = step(thick, 0.18 * foam_amt + wobble * foam_amt);
+    // drifting streaks on open water
+    float streak = step(0.78, value_noise(p * vec2(1.3, 5.0) + vec2(t * 0.25, t * 0.1)));
+    color = mix(color, vec3(1.0), max(line, streak * 0.6));
+
+    // cel sun highlight from a wavy normal
+    vec3 n = water_normal(p, t);
+    vec3 h = normalize(normalize(uSunDir) + normalize(uCameraPos - vWorld));
+    color += uSunColor * step(0.985, dot(n, h)) * 0.8;
+
+    if (uPlanar > 0.0 && bReflect.x > 0.5)
+        color = mix(color, planar_reflection(vWorld, n, 0.3), uPlanar * 0.35);
+    frag = vec4(apply_fog(color, vWorld), 1.0);
+}
+)";
+// ---- depth only, for the shadow pass ----
+// uv rides along so cut-out materials (foliage, fences) cast cut-out shadows
+static const char* const VSHDER_DEPTH = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=2) in vec2 aUV;
+layout(location=3) in mat4 aModel;
+uniform mat4 uLightViewProj;
+out vec2 vUV;
+void main() { vUV = aUV; gl_Position = uLightViewProj * (aModel * vec4(aPos, 1.0)); }
+)";
+
+static const char* const VSHDER_DEPTH_SKINNED = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=2) in vec2 aUV;
+layout(location=3) in vec4 aBoneIds;
+layout(location=4) in vec4 aWeights;
+uniform mat4 uLightViewProj;
+out vec2 vUV;
+void main() {
+    SkinInstance si = skin_instance();
+    vUV = aUV;
+    gl_Position = uLightViewProj * (si.model * (skin_matrix(si, aBoneIds, aWeights) * vec4(aPos, 1.0)));
+}
+)";
+static const char* const FSHDER_DEPTH = R"(#version 440 core
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform float uAlphaCutoff;
+void main() {
+    if (uAlphaCutoff > 0.0 && texture(uTex, vUV).a < uAlphaCutoff) discard;
+}
+)";
+
+// ---- fullscreen passes ----
+// One triangle larger than the screen from gl_VertexID, no vertex buffer: no
+// diagonal seam and every pixel shaded exactly once.
+static const char* const VSHDER_POST = R"(#version 440 core
 out vec2 vUV;
 void main() {
     vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
@@ -932,44 +694,58 @@ void main() {
 }
 )";
 
-// ---- bloom ----
-//
-// The scene target is real HDR, so a sun glint off a car roof or a wave crest
-// is genuinely brighter than 1 while the tonemap squashes it back to near
-// white. Bloom is what puts that energy back on screen as glare, and it is the
-// single thing that makes a specular highlight read as *bright* rather than as
-// a pale patch. Threshold with a soft knee (a hard cutoff bands visibly as
-// something crosses it), then two separable Gaussian passes at quarter res.
-const char* FSHDER_BLOOM_PREFILTER = R"(#version 440 core
+// the backdrop: each pixel turned back into a world-space ray
+static const char* const VSHDER_SKY = R"(#version 440 core
+out vec2 vNDC;
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
+    vNDC = p;
+    gl_Position = vec4(p, 1.0, 1.0);   // z = w -> sits on the far plane
+}
+)";
+
+static const char* const FSHDER_SKY = R"(#version 440 core
+in vec2 vNDC;
+out vec4 frag;
+uniform mat4 uInvViewProj;
+void main() {
+    vec4 far = uInvViewProj * vec4(vNDC, 1.0, 1.0);
+    vec3 dir = normalize(far.xyz / far.w - uCameraPos);
+    vec3 col = sky_env(dir);
+    // settle the lower sky into the fog so the horizon is not a hard seam
+    float haze = smoothstep(0.10, -0.05, dir.y) * clamp(uFogDensity * 400.0, 0.0, 1.0);
+    frag = vec4(mix(col, uFogColor, haze * 0.85), 1.0);
+}
+)";
+
+// Bloom: soft-knee threshold with a 4-tap downsample, then separable blur.
+static const char* const FSHDER_BLOOM_PREFILTER = R"(#version 440 core
 in vec2 vUV;
 out vec4 frag;
 uniform sampler2D uScene;
-uniform vec2  uTexel;      // one source texel
+uniform vec2  uTexel;
 uniform float uThreshold;
 uniform float uKnee;
 void main() {
-    // 4-tap box downsample first: a one-pixel spark left to alias would crawl
     vec3 c = texture(uScene, vUV + vec2(-uTexel.x, -uTexel.y)).rgb
            + texture(uScene, vUV + vec2( uTexel.x, -uTexel.y)).rgb
            + texture(uScene, vUV + vec2(-uTexel.x,  uTexel.y)).rgb
            + texture(uScene, vUV + vec2( uTexel.x,  uTexel.y)).rgb;
     c *= 0.25;
-
     float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
     float soft = clamp(lum - uThreshold + uKnee, 0.0, 2.0 * uKnee);
     soft = soft * soft / (4.0 * uKnee + 1e-5);
     float w = max(soft, lum - uThreshold) / max(lum, 1e-5);
-    frag = vec4(c * w, 1.0);
+    frag = vec4(min(c * w, vec3(64.0)), 1.0);   // clamp: one NaN/inf pixel must not flood the screen
 }
 )";
 
-// five taps standing in for a nine-tap Gaussian: the hardware's linear filter
-// fetches each outer pair in one sample at a weighted offset
-const char* FSHDER_BLOOM_BLUR = R"(#version 440 core
+// five taps standing in for a nine-tap Gaussian via the linear filter
+static const char* const FSHDER_BLOOM_BLUR = R"(#version 440 core
 in vec2 vUV;
 out vec4 frag;
 uniform sampler2D uSource;
-uniform vec2 uDirection;   // one texel along the axis being blurred
+uniform vec2 uDirection;
 void main() {
     vec3 c = texture(uSource, vUV).rgb * 0.2270270270;
     c += (texture(uSource, vUV + uDirection * 1.3846153846).rgb
@@ -980,7 +756,9 @@ void main() {
 }
 )";
 
-const char* FSHDER_POST = R"(#version 440 core
+// HDR -> display: bloom, exposure, ACES, grade, vignette, sRGB encode. Writes
+// luma to alpha for the FXAA pass that may follow.
+static const char* const FSHDER_POST = R"(#version 440 core
 in vec2 vUV;
 out vec4 frag;
 uniform sampler2D uScene;
@@ -988,179 +766,128 @@ uniform sampler2D uBloom;
 uniform vec2  uTexel;
 uniform float uExposure;
 uniform float uSaturation;
+uniform float uContrast;
 uniform float uVignette;
 uniform float uSharpen;
 uniform float uBloomStrength;
-// The grade. One number for how hard the contrast curve bites and one for how
-// far the shadows and highlights are pulled apart in hue - see `grade` below.
-uniform float uContrast;
-uniform float uSplitTone;
+uniform int   uTonemap;       // 0 ACES, 1 Reinhard, 2 none
+uniform vec3  uColorFilter;
+uniform float uDither;
 
-// ---- rain ----
-//
-// Screen space, not particles. Rain seen from a chase camera is a wall of
-// near-identical streaks with no parallax worth the name, so simulating it in
-// world space buys nothing a scrolling noise field does not already give, and
-// costs a draw call and a buffer per frame. uRain is the downpour, 0..1.
-uniform float uRain;
-uniform float uTime;
-
-float rain_hash(vec2 p) {
-    return fract(sin(dot(p, vec2(41.7, 289.1))) * 43758.5453);
-}
-
-// One layer of falling drops.
-//
-// The screen is cut into columns; a column is a stream of drops, each one a
-// short comet - bright at the leading end, fading out behind it, which is what
-// a real drop looks like on any exposure long enough to see it at all. The two
-// things that make this read as rain rather than as noise are that a drop is
-// far shorter than the gap to the next one in its column, and that it is
-// roughly a pixel and a half wide however far away the layer is meant to be.
-//
-// `uv` arrives aspect corrected, so a column is as wide on screen as it is
-// tall-per-unit, and a streak stays vertical instead of shearing with the
-// window. `rows` is how many drop-lengths fit down the screen, so it and
-// `len` together set both the length of a drop and the spacing between drops.
-float rain_layer(vec2 uv, float cols, float rows, float speed, float len,
-                 float wind, float seed) {
-    vec2 g = vec2((uv.x + uv.y * wind) * cols + seed * 13.7, uv.y * rows);
-
-    float col = floor(g.x);
-    float r1 = rain_hash(vec2(col, seed));
-
-    // Plus, not minus: vUV.y here is the fullscreen triangle's clip-space y,
-    // so it runs bottom to top and scrolling the field the intuitive way sends
-    // the rain up into the sky. The r1 term offsets each column by a random
-    // amount so neighbouring columns are not falling in step.
-    float y = g.y + uTime * speed * (0.75 + r1 * 0.55) + r1 * 41.0;
-    float row = floor(y);
-
-    // Whether this slot carries a drop at all is rolled per (column, slot), so
-    // the spacing down a column is irregular. A drop in every slot is a grid,
-    // and a grid reads as a texture stuck to the screen.
-    float present = rain_hash(vec2(col, row * 1.7 + seed));
-    if (present < 0.45) return 0.0;
-
-    float fy = fract(y);
-    float streak = smoothstep(len, 0.0, fy);              // head at fy 0, tail behind
-    float across = smoothstep(0.05, 0.0, abs(fract(g.x) - 0.5));
-    // and not every drop the same brightness - depth within the layer
-    return streak * across * (0.45 + present * 0.55);
-}
-
-// Narkowicz's fit of the ACES filmic curve: cheap, and it rolls highlights off
-// instead of clipping them flat white the way a plain clamp does
 vec3 tonemap(vec3 x) {
+    if (uTonemap == 1) return x / (1.0 + x);                  // Reinhard
+    if (uTonemap == 2) return clamp(x, 0.0, 1.0);
+    // Narkowicz's ACES fit: rolls highlights off instead of clipping them
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// The grade: the last thing done to the image, and the cheapest place to buy
-// the largest change in how it reads.
-//
-// Two things, both of which every graded photograph has and a raw tonemap
-// does not.
-//
-// A contrast curve. The tonemap's job is to fit a huge range into zero to one
-// and it does that by flattening the middle, which is why a straight ACES
-// image looks correct and washed at the same time. A smoothstep-shaped curve
-// about mid grey puts the separation back where the eye actually looks - the
-// midtones - while leaving the rolled-off ends where the tonemap put them.
-// Done per channel rather than on luminance, because a per-channel curve also
-// deepens saturation as it steepens, which is what film does.
-//
-// A split tone. Shadows toward blue, highlights toward warm. Daylight is two
-// light sources - a warm sun and a blue sky - and everything in shadow is lit
-// by the second one, so this is not a stylistic tint so much as the thing the
-// single-colour ambient term in the surface shader cannot express. It is what
-// separates a grey surface in sun from the same grey surface in shade.
-vec3 grade(vec3 c) {
-    vec3 curved = c * c * (3.0 - 2.0 * c);          // smoothstep about mid grey
-    c = mix(c, curved, uContrast);
-
-    float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    // Weighted so each end owns its half of the range and neither reaches the
-    // other: a split tone that meets in the middle is a colour cast.
-    float shadow = 1.0 - smoothstep(0.0, 0.45, luma);
-    float light  = smoothstep(0.55, 1.0, luma);
-    // Small numbers on purpose. This is a *lean*, not a tint: the shadows are
-    // already blue - they are lit by a blue sky ambient - and a heavy hand here
-    // does not deepen that, it lays a colour cast over the whole frame, which
-    // is what twice these values does.
-    const vec3 COOL = vec3(-0.010, 0.000, 0.022);   // sky in the shadows
-    const vec3 WARM = vec3( 0.028, 0.011, -0.014);  // sun in the highlights
-    return c + (COOL * shadow + WARM * light) * uSplitTone;
-}
-
 void main() {
     vec3 color = texture(uScene, vUV).rgb;
-
-    // a light unsharp mask puts the edges back that the resolve softened
     if (uSharpen > 0.0) {
         vec3 blur = texture(uScene, vUV + vec2( uTexel.x, 0.0)).rgb
                   + texture(uScene, vUV + vec2(-uTexel.x, 0.0)).rgb
                   + texture(uScene, vUV + vec2(0.0,  uTexel.y)).rgb
                   + texture(uScene, vUV + vec2(0.0, -uTexel.y)).rgb;
-        color += (color - blur * 0.25) * uSharpen;
+        color = max(color + (color - blur * 0.25) * uSharpen, vec3(0.0));
     }
-
-    // glare is added before the tonemap, in linear light, so it rolls off with
-    // everything else instead of clipping on top of an already-mapped image
     if (uBloomStrength > 0.0) color += texture(uBloom, vUV).rgb * uBloomStrength;
-
-    // the scene target holds linear HDR radiance; tonemap in linear, then this
-    // is the one place the whole pipeline encodes back to sRGB for the 8-bit
-    // backbuffer
     color = tonemap(color * uExposure);
-    color = grade(color);
-
+    color = mix(color, color * color * (3.0 - 2.0 * color), uContrast);   // midtone S-curve
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     color = mix(vec3(luma), color, uSaturation);
-
-    if (uRain > 0.001) {
-        // Aspect corrected, so a streak is vertical and a pixel wide at any
-        // window shape, and slanted per layer: rain that all falls at exactly
-        // one angle looks painted on, and rain that falls straight down looks
-        // like it is in a lift shaft.
-        float aspect = uTexel.y / uTexel.x;
-        vec2 ruv = vec2(vUV.x * aspect, vUV.y);
-
-        // three depths. The near layer is long, fast, sparse and bright; the
-        // far one is short, slow, dense and dim, which is what puts distance
-        // between them - a single layer at any setting reads as a flat sheet.
-        float drops = rain_layer(ruv,  70.0,  6.5, 2.9, 0.62, 0.16, 0.0) * 1.00
-                    + rain_layer(ruv, 130.0, 12.0, 2.2, 0.50, 0.21, 3.0) * 0.62
-                    + rain_layer(ruv, 240.0, 22.0, 1.7, 0.42, 0.26, 8.0) * 0.36;
-
-        // A drop is not a light source; it is a lens full of whatever is
-        // behind it, which in daylight is mostly the sky. Scaling by the local
-        // brightness is what keeps rain at noon bright, rain against a dark
-        // wall dim, and rain at night nearly invisible except where a lamp
-        // catches it - all of which a fixed grey gets wrong.
-        float lit = clamp(luma * 1.5 + 0.20, 0.0, 1.5);
-        float wash = clamp(drops * uRain, 0.0, 1.0);
-        color = mix(color, color * 0.88 + vec3(0.62, 0.68, 0.80) * lit * 0.55, wash);
-    }
-
-    // A smoothstep rather than the plain quadratic this was: dot(d, d) starts
-    // falling from the very centre of the frame, so the darkening covered the
-    // whole image and showed as a gradient band across a flat sky rather than
-    // as a corner falloff. Held off until well out from the middle, it does
-    // what a vignette is for - keeping the eye in the frame - and does not
-    // touch the middle of the picture at all.
     vec2 d = vUV - 0.5;
     color *= 1.0 - uVignette * smoothstep(0.16, 0.62, dot(d, d));
-
-    frag = vec4(linear_to_srgb(color), 1.0);
+    color *= uColorFilter;
+    color = linear_to_srgb(clamp(color, 0.0, 1.0));
+    // half an 8-bit step of noise: invisible, but it stops smooth gradients banding
+    float n = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    color += (n - 0.5) / 255.0 * uDither;
+    frag = vec4(color, 1.0);
 }
 )";
 
-// instanced: unit quad corner (loc 0), per-instance box + atlas crop + texture
-// index (loc 1..3). aTexIndex selects both the sampler and its uTexSize entry,
-// so one batch draws in a single call across up to MAX_SPRITE_TEXTURES(32)
-// distinct textures - keep the array sizes below in sync with sprite.hpp.
-const char* VSHDER_SPRITE = R"(#version 440 core
+// FXAA 3.11-style (Lottes), quality preset simplified: edge detect on luma,
+// blend along the edge.
+static const char* const FSHDER_FXAA = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uSource;
+uniform vec2 uTexel;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+void main() {
+    vec3 rgbM = texture(uSource, vUV).rgb;
+    float lM  = luma(rgbM);
+    float lNW = luma(textureOffset(uSource, vUV, ivec2(-1, -1)).rgb);
+    float lNE = luma(textureOffset(uSource, vUV, ivec2( 1, -1)).rgb);
+    float lSW = luma(textureOffset(uSource, vUV, ivec2(-1,  1)).rgb);
+    float lSE = luma(textureOffset(uSource, vUV, ivec2( 1,  1)).rgb);
+    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    if (lMax - lMin < max(0.0312, lMax * 0.125)) { frag = vec4(rgbM, 1.0); return; }
+
+    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), ((lNW + lSW) - (lNE + lSE)));
+    float reduce = max((lNW + lNE + lSW + lSE) * 0.25 * 0.125, 1.0 / 128.0);
+    float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcp, vec2(-8.0), vec2(8.0)) * uTexel;
+
+    vec3 a = 0.5 * (texture(uSource, vUV + dir * (1.0 / 3.0 - 0.5)).rgb
+                  + texture(uSource, vUV + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (texture(uSource, vUV + dir * -0.5).rgb
+                             + texture(uSource, vUV + dir *  0.5).rgb);
+    float lB = dot(b, vec3(0.299, 0.587, 0.114));
+    frag = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);
+}
+)";
+
+// ---- particles ----
+// One camera-facing quad per particle from gl_VertexID; colour is linear
+// radiance and deliberately unclamped, so a flash at 14.0 blows through the
+// bloom threshold and glares while smoke at 0.05 does not.
+static const char* const VSHDER_PARTICLE = R"(#version 440 core
+layout(location=0) in vec4 aCentreSize;   // xyz world centre, w half-size
+layout(location=1) in vec4 aColor;        // rgb linear radiance, a coverage
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+out vec2 vUV;
+out vec4 vColor;
+void main() {
+    vec2 corner = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0, (gl_VertexID & 2) == 0 ? -1.0 : 1.0);
+    vUV = corner;
+    vColor = aColor;
+    vec3 world = aCentreSize.xyz + (uCamRight * corner.x + uCamUp * corner.y) * aCentreSize.w;
+    gl_Position = uViewProj * vec4(world, 1.0);
+}
+)";
+
+static const char* const FSHDER_PARTICLE = R"(#version 440 core
+in vec2 vUV;
+in vec4 vColor;
+out vec4 frag;
+void main() {
+    float r2 = dot(vUV, vUV);
+    if (r2 > 1.0) discard;
+    float falloff = 1.0 - r2;
+    frag = vec4(vColor.rgb, vColor.a * falloff * falloff);
+}
+)";
+
+// ---- debug lines ----
+static const char* const VSHDER_LINE = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec4 aColor;
+out vec4 vColor;
+void main() { vColor = aColor; gl_Position = uViewProj * vec4(aPos, 1.0); }
+)";
+
+static const char* const FSHDER_LINE = R"(#version 440 core
+in vec4 vColor;
+out vec4 frag;
+void main() { frag = vec4(srgb_to_linear(vColor.rgb), vColor.a); }
+)";
+
+// ---- retained sprites and text (sprite.hpp / text.hpp) ----
+static const char* const VSHDER_SPRITE = R"(#version 440 core
 layout(location=0) in vec2 aCorner;   // unit quad, 0..1
 layout(location=1) in vec4 aBox;      // x, y, w, h
 layout(location=2) in vec4 aCrop;     // atlas pixel rect x, y, w, h
@@ -1177,21 +904,16 @@ void main() {
 }
 )";
 
-const char* FSHDER_SPRITE = R"(#version 440 core
+static const char* const FSHDER_SPRITE = R"(#version 440 core
 in vec2 vUV;
 flat in uint vTexIndex;
 out vec4 frag;
 uniform sampler2D uTex[32];
-void main() {
-    frag = texture(uTex[vTexIndex], vUV);
-}
+void main() { frag = texture(uTex[vTexIndex], vUV); }
 )";
 
-
-// uItalic shears the quad in place (no extra per-instance data): the top
-// edge of each glyph's own box shifts right, the bottom edge doesn't move -
-// a cheap approximation of a true glyph-shape slant, good enough for UI text
-const char* VSHDER_TEXT = R"(#version 440 core
+// uItalic shears each glyph quad in place: the top edge shifts, the baseline stays
+static const char* const VSHDER_TEXT = R"(#version 440 core
 layout(location=0) in vec2 aCorner;
 layout(location=1) in vec4 aBox;
 layout(location=2) in vec4 aCrop;
@@ -1210,12 +932,9 @@ void main() {
 }
 )";
 
-// atlas holds a signed distance field (0.5 = outline); fwidth() adapts the
-// smoothstep band to the glyph's current on-screen scale, so edges stay crisp
-// whether the text is shrunk or magnified. uWeight biases the fill edge to
-// synthesize bold(+)/thin(-); uOutlineWidth carves a second band below the
-// fill edge, in the same normalized sdf units, filled with uOutlineColor.
-const char* FSHDER_TEXT = R"(#version 440 core
+// SDF text: fwidth() keeps the edge one pixel wide at any scale; uWeight
+// biases the edge for bold/thin, uOutlineWidth carves a second band below it.
+static const char* const FSHDER_TEXT = R"(#version 440 core
 in vec2 vUV;
 flat in uint vTexIndex;
 out vec4 frag;
@@ -1231,11 +950,6 @@ void main() {
     float outlineEdge = fillEdge - uOutlineWidth;
     float fillAlpha = smoothstep(fillEdge - w, fillEdge + w, sdf);
     float outlineAlpha = smoothstep(outlineEdge - w, outlineEdge + w, sdf);
-    // fillAlpha/outlineAlpha is 0 in the ring-only band and ramps to 1 exactly
-    // at the fill edge; when outlineWidth is 0 the two edges coincide, the
-    // ratio collapses to 1 everywhere, and uOutlineColor drops out entirely -
-    // a plain mix(outline, color, fillAlpha) would instead tint every glyph's
-    // antialiased rim toward outline colour even with no outline requested
     float t = outlineAlpha > 1e-4 ? clamp(fillAlpha / outlineAlpha, 0.0, 1.0) : 0.0;
     vec3 rgb = mix(uOutlineColor.rgb, uColor.rgb, t);
     float alpha = outlineAlpha * mix(uOutlineColor.a, uColor.a, t);
@@ -1243,48 +957,139 @@ void main() {
 }
 )";
 
-// ---- particles ----
+// ---- ready-made post effects, for pix_add_post_effect ----
 //
-// One camera-facing quad per particle, four vertices apiece, with no vertex
-// buffer at all: the corner is derived from gl_VertexID and everything else is
-// per-instance. That is deliberate - a muzzle flash is a handful of quads that
-// live for a tenth of a second, and the cheapest thing a system like that can
-// do is not touch a mesh pool it would immediately have to give back.
-//
-// Colour is linear radiance and is not clamped, so a flash written at 14.0
-// blows straight through the bloom threshold and glares, while smoke written
-// at 0.05 sits under it and does not. Which is the whole reason particles are
-// drawn into the HDR target rather than composited afterwards.
-const char* VSHDER_PARTICLE = R"(#version 440 core
-layout(location=0) in vec4 aCentreSize;   // xyz world centre, w half-size in metres
-layout(location=1) in vec4 aColor;        // rgb linear radiance, a coverage
-uniform mat4 uViewProj;
-uniform vec3 uCamRight;
-uniform vec3 uCamUp;
-out vec2 vUV;
-out vec4 vColor;
+// Each is just a main(): the effect prelude supplies uScene, uDepth,
+// linear_depth(), uTexel, uParams, vUV and frag. They double as examples of
+// writing your own. The comment on each says what its uParams mean.
+
+// x: amount 0..1
+static const char* const PIX_EFFECT_GRAYSCALE = R"(
 void main() {
-    // 0,1,2,3 as a triangle strip: (-1,-1) (1,-1) (-1,1) (1,1)
-    vec2 corner = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,
-                       (gl_VertexID & 2) == 0 ? -1.0 : 1.0);
-    vUV = corner;
-    vColor = aColor;
-    vec3 world = aCentreSize.xyz + (uCamRight * corner.x + uCamUp * corner.y) * aCentreSize.w;
-    gl_Position = uViewProj * vec4(world, 1.0);
+    vec3 c = texture(uScene, vUV).rgb;
+    frag = vec4(mix(c, vec3(dot(c, vec3(0.299, 0.587, 0.114))), uParams.x), 1.0);
 }
 )";
 
-// A soft round blob rather than a square: the quad is only a carrier, and the
-// squared falloff is what keeps a spark from reading as a pixel and a smoke
-// puff from reading as a card.
-const char* FSHDER_PARTICLE = R"(#version 440 core
-in vec2 vUV;
-in vec4 vColor;
-out vec4 frag;
+// x: amount 0..1
+static const char* const PIX_EFFECT_SEPIA = R"(
 void main() {
-    float r2 = dot(vUV, vUV);
-    if (r2 > 1.0) discard;
-    float falloff = 1.0 - r2;
-    frag = vec4(vColor.rgb, vColor.a * falloff * falloff);
+    vec3 c = texture(uScene, vUV).rgb;
+    vec3 s = vec3(dot(c, vec3(0.393, 0.769, 0.189)), dot(c, vec3(0.349, 0.686, 0.168)),
+                  dot(c, vec3(0.272, 0.534, 0.131)));
+    frag = vec4(mix(c, min(s, 1.0), uParams.x), 1.0);
 }
 )";
+
+// x: block size in pixels (e.g. 4)
+static const char* const PIX_EFFECT_PIXELATE = R"(
+void main() {
+    vec2 block = uTexel * max(uParams.x, 1.0);
+    frag = vec4(texture(uScene, (floor(vUV / block) + 0.5) * block).rgb, 1.0);
+}
+)";
+
+// x: offset in pixels at the screen edge (e.g. 3)
+static const char* const PIX_EFFECT_CHROMATIC = R"(
+void main() {
+    vec2 d = (vUV - 0.5) * uTexel * uParams.x * 2.0;
+    frag = vec4(texture(uScene, vUV + d).r, texture(uScene, vUV).g, texture(uScene, vUV - d).b, 1.0);
+}
+)";
+
+// x: scanline strength 0..1, y: screen curvature (e.g. 0.1)
+static const char* const PIX_EFFECT_CRT = R"(
+void main() {
+    vec2 uv = vUV * 2.0 - 1.0;
+    uv *= 1.0 + uParams.y * dot(uv.yx, uv.yx);
+    uv = uv * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { frag = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    vec3 c = texture(uScene, uv).rgb;
+    float line = 0.5 + 0.5 * sin(uv.y / uTexel.y * 3.14159);
+    c *= mix(1.0, 0.65 + 0.35 * line, uParams.x);
+    frag = vec4(c * 1.1, 1.0);
+}
+)";
+
+// Toon ink from depth discontinuities. x: thickness in pixels, y: sensitivity
+// (e.g. 0.05 = 5% depth jump), z: 0..1 darkness
+static const char* const PIX_EFFECT_OUTLINE = R"(
+void main() {
+    vec2 o = uTexel * max(uParams.x, 1.0);
+    float d = linear_depth(vUV);
+    float e = 0.0;
+    e = max(e, abs(linear_depth(vUV + vec2(o.x, 0.0)) - d));
+    e = max(e, abs(linear_depth(vUV - vec2(o.x, 0.0)) - d));
+    e = max(e, abs(linear_depth(vUV + vec2(0.0, o.y)) - d));
+    e = max(e, abs(linear_depth(vUV - vec2(0.0, o.y)) - d));
+    float edge = smoothstep(0.0, 1.0, e / (d * max(uParams.y, 1e-4)));
+    vec3 c = texture(uScene, vUV).rgb;
+    frag = vec4(c * (1.0 - edge * uParams.z), 1.0);
+}
+)";
+
+// Depth of field lite: blurs what is far from a focus distance.
+// x: focus distance (world units), y: focus range, z: max blur in pixels
+static const char* const PIX_EFFECT_DEPTH_BLUR = R"(
+void main() {
+    float d = linear_depth(vUV);
+    float amount = clamp(abs(d - uParams.x) / max(uParams.y, 1e-3), 0.0, 1.0) * uParams.z;
+    vec3 c = texture(uScene, vUV).rgb;
+    if (amount > 0.5) {
+        vec3 sum = c;
+        const vec2 taps[8] = vec2[8](vec2(1,0), vec2(-1,0), vec2(0,1), vec2(0,-1),
+                                     vec2(0.7,0.7), vec2(-0.7,0.7), vec2(0.7,-0.7), vec2(-0.7,-0.7));
+        for (int i = 0; i < 8; i++) sum += texture(uScene, vUV + taps[i] * uTexel * amount).rgb;
+        c = sum / 9.0;
+    }
+    frag = vec4(c, 1.0);
+}
+)";
+
+// ---- splicing ----
+//
+// Inserts the named GLSL chunks right after a shader's #version line. The
+// result is malloc'd; free it with pix_free once compiled.
+PIXDEF char* pix_shader_splice(const char* src, const char* const* chunks, int chunk_count);
+// The full lighting library (scene block, sky, BRDF, lights, shadows,
+// shade_surface) spliced into `src`.
+PIXDEF char* shader_with_pbr(const char* src);
+// Just the scene block + sky/colour helpers.
+PIXDEF char* shader_with_common(const char* src);
+
+#endif // PIX_SHADER_SOURCES_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_SHADER_SOURCES_IMPL)
+#define PIX_SHADER_SOURCES_IMPL
+
+char* pix_shader_splice(const char* src, const char* const* chunks, int chunk_count) {
+    const char* nl = strchr(src, '\n');
+    size_t head = nl ? (size_t)(nl - src) + 1 : 0;
+    size_t total = strlen(src) + 1;
+    for (int i = 0; i < chunk_count; i++) total += strlen(chunks[i]) + 1;
+    char* out = pix_new<char>(total);
+    if (!out) return 0;
+    memcpy(out, src, head);
+    size_t n = head;
+    for (int i = 0; i < chunk_count; i++) {
+        size_t len = strlen(chunks[i]);
+        memcpy(out + n, chunks[i], len);
+        n += len;
+        out[n++] = '\n';
+    }
+    strcpy(out + n, src + head);
+    return out;
+}
+
+char* shader_with_pbr(const char* src) {
+    const char* chunks[] = { GLSL_SCENE, GLSL_COMMON, GLSL_NOISE, GLSL_BRDF, GLSL_LIGHTS, GLSL_SHADOW, GLSL_SURFACE };
+    return pix_shader_splice(src, chunks, 7);
+}
+
+char* shader_with_common(const char* src) {
+    const char* chunks[] = { GLSL_SCENE, GLSL_COMMON };
+    return pix_shader_splice(src, chunks, 2);
+}
+
+#endif // PIX_SHADER_SOURCES_IMPL

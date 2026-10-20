@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_MATH_HPP
+#define PIX_MATH_HPP
 #include <math.h>
 #include "dtype.hpp"
 
@@ -32,40 +33,40 @@
   #define PIX_MATH_SSE 0
 #endif
 
-static vec3 v3(float x, float y, float z) { vec3 r = { x, y, z }; return r; }
-static vec3 v3add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
-static vec3 v3sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
-static vec3 v3scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
-static float v3dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static vec3 v3cross(vec3 a, vec3 b) {
+static inline vec3 v3(float x, float y, float z) { vec3 r = { x, y, z }; return r; }
+static inline vec3 v3add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+static inline vec3 v3sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+static inline vec3 v3scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static inline float v3dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline vec3 v3cross(vec3 a, vec3 b) {
     return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
 }
-static vec3 v3norm(vec3 a) {
+static inline vec3 v3norm(vec3 a) {
     float l = sqrtf(v3dot(a, a));
     if (l < 1e-6f) l = 1.0f;
     return v3(a.x / l, a.y / l, a.z / l);
 }
 
-static vec4 v4(float x, float y, float z, float w) { vec4 r = { x, y, z, w }; return r; }
+static inline vec4 v4(float x, float y, float z, float w) { vec4 r = { x, y, z, w }; return r; }
 
-static vec2 v2(float x, float y) { vec2 r = { x, y }; return r; }
+static inline vec2 v2(float x, float y) { vec2 r = { x, y }; return r; }
 // a vec3's horizontal part - the plane collision and steering queries live in
-static vec2 v2xz(vec3 a) { vec2 r = { a.x, a.z }; return r; }
-static vec2 v2add(vec2 a, vec2 b) { return v2(a.x + b.x, a.y + b.y); }
-static vec2 v2sub(vec2 a, vec2 b) { return v2(a.x - b.x, a.y - b.y); }
-static vec2 v2scale(vec2 a, float s) { return v2(a.x * s, a.y * s); }
-static float v2dot(vec2 a, vec2 b) { return a.x * b.x + a.y * b.y; }
-static float v2len(vec2 a) { return sqrtf(a.x * a.x + a.y * a.y); }
+static inline vec2 v2xz(vec3 a) { vec2 r = { a.x, a.z }; return r; }
+static inline vec2 v2add(vec2 a, vec2 b) { return v2(a.x + b.x, a.y + b.y); }
+static inline vec2 v2sub(vec2 a, vec2 b) { return v2(a.x - b.x, a.y - b.y); }
+static inline vec2 v2scale(vec2 a, float s) { return v2(a.x * s, a.y * s); }
+static inline float v2dot(vec2 a, vec2 b) { return a.x * b.x + a.y * b.y; }
+static inline float v2len(vec2 a) { return sqrtf(a.x * a.x + a.y * a.y); }
 
-static vec3 v3lerp(vec3 a, vec3 b, float t) {
+static inline vec3 v3lerp(vec3 a, vec3 b, float t) {
     return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
 }
 
 // ---------------- quaternions ----------------
 
-static quat quat_identity() { quat q = { 0.0f, 0.0f, 0.0f, 1.0f }; return q; }
+static inline quat quat_identity() { quat q = { 0.0f, 0.0f, 0.0f, 1.0f }; return q; }
 
-static quat quat_norm(quat q) {
+static inline quat quat_norm(quat q) {
     float l = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
     if (l < 1e-8f) return quat_identity();
     float inv = 1.0f / l;
@@ -73,7 +74,7 @@ static quat quat_norm(quat q) {
     return r;
 }
 
-static quat quat_mul(quat a, quat b) {
+static inline quat quat_mul(quat a, quat b) {
     quat r;
     r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
     r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
@@ -83,7 +84,7 @@ static quat quat_mul(quat a, quat b) {
 }
 
 // shortest-arc interpolation; falls back to nlerp when the arc is tiny
-static quat quat_slerp(quat a, quat b, float t) {
+static inline quat quat_slerp(quat a, quat b, float t) {
     float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
     if (d < 0.0f) { b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w; d = -d; }
     float ka = 1.0f - t, kb = t;
@@ -96,7 +97,7 @@ static quat quat_slerp(quat a, quat b, float t) {
     return quat_norm(r);
 }
 
-static mat4 mat4_identity() {
+static inline mat4 mat4_identity() {
     mat4 m = {};
     m.data[0] = m.data[5] = m.data[10] = m.data[15] = 1.0f;
     return m;
@@ -110,7 +111,7 @@ static mat4 mat4_identity() {
 // multiply-adds over whole columns, with no transposing and no horizontal adds
 // - the shape the scalar loop below spells out one element at a time.
 #if PIX_MATH_SSE
-static mat4 mat4_mul(mat4 a, mat4 b) {
+static inline mat4 mat4_mul(mat4 a, mat4 b) {
     mat4 r;
     __m128 a0 = _mm_loadu_ps(a.data + 0);
     __m128 a1 = _mm_loadu_ps(a.data + 4);
@@ -128,7 +129,7 @@ static mat4 mat4_mul(mat4 a, mat4 b) {
     return r;
 }
 #else
-static mat4 mat4_mul(mat4 a, mat4 b) {
+static inline mat4 mat4_mul(mat4 a, mat4 b) {
     mat4 r = {};
     for (int c = 0; c < 4; c++)
         for (int row = 0; row < 4; row++) {
@@ -140,19 +141,19 @@ static mat4 mat4_mul(mat4 a, mat4 b) {
 }
 #endif
 
-static mat4 mat4_translate(float x, float y, float z) {
+static inline mat4 mat4_translate(float x, float y, float z) {
     mat4 m = mat4_identity();
     m.data[12] = x; m.data[13] = y; m.data[14] = z;
     return m;
 }
 
-static mat4 mat4_scale(float x, float y, float z) {
+static inline mat4 mat4_scale(float x, float y, float z) {
     mat4 m = {};
     m.data[0] = x; m.data[5] = y; m.data[10] = z; m.data[15] = 1.0f;
     return m;
 }
 
-static mat4 mat4_rotate_y(float radians) {
+static inline mat4 mat4_rotate_y(float radians) {
     mat4 m = mat4_identity();
     float c = cosf(radians), s = sinf(radians);
     m.data[0] = c; m.data[8] = s;
@@ -160,7 +161,7 @@ static mat4 mat4_rotate_y(float radians) {
     return m;
 }
 
-static mat4 mat4_perspective(float fovy, float aspect, float n, float f) {
+static inline mat4 mat4_perspective(float fovy, float aspect, float n, float f) {
     mat4 m = {};
     float t = 1.0f / tanf(fovy * 0.5f);
     m.data[0]  = t / aspect;
@@ -172,7 +173,7 @@ static mat4 mat4_perspective(float fovy, float aspect, float n, float f) {
 }
 
 // maps [left,right]x[bottom,top] to NDC; pass top=0,bottom=height for y-down screen space
-static mat4 mat4_ortho(float left, float right, float bottom, float top, float n, float f) {
+static inline mat4 mat4_ortho(float left, float right, float bottom, float top, float n, float f) {
     mat4 m = {};
     m.data[0]  = 2.0f / (right - left);
     m.data[5]  = 2.0f / (top - bottom);
@@ -184,7 +185,7 @@ static mat4 mat4_ortho(float left, float right, float bottom, float top, float n
     return m;
 }
 
-static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
+static inline mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     vec3 fwd = v3norm(v3sub(center, eye));
     vec3 s   = v3norm(v3cross(fwd, up));
     vec3 u   = v3cross(s, fwd);
@@ -199,7 +200,7 @@ static mat4 mat4_lookat(vec3 eye, vec3 center, vec3 up) {
     return m;
 }
 
-static mat4 mat4_from_quat(quat q) {
+static inline mat4 mat4_from_quat(quat q) {
     mat4 m = mat4_identity();
     float x = q.x, y = q.y, z = q.z, w = q.w;
     m.data[0] = 1.0f - 2.0f * (y * y + z * z);
@@ -215,7 +216,7 @@ static mat4 mat4_from_quat(quat q) {
 }
 
 // T * R * S, built directly (cheaper than three mat4_mul calls)
-static mat4 mat4_from_trs(vec3 t, quat r, vec3 s) {
+static inline mat4 mat4_from_trs(vec3 t, quat r, vec3 s) {
     mat4 m = mat4_from_quat(r);
     m.data[0] *= s.x; m.data[1] *= s.x; m.data[2] *= s.x;
     m.data[4] *= s.y; m.data[5] *= s.y; m.data[6] *= s.y;
@@ -225,7 +226,7 @@ static mat4 mat4_from_trs(vec3 t, quat r, vec3 s) {
 }
 
 // splits an affine matrix back into TRS; assumes no shear (true for node matrices in practice)
-static void mat4_decompose(const mat4& m, vec3* t, quat* r, vec3* s) {
+static inline void mat4_decompose(const mat4& m, vec3* t, quat* r, vec3* s) {
     t->x = m.data[12]; t->y = m.data[13]; t->z = m.data[14];
 
     vec3 cx = v3(m.data[0], m.data[1], m.data[2]);
@@ -264,7 +265,7 @@ static void mat4_decompose(const mat4& m, vec3* t, quat* r, vec3* s) {
 
 // ---------------- extra rotations ----------------
 
-static mat4 mat4_rotate_x(float radians) {
+static inline mat4 mat4_rotate_x(float radians) {
     mat4 m = mat4_identity();
     float c = cosf(radians), s = sinf(radians);
     m.data[5] = c; m.data[9] = -s;
@@ -272,7 +273,7 @@ static mat4 mat4_rotate_x(float radians) {
     return m;
 }
 
-static mat4 mat4_rotate_z(float radians) {
+static inline mat4 mat4_rotate_z(float radians) {
     mat4 m = mat4_identity();
     float c = cosf(radians), s = sinf(radians);
     m.data[0] = c; m.data[4] = -s;
@@ -281,7 +282,7 @@ static mat4 mat4_rotate_z(float radians) {
 }
 
 // the common "place a prop" transform, built without three mat4_mul calls
-static mat4 mat4_trs_y(vec3 position, float yaw, float scale) {
+static inline mat4 mat4_trs_y(vec3 position, float yaw, float scale) {
     mat4 m = {};
     float c = cosf(yaw) * scale, s = sinf(yaw) * scale;
     m.data[0] = c;  m.data[8]  = s;
@@ -293,7 +294,7 @@ static mat4 mat4_trs_y(vec3 position, float yaw, float scale) {
 }
 
 // same, with an independent vertical scale (squash/stretch a prop without a second mul)
-static mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y) {
+static inline mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y) {
     mat4 m = mat4_trs_y(position, yaw, scale_xz);
     m.data[5] = scale_y;
     return m;
@@ -307,7 +308,7 @@ static mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y)
 // closes that gap without changing how deep the model sits on the others. A
 // yaw and three scales is the whole of it, still as one matrix rather than
 // three multiplied together.
-static mat4 mat4_trs_y3(vec3 position, float yaw, float scale_x, float scale_y, float scale_z) {
+static inline mat4 mat4_trs_y3(vec3 position, float yaw, float scale_x, float scale_y, float scale_z) {
     mat4 m = {};
     float c = cosf(yaw), s = sinf(yaw);
     m.data[0] = c * scale_x;  m.data[2]  = -s * scale_x;
@@ -321,7 +322,7 @@ static mat4 mat4_trs_y3(vec3 position, float yaw, float scale_x, float scale_y, 
 // Full 4x4 inverse (cofactor expansion). Wanted for turning a view-projection
 // back into camera rays, and for undoing a bind pose; not on any hot path, so
 // clarity over speed.
-static mat4 mat4_inverse(const mat4& m) {
+static inline mat4 mat4_inverse(const mat4& m) {
     const float* a = m.data;
     mat4 out;
     float* o = out.data;
@@ -353,18 +354,18 @@ static mat4 mat4_inverse(const mat4& m) {
     return out;
 }
 
-static vec3 mat4_mul_point(const mat4& m, vec3 p) {
+static inline vec3 mat4_mul_point(const mat4& m, vec3 p) {
     return v3(m.data[0] * p.x + m.data[4] * p.y + m.data[8]  * p.z + m.data[12],
               m.data[1] * p.x + m.data[5] * p.y + m.data[9]  * p.z + m.data[13],
               m.data[2] * p.x + m.data[6] * p.y + m.data[10] * p.z + m.data[14]);
 }
 
-static float v3len(vec3 a) { return sqrtf(v3dot(a, a)); }
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static inline float v3len(vec3 a) { return sqrtf(v3dot(a, a)); }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
 // shortest signed difference between two headings, wrapped to (-pi, pi]
-static float angle_delta(float from, float to) {
+static inline float angle_delta(float from, float to) {
     float d = to - from;
     while (d >  3.14159265f) d -= 6.28318531f;
     while (d < -3.14159265f) d += 6.28318531f;
@@ -372,13 +373,13 @@ static float angle_delta(float from, float to) {
 }
 
 // exponential smoothing that behaves the same at any framerate
-static float damp(float current, float target, float rate, float dt) {
+static inline float damp(float current, float target, float rate, float dt) {
     return lerpf(current, target, 1.0f - expf(-rate * dt));
 }
 
 // the same, but taking the short way round the circle so a heading never spins
 // the long way to get somewhere a few degrees away
-static float damp_angle(float current, float target, float rate, float dt) {
+static inline float damp_angle(float current, float target, float rate, float dt) {
     return current + angle_delta(current, target) * (1.0f - expf(-rate * dt));
 }
 
@@ -389,7 +390,7 @@ static float damp_angle(float current, float target, float rate, float dt) {
 // standard Gribb/Hartmann row combinations.
 struct frustum { vec4 planes[6]; };
 
-static frustum frustum_from_viewproj(const mat4& m) {
+static inline frustum frustum_from_viewproj(const mat4& m) {
     frustum f;
     // rows of a column-major matrix: row r = (m[r], m[4+r], m[8+r], m[12+r])
     float row[4][4];
@@ -410,7 +411,7 @@ static frustum frustum_from_viewproj(const mat4& m) {
     return f;
 }
 
-static bool frustum_test_sphere(const frustum& f, vec3 c, float radius) {
+static inline bool frustum_test_sphere(const frustum& f, vec3 c, float radius) {
     for (int i = 0; i < 6; i++) {
         const vec4& p = f.planes[i];
         if (p.x * c.x + p.y * c.y + p.z * c.z + p.w < -radius) return false;
@@ -420,7 +421,7 @@ static bool frustum_test_sphere(const frustum& f, vec3 c, float radius) {
 
 // Positive-vertex test: for each plane, only the box corner furthest along the
 // plane normal can keep the box inside, so one corner per plane decides it.
-static bool frustum_test_aabb(const frustum& f, vec3 min_corner, vec3 max_corner) {
+static inline bool frustum_test_aabb(const frustum& f, vec3 min_corner, vec3 max_corner) {
     for (int i = 0; i < 6; i++) {
         const vec4& p = f.planes[i];
         vec3 positive = v3(p.x >= 0.0f ? max_corner.x : min_corner.x,
@@ -431,3 +432,135 @@ static bool frustum_test_aabb(const frustum& f, vec3 min_corner, vec3 max_corner
     }
     return true;
 }
+
+// ---------------- more vector helpers ----------------
+
+static inline vec3 v3neg(vec3 a) { return v3(-a.x, -a.y, -a.z); }
+static inline vec3 v3mul(vec3 a, vec3 b) { return v3(a.x * b.x, a.y * b.y, a.z * b.z); }
+static inline vec3 v3min(vec3 a, vec3 b) { return v3(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z); }
+static inline vec3 v3max(vec3 a, vec3 b) { return v3(a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y, a.z > b.z ? a.z : b.z); }
+static inline float v3dist(vec3 a, vec3 b) { return v3len(v3sub(a, b)); }
+static inline vec2 v2norm(vec2 a) {
+    float l = v2len(a);
+    return l < 1e-6f ? v2(0.0f, 0.0f) : v2(a.x / l, a.y / l);
+}
+static inline vec2 v2rotate(vec2 a, float radians) {
+    float c = cosf(radians), s = sinf(radians);
+    return v2(a.x * c - a.y * s, a.x * s + a.y * c);
+}
+static inline vec2 v2lerp(vec2 a, vec2 b, float t) { return v2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t); }
+static inline float v2dist(vec2 a, vec2 b) { return v2len(v2sub(a, b)); }
+static inline vec4 v4lerp(vec4 a, vec4 b, float t) {
+    return v4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+}
+
+#define PIX_PI      3.14159265358979f
+#define PIX_TAU     6.28318530717959f
+#define PIX_DEG2RAD (PIX_PI / 180.0f)
+#define PIX_RAD2DEG (180.0f / PIX_PI)
+
+static inline float minf(float a, float b) { return a < b ? a : b; }
+static inline float maxf(float a, float b) { return a > b ? a : b; }
+static inline float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+// moves `current` toward `target` by at most `max_step`, never overshooting
+static inline float approachf(float current, float target, float max_step) {
+    if (current < target) return current + max_step < target ? current + max_step : target;
+    return current - max_step > target ? current - max_step : target;
+}
+
+// ---------------- more quaternion / matrix helpers ----------------
+
+static inline quat quat_from_axis_angle(vec3 axis, float radians) {
+    vec3 a = v3norm(axis);
+    float s = sinf(radians * 0.5f);
+    quat q = { a.x * s, a.y * s, a.z * s, cosf(radians * 0.5f) };
+    return q;
+}
+
+// yaw about +Y, then pitch about +X, then roll about +Z (the usual game order)
+static inline quat quat_from_euler(float pitch, float yaw, float roll) {
+    quat qy = quat_from_axis_angle(v3(0.0f, 1.0f, 0.0f), yaw);
+    quat qx = quat_from_axis_angle(v3(1.0f, 0.0f, 0.0f), pitch);
+    quat qz = quat_from_axis_angle(v3(0.0f, 0.0f, 1.0f), roll);
+    return quat_mul(quat_mul(qy, qx), qz);
+}
+
+static inline quat quat_conjugate(quat q) { quat r = { -q.x, -q.y, -q.z, q.w }; return r; }
+
+static inline vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3scale(v3cross(u, v), 2.0f);
+    return v3add(v3add(v, v3scale(t, q.w)), v3cross(u, t));
+}
+
+static inline mat4 mat4_rotate(vec3 axis, float radians) {
+    return mat4_from_quat(quat_from_axis_angle(axis, radians));
+}
+
+static inline mat4 mat4_transpose(const mat4& m) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) r.data[row * 4 + c] = m.data[c * 4 + row];
+    return r;
+}
+
+// a direction, ignoring translation
+static inline vec3 mat4_mul_dir(const mat4& m, vec3 d) {
+    return v3(m.data[0] * d.x + m.data[4] * d.y + m.data[8]  * d.z,
+              m.data[1] * d.x + m.data[5] * d.y + m.data[9]  * d.z,
+              m.data[2] * d.x + m.data[6] * d.y + m.data[10] * d.z);
+}
+
+static inline vec4 mat4_mul_vec4(const mat4& m, vec4 p) {
+    return v4(m.data[0] * p.x + m.data[4] * p.y + m.data[8]  * p.z + m.data[12] * p.w,
+              m.data[1] * p.x + m.data[5] * p.y + m.data[9]  * p.z + m.data[13] * p.w,
+              m.data[2] * p.x + m.data[6] * p.y + m.data[10] * p.z + m.data[14] * p.w,
+              m.data[3] * p.x + m.data[7] * p.y + m.data[11] * p.z + m.data[15] * p.w);
+}
+
+static inline vec3 mat4_get_translation(const mat4& m) { return v3(m.data[12], m.data[13], m.data[14]); }
+
+// largest axis scale, for growing a bounding sphere through a transform
+static inline float mat4_max_scale(const mat4& m) {
+    float sx = m.data[0] * m.data[0] + m.data[1] * m.data[1] + m.data[2]  * m.data[2];
+    float sy = m.data[4] * m.data[4] + m.data[5] * m.data[5] + m.data[6]  * m.data[6];
+    float sz = m.data[8] * m.data[8] + m.data[9] * m.data[9] + m.data[10] * m.data[10];
+    float s = sx > sy ? sx : sy;
+    return sqrtf(s > sz ? s : sz);
+}
+
+// ---------------- operators ----------------
+//
+// Plain arithmetic on the plain structs above, so game code can write
+// `pos + vel * dt` instead of v3add(pos, v3scale(vel, dt)). Opt out with
+// PIX_NO_OPERATORS if they clash with another maths library.
+#ifndef PIX_NO_OPERATORS
+static inline vec2  operator+(vec2 a, vec2 b)   { return v2add(a, b); }
+static inline vec2  operator-(vec2 a, vec2 b)   { return v2sub(a, b); }
+static inline vec2  operator-(vec2 a)           { return v2(-a.x, -a.y); }
+static inline vec2  operator*(vec2 a, float s)  { return v2scale(a, s); }
+static inline vec2  operator*(float s, vec2 a)  { return v2scale(a, s); }
+static inline vec2  operator/(vec2 a, float s)  { return v2scale(a, 1.0f / s); }
+static inline vec2& operator+=(vec2& a, vec2 b) { a = a + b; return a; }
+static inline vec2& operator-=(vec2& a, vec2 b) { a = a - b; return a; }
+static inline vec2& operator*=(vec2& a, float s) { a = a * s; return a; }
+
+static inline vec3  operator+(vec3 a, vec3 b)   { return v3add(a, b); }
+static inline vec3  operator-(vec3 a, vec3 b)   { return v3sub(a, b); }
+static inline vec3  operator-(vec3 a)           { return v3neg(a); }
+static inline vec3  operator*(vec3 a, float s)  { return v3scale(a, s); }
+static inline vec3  operator*(float s, vec3 a)  { return v3scale(a, s); }
+static inline vec3  operator*(vec3 a, vec3 b)   { return v3mul(a, b); }
+static inline vec3  operator/(vec3 a, float s)  { return v3scale(a, 1.0f / s); }
+static inline vec3& operator+=(vec3& a, vec3 b) { a = a + b; return a; }
+static inline vec3& operator-=(vec3& a, vec3 b) { a = a - b; return a; }
+static inline vec3& operator*=(vec3& a, float s) { a = a * s; return a; }
+
+static inline mat4  operator*(const mat4& a, const mat4& b) { return mat4_mul(a, b); }
+static inline quat  operator*(quat a, quat b)   { return quat_mul(a, b); }
+#endif
+
+#endif // PIX_MATH_HPP

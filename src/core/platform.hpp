@@ -1,7 +1,8 @@
-#pragma once
+// pix - window, OpenGL context, keyboard / mouse / gamepad input and time.
+#ifndef PIX_PLATFORM_HPP
+#define PIX_PLATFORM_HPP
+#include "dtype.hpp"
 #include <windows.h>
-#include <windowsx.h>
-#include <math.h>
 #include <GL/gl.h>
 
 #pragma comment(lib, "opengl32.lib")
@@ -15,6 +16,12 @@ struct pix_key_state {
     char code;
 };
 
+// ---- key codes ----
+//
+// keystates[] is indexed by the Windows virtual-key code, which for letters
+// and digits is simply their ASCII capital: keystates['W'], keystates['1'].
+// The handful of keys whose virtual codes would read as punctuation are moved
+// up out of the way, and the mouse buttons live at the very top.
 #define MOUSE_BUTTON_LEFT  255
 #define MOUSE_BUTTON_RIGHT 254
 #define MOUSE_BUTTON_MID   253
@@ -44,10 +51,21 @@ struct pix_key_state {
 #define KEY_F11 0x7A
 #define KEY_F12 0x7B
 #define KEY_RETURN 0x0D
+#define KEY_ENTER  KEY_RETURN
 // these keep their windows virtual key codes, which pix__map_vk passes through
-#define KEY_SHIFT 16
-#define KEY_CTRL  17
-#define KEY_SPACE 32
+#define KEY_BACKSPACE 0x08
+#define KEY_SHIFT     16
+#define KEY_CTRL      17
+#define KEY_ALT       18
+#define KEY_PAUSE     0x13
+#define KEY_CAPS_LOCK 0x14
+#define KEY_SPACE     32
+#define KEY_PAGE_UP   0x21
+#define KEY_PAGE_DOWN 0x22
+#define KEY_END       0x23
+#define KEY_HOME      0x24
+#define KEY_INSERT    0x2D
+#define KEY_DELETE    0x2E
 
 // ---- gamepads ----
 // XInput, resolved at runtime so there is no link dependency and a machine
@@ -84,6 +102,15 @@ struct pix_gamepad {
     float rumble_low, rumble_high;            // last values handed to the motors
 };
 
+// ---- window flags ----
+#define PIX_WINDOW_RESIZABLE  0x01   // user may drag the border; watch window.resized
+#define PIX_WINDOW_FULLSCREEN 0x02   // borderless fullscreen on the current monitor
+#define PIX_WINDOW_VSYNC      0x04   // start with vsync on (default is uncapped)
+#define PIX_WINDOW_DEBUG_GL   0x08   // debug context; GL errors are printed via pix_log
+#define PIX_WINDOW_HIDDEN     0x10   // create without showing (tools, tests)
+
+#define PIX_MAX_TEXT_INPUT 32
+
 struct pix_window {
     HWND  handle;
     HDC   dc;
@@ -96,30 +123,73 @@ struct pix_window {
     bool should_close;
 
     pix_gamepad gamepads[PIX_MAX_GAMEPADS];
+
+    // Client area in pixels. `resized` is true for exactly the frame the size
+    // changed on, which is when render targets need to follow it.
+    int  width;
+    int  height;
+    bool resized;
+    bool focused;
+    bool minimized;
+    bool fullscreen;
+    unsigned int flags;
+
+    // Unicode codepoints typed this frame, in order - for text boxes and chat,
+    // where keystates would lose the shift state, the layout and key repeat.
+    unsigned int text_input[PIX_MAX_TEXT_INPUT];
+    int          text_input_count;
+
+    // private: restoring from fullscreen
+    RECT windowed_rect;
+    DWORD windowed_style;
+    wchar_t pending_surrogate;
 };
 
-static pix_window pix_create_window(const char* title, int width, int height);
-static void pix_update_window(pix_window& window);   // pump events + refresh input state
-static void pix_swap_buffers(pix_window& window);
+PIXDEF pix_window pix_create_window(const char* title, int width, int height, unsigned int flags = 0);
+PIXDEF void pix_destroy_window(pix_window& window);
+PIXDEF void pix_update_window(pix_window& window);   // swap the last frame, pump events, refresh input
+PIXDEF void pix_swap_buffers(pix_window& window);
 
 // Hides the cursor and warps it back to the middle of the client area after
 // every frame, so mouse_rel keeps accumulating without the pointer ever
 // reaching a screen edge - what a mouselook camera needs.
-static void pix_set_mouse_capture(pix_window& window, bool captured);
+PIXDEF void pix_set_mouse_capture(pix_window& window, bool captured);
+PIXDEF void pix_show_cursor(pix_window& window, bool visible);
 
 // Buffer swap pacing. Off means the frame rate is uncapped, which is what you
 // want while measuring - vsync pins a scene that would run at 150fps to a flat
 // 60 and it reads exactly like a real bottleneck. On is what a shipped game
-// wants. The window starts uncapped; call this to change it.
-static void pix_set_vsync(pix_window& window, bool enabled);
+// wants. The window starts uncapped unless PIX_WINDOW_VSYNC is passed.
+PIXDEF void pix_set_vsync(pix_window& window, bool enabled);
+
+// Borderless fullscreen on whichever monitor the window is on, and back.
+PIXDEF void pix_set_fullscreen(pix_window& window, bool fullscreen);
+PIXDEF void pix_set_window_title(pix_window& window, const char* title);
 
 // low = the heavy motor, high = the light one; both 0..1, held until changed
-static void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float high);
-static void pix_stop_gamepad_rumble(pix_window& window);   // all pads, e.g. on shutdown
+PIXDEF void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float high);
+PIXDEF void pix_stop_gamepad_rumble(pix_window& window);   // all pads, e.g. on shutdown
+
+// Seconds since the first call, from the high resolution counter.
+PIXDEF double pix_time_seconds(void);
+
+// Some Win32/WGL entry points the loader in opengl_api.hpp also needs.
+PIXDEF void* pix_gl_get_proc(const char* name);
+
+#endif // PIX_PLATFORM_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_PLATFORM_IMPL)
+#define PIX_PLATFORM_IMPL
+#include <windowsx.h>
+#include <math.h>
+#include <stdio.h>
 
 // ---- WGL extension constants ----
 #define WGL_CONTEXT_MAJOR_VERSION_ARB    0x2091
 #define WGL_CONTEXT_MINOR_VERSION_ARB    0x2092
+#define WGL_CONTEXT_FLAGS_ARB            0x2094
+#define WGL_CONTEXT_DEBUG_BIT_ARB        0x0001
 #define WGL_CONTEXT_PROFILE_MASK_ARB     0x9126
 #define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
 #define WGL_DRAW_TO_WINDOW_ARB           0x2001
@@ -137,10 +207,24 @@ typedef BOOL (WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int);
 // resolved once the real context exists; null on a driver without the extension
 static PFNWGLSWAPINTERVALEXTPROC pix__swap_interval;
 
-
-// -------------------- implementation --------------------
-
 static pix_window* pix__active; // valid only while pix_update_window is pumping
+
+void* pix_gl_get_proc(const char* name) {
+    void* p = (void*)wglGetProcAddress(name);
+    if (p == 0 || p == (void*)1 || p == (void*)2 || p == (void*)3 || p == (void*)-1) {
+        HMODULE m = GetModuleHandleA("opengl32.dll");
+        p = (void*)GetProcAddress(m, name);
+    }
+    return p;
+}
+
+double pix_time_seconds(void) {
+    static LARGE_INTEGER freq, start;
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start); }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart;
+}
 
 // ---- xinput, declared here rather than pulling in <xinput.h> ----
 
@@ -178,7 +262,6 @@ static ULONGLONG pix__pad_retry[PIX_MAX_GAMEPADS];  // next tick an empty slot m
 #define PIX__XI_LEFT_DEADZONE   7849.0f
 #define PIX__XI_RIGHT_DEADZONE  8689.0f
 #define PIX__XI_TRIGGER_FLOOR   30.0f
-#define PIX__XI_NOT_CONNECTED   1167    // ERROR_DEVICE_NOT_CONNECTED
 #define PIX__PAD_RETRY_MS       2000    // probing an empty slot is slow, so back off
 
 static void pix__load_xinput() {
@@ -276,11 +359,13 @@ static void pix__update_gamepads(pix_window& w) {
     }
 }
 
-static void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float high) {
+void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float high) {
     if (pad < 0 || pad >= PIX_MAX_GAMEPADS || !pix__xi_set) return;
     if (!window.gamepads[pad].connected) return;
-    if (low  < 0.0f) low  = 0.0f;  if (low  > 1.0f) low  = 1.0f;
-    if (high < 0.0f) high = 0.0f;  if (high > 1.0f) high = 1.0f;
+    if (low  < 0.0f) low  = 0.0f;
+    if (low  > 1.0f) low  = 1.0f;
+    if (high < 0.0f) high = 0.0f;
+    if (high > 1.0f) high = 1.0f;
 
     pix__xi_rumble v;
     v.low  = (WORD)(low  * 65535.0f);
@@ -290,7 +375,7 @@ static void pix_set_gamepad_rumble(pix_window& window, int pad, float low, float
     window.gamepads[pad].rumble_high = high;
 }
 
-static void pix_stop_gamepad_rumble(pix_window& window) {
+void pix_stop_gamepad_rumble(pix_window& window) {
     for (int i = 0; i < PIX_MAX_GAMEPADS; i++) pix_set_gamepad_rumble(window, i, 0.0f, 0.0f);
 }
 
@@ -304,6 +389,10 @@ static int pix__map_vk(int vk) {
         case VK_TAB:    return KEY_TAB;
         case VK_OEM_4:  return KEY_LEFT_BRACKET;
         case VK_OEM_6:  return KEY_RIGHT_BRACKET;
+        // left/right variants report as the generic modifier
+        case VK_LSHIFT: case VK_RSHIFT:     return KEY_SHIFT;
+        case VK_LCONTROL: case VK_RCONTROL: return KEY_CTRL;
+        case VK_LMENU: case VK_RMENU:       return KEY_ALT;
     }
     if (vk > 0 && vk < 253) return vk; // letters/digits land on their ascii code
     return -1;
@@ -318,9 +407,22 @@ static void pix__key_down(pix_window* w, int code) {
 
 static void pix__key_up(pix_window* w, int code) {
     if (code < 0) return;
+    if (w->keystates[code].held) w->keystates[code].released = true;
     w->keystates[code].held = false;
-    w->keystates[code].released = true;
     w->keystates[code].code = (char)code;
+}
+
+// Alt-tabbing away with a key held never delivers its key-up to this window,
+// which leaves the key stuck down until it is pressed again. Losing focus lets
+// go of everything instead.
+static void pix__release_all(pix_window* w) {
+    for (int i = 0; i < 256; i++) if (w->keystates[i].held) pix__key_up(w, i);
+}
+
+static void pix__push_codepoint(pix_window* w, unsigned int cp) {
+    if (cp < 32 && cp != '\t' && cp != '\r' && cp != '\b') return;  // control chars stay in keystates
+    if (cp == 127) return;
+    if (w->text_input_count < PIX_MAX_TEXT_INPUT) w->text_input[w->text_input_count++] = cp;
 }
 
 static LRESULT CALLBACK pix__wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -333,11 +435,42 @@ static LRESULT CALLBACK pix__wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             w->should_close = true;
             return 0;
 
+        case WM_SIZE: {
+            int nw = LOWORD(lp), nh = HIWORD(lp);
+            w->minimized = (wp == SIZE_MINIMIZED);
+            if (!w->minimized && nw > 0 && nh > 0 && (nw != w->width || nh != w->height)) {
+                w->width = nw;
+                w->height = nh;
+                w->resized = true;
+            }
+            return 0;
+        }
+        case WM_SETFOCUS:  w->focused = true;  return 0;
+        case WM_KILLFOCUS: w->focused = false; pix__release_all(w); return 0;
+
         case WM_KEYDOWN:    pix__key_down(w, pix__map_vk((int)wp)); return 0;
         case WM_KEYUP:      pix__key_up  (w, pix__map_vk((int)wp)); return 0;
+        // Alt and F10 arrive as system keys; they are recorded like any other
+        // and then still handed to Windows so Alt+F4 and Alt+Space keep working.
+        case WM_SYSKEYDOWN: pix__key_down(w, pix__map_vk((int)wp)); break;
+        case WM_SYSKEYUP:   pix__key_up  (w, pix__map_vk((int)wp)); break;
 
-        case WM_LBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_LEFT);  return 0;
-        case WM_LBUTTONUP:   pix__key_up  (w, MOUSE_BUTTON_LEFT);  return 0;
+        case WM_CHAR: {
+            wchar_t c = (wchar_t)wp;
+            if (c >= 0xD800 && c < 0xDC00) { w->pending_surrogate = c; return 0; }
+            if (c >= 0xDC00 && c < 0xE000 && w->pending_surrogate) {
+                unsigned int cp = 0x10000 + (((unsigned)w->pending_surrogate - 0xD800) << 10)
+                                + ((unsigned)c - 0xDC00);
+                w->pending_surrogate = 0;
+                pix__push_codepoint(w, cp);
+                return 0;
+            }
+            pix__push_codepoint(w, (unsigned int)c);
+            return 0;
+        }
+
+        case WM_LBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_LEFT);  SetCapture(h); return 0;
+        case WM_LBUTTONUP:   pix__key_up  (w, MOUSE_BUTTON_LEFT);  ReleaseCapture(); return 0;
         case WM_RBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_RIGHT); return 0;
         case WM_RBUTTONUP:   pix__key_up  (w, MOUSE_BUTTON_RIGHT); return 0;
         case WM_MBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_MID);   return 0;
@@ -356,18 +489,38 @@ static LRESULT CALLBACK pix__wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             w->mouse_y = ny;
             return 0;
         }
+        case WM_ERASEBKGND:
+            return 1;   // GL paints every pixel; skipping the erase avoids a flash on resize
     }
     return DefWindowProcA(h, msg, wp, lp);
 }
 
-static pix_window pix_create_window(const char* title, int width, int height) {
+static DWORD pix__window_style(unsigned int flags) {
+    if (flags & PIX_WINDOW_RESIZABLE) return WS_OVERLAPPEDWINDOW;
+    return WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
+}
+
+pix_window pix_create_window(const char* title, int width, int height, unsigned int flags) {
     pix_window win = {};
+    win.flags = flags;
+
+    // Without this Windows bitmap-stretches the whole window on a high DPI
+    // display and every pixel the game draws comes out blurred.
+    {
+        typedef BOOL (WINAPI* PFN_SetProcessDPIAware)(void);
+        HMODULE user32 = GetModuleHandleA("user32.dll");
+        PFN_SetProcessDPIAware aware = user32
+            ? (PFN_SetProcessDPIAware)GetProcAddress(user32, "SetProcessDPIAware") : 0;
+        if (aware) aware();
+    }
 
     WNDCLASSA wc = {};
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = pix__wndproc;
     wc.hInstance = GetModuleHandleA(0);
     wc.lpszClassName = "pix_window_class";
     wc.hCursor = LoadCursor(0, IDC_ARROW);
+    wc.hIcon = LoadIcon(0, IDI_APPLICATION);
     RegisterClassA(&wc);
 
     // dummy context so we can resolve the modern WGL entry points
@@ -396,14 +549,23 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     ReleaseDC(dummy, ddc);
     DestroyWindow(dummy);
 
+    if (!wglChoosePixelFormatARB || !wglCreateContextAttribsARB) {
+        MessageBoxA(0, "This graphics driver does not support modern OpenGL.", "pix", MB_OK | MB_ICONERROR);
+        win.should_close = true;
+        return win;
+    }
+
     // real window
+    DWORD style = pix__window_style(flags);
     RECT r = { 0, 0, width, height };
-    DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     win.handle = CreateWindowExA(0, wc.lpszClassName, title, style,
         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
         0, 0, wc.hInstance, 0);
     win.dc = GetDC(win.handle);
+    win.width = width;
+    win.height = height;
+    win.focused = true;
 
     const int pf_attr[] = {
         WGL_DRAW_TO_WINDOW_ARB, 1,
@@ -425,9 +587,16 @@ static pix_window pix_create_window(const char* title, int width, int height) {
         WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
         WGL_CONTEXT_MINOR_VERSION_ARB, 4,
         WGL_CONTEXT_PROFILE_MASK_ARB,  WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        WGL_CONTEXT_FLAGS_ARB,         (flags & PIX_WINDOW_DEBUG_GL) ? WGL_CONTEXT_DEBUG_BIT_ARB : 0,
         0
     };
     HGLRC rc = wglCreateContextAttribsARB(win.dc, 0, ctx_attr);
+    if (!rc) {
+        MessageBoxA(0, "OpenGL 4.4 is required but this driver could not create a 4.4 core context.\n"
+                       "Updating the graphics driver usually fixes this.", "pix", MB_OK | MB_ICONERROR);
+        win.should_close = true;
+        return win;
+    }
     win.gl_context = rc;
     wglMakeCurrent(win.dc, rc);
 
@@ -435,9 +604,14 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     // reports what the engine actually costs rather than what the monitor
     // allows. pix_set_vsync puts it back.
     pix__swap_interval = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
-    pix_set_vsync(win, false);
+    pix_set_vsync(win, (flags & PIX_WINDOW_VSYNC) != 0);
 
-    ShowWindow(win.handle, SW_SHOW);
+    if (!(flags & PIX_WINDOW_HIDDEN)) ShowWindow(win.handle, SW_SHOW);
+    if (flags & PIX_WINDOW_FULLSCREEN) {
+        pix__active = &win;                 // so the WM_SIZE this sends lands in win
+        pix_set_fullscreen(win, true);
+        pix__active = 0;
+    }
 
     pix__load_xinput();   // absent xinput just means no pads are ever reported
 
@@ -447,21 +621,73 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     ScreenToClient(win.handle, &p);
     win.mouse_x = p.x;
     win.mouse_y = p.y;
+    pix_time_seconds();   // start the clock
     return win;
 }
 
-static void pix_set_vsync(pix_window& window, bool enabled) {
+void pix_destroy_window(pix_window& window) {
+    if (window.gl_context) {
+        wglMakeCurrent(0, 0);
+        wglDeleteContext((HGLRC)window.gl_context);
+    }
+    if (window.handle) {
+        if (window.dc) ReleaseDC(window.handle, window.dc);
+        DestroyWindow(window.handle);
+    }
+    window.handle = 0;
+    window.dc = 0;
+    window.gl_context = 0;
+}
+
+void pix_set_vsync(pix_window& window, bool enabled) {
     (void)window;   // one context per window here, and it is already current
     if (pix__swap_interval) pix__swap_interval(enabled ? 1 : 0);
 }
 
-static void pix_set_mouse_capture(pix_window& window, bool captured) {
+void pix_set_mouse_capture(pix_window& window, bool captured) {
     if (window.mouse_captured == captured) return;
     window.mouse_captured = captured;
     ShowCursor(captured ? FALSE : TRUE);
 }
 
-static void pix_update_window(pix_window& window) {
+void pix_show_cursor(pix_window& window, bool visible) {
+    (void)window;
+    // ShowCursor keeps a counter rather than a flag; drive it to the state asked for
+    CURSORINFO ci = { sizeof(ci) };
+    GetCursorInfo(&ci);
+    bool shown = (ci.flags & CURSOR_SHOWING) != 0;
+    if (shown != visible) ShowCursor(visible ? TRUE : FALSE);
+}
+
+void pix_set_window_title(pix_window& window, const char* title) {
+    SetWindowTextA(window.handle, title);
+}
+
+void pix_set_fullscreen(pix_window& window, bool fullscreen) {
+    if (window.fullscreen == fullscreen || !window.handle) return;
+    if (fullscreen) {
+        window.windowed_style = (DWORD)GetWindowLongA(window.handle, GWL_STYLE);
+        GetWindowRect(window.handle, &window.windowed_rect);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfoA(MonitorFromWindow(window.handle, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongA(window.handle, GWL_STYLE, (LONG)(window.windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(window.handle, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongA(window.handle, GWL_STYLE, (LONG)window.windowed_style);
+        const RECT& r = window.windowed_rect;
+        SetWindowPos(window.handle, 0, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    window.fullscreen = fullscreen;
+}
+
+void pix_swap_buffers(pix_window& window) {
+    SwapBuffers(window.dc);
+}
+
+void pix_update_window(pix_window& window) {
     // clear per-frame edges before draining this frame's events
     SwapBuffers(window.dc);
 
@@ -472,6 +698,8 @@ static void pix_update_window(pix_window& window) {
     window.mouse_rel_x = 0;
     window.mouse_rel_y = 0;
     window.mouse_wheel = 0;
+    window.resized = false;
+    window.text_input_count = 0;
 
     pix__active = &window;
     MSG msg;
@@ -497,3 +725,4 @@ static void pix_update_window(pix_window& window) {
     }
 }
 
+#endif // PIX_PLATFORM_IMPL

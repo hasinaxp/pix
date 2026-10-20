@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_PHYSICS_HPP
+#define PIX_PHYSICS_HPP
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -46,8 +47,14 @@
 // Splitting only what is provably independent is why there is not a lock
 // anywhere in the step.
 
+// Capacities, not memory in the struct: the arrays behind them are heap
+// allocated by phys_create_world. Define before including pix to change them.
+#ifndef PHYS_MAX_BODIES
 #define PHYS_MAX_BODIES    2048
+#endif
+#ifndef PHYS_MAX_STATICS
 #define PHYS_MAX_STATICS   32768
+#endif
 #define PHYS_CELL          10.0f   // metres per broadphase cell
 #define PHYS_SOLVER_PASSES 2
 
@@ -121,8 +128,8 @@ struct phys_static_shape {
 };
 
 struct phys_world {
-    aabb   statics[PHYS_MAX_STATICS];
-    phys_static_shape static_shape[PHYS_MAX_STATICS];
+    aabb*  statics;                        // PHYS_MAX_STATICS, heap
+    phys_static_shape* static_shape;       // PHYS_MAX_STATICS, heap
     size_t      static_count;
 
     // static uniform grid, built by phys_build_statics
@@ -131,12 +138,13 @@ struct phys_world {
     uint32_t* cell_items;     // static indices, bucketed
     size_t    cell_item_count;
 
-    phys_body bodies[PHYS_MAX_BODIES];
+    phys_body* bodies;                     // PHYS_MAX_BODIES, heap
     size_t    body_count;
 
     // dynamic hash grid, rebuilt every step
-    uint32_t dyn_start[4097];
-    uint32_t dyn_items[PHYS_MAX_BODIES];
+    uint32_t* dyn_start;                   // PHYS_DYN_BUCKETS + 1, heap
+    uint32_t* dyn_items;                   // PHYS_MAX_BODIES, heap
+    uint32_t* dyn_cursor;                  // PHYS_DYN_BUCKETS + 1, heap scratch
 
     vec3  gravity;
     float ground_y;
@@ -156,36 +164,36 @@ struct phys_world {
     pix_jobs* jobs;
 };
 
-static void phys_create_world(phys_world& w);
-static void phys_destroy_world(phys_world& w);
+PIXDEF void phys_create_world(phys_world& w);
+PIXDEF void phys_destroy_world(phys_world& w);
 
-static void phys_add_static_box(phys_world& w, vec3 min, vec3 max);
+PIXDEF void phys_add_static_box(phys_world& w, vec3 min, vec3 max);
 // convenience: a yawed footprint, stored as its axis aligned bound
-static void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height);
-static void phys_build_statics(phys_world& w);
+PIXDEF void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height);
+PIXDEF void phys_build_statics(phys_world& w);
 // drops every static collider (not the dynamic bodies) so the world can be
 // regenerated in place - see the definition for why this has to exist
-static void phys_reset_statics(phys_world& w);
+PIXDEF void phys_reset_statics(phys_world& w);
 
-static idx  phys_add_body(phys_world& w, const phys_body& body);
-static phys_body* phys_get_body(phys_world& w, idx id);
-static void phys_remove_body(phys_world& w, idx id);
+PIXDEF idx  phys_add_body(phys_world& w, const phys_body& body);
+PIXDEF phys_body* phys_get_body(phys_world& w, idx id);
+PIXDEF void phys_remove_body(phys_world& w, idx id);
 
-static void phys_step(phys_world& w, float dt);
+PIXDEF void phys_step(phys_world& w, float dt);
 
 // world queries
-static bool phys_raycast(const phys_world& w, vec3 origin, vec3 direction,
+PIXDEF bool phys_raycast(const phys_world& w, vec3 origin, vec3 direction,
                          float max_distance, float* out_distance);
-static size_t phys_overlap_bodies(const phys_world& w, vec3 centre, float radius,
+PIXDEF size_t phys_overlap_bodies(const phys_world& w, vec3 centre, float radius,
                                   idx* out, size_t capacity);
 // Same question answered through the dynamic hash grid instead of a linear
 // scan. The grid is rebuilt by phys_step and stays valid until the next one,
 // so game code that runs between steps - steering that wants its neighbours,
 // say - can ask this instead of walking every body in the world.
-static size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radius,
+PIXDEF size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radius,
                                     idx* out, size_t capacity);
 // true when an upright cylinder placed here would intersect static geometry
-static bool phys_point_blocked(const phys_world& w, vec3 position, float radius, float height);
+PIXDEF bool phys_point_blocked(const phys_world& w, vec3 position, float radius, float height);
 
 // The first *dynamic* body a ray meets, as opposed to phys_raycast above,
 // which only ever sees the static world. A projectile needs both and needs to
@@ -194,14 +202,26 @@ static bool phys_point_blocked(const phys_world& w, vec3 position, float radius,
 // `ignore` is skipped outright - normally the firer's own collider. `mask` is
 // a layer filter, so a shot can be made to pass through whatever it should not
 // stop on.
-static idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
+PIXDEF idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
                                float max_distance, uint16_t mask, idx ignore,
                                float* out_distance);
 
-// ---------------- implementation ----------------
+#endif // PIX_PHYSICS_HPP
 
-static void phys_create_world(phys_world& w) {
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_PHYSICS_IMPL)
+#define PIX_PHYSICS_IMPL
+
+#define PHYS_DYN_BUCKETS 4096
+
+void phys_create_world(phys_world& w) {
     memset(&w, 0, sizeof(w));
+    w.statics      = pix_alloc<aabb>(PHYS_MAX_STATICS);
+    w.static_shape = pix_alloc<phys_static_shape>(PHYS_MAX_STATICS);
+    w.bodies       = pix_alloc<phys_body>(PHYS_MAX_BODIES);
+    w.dyn_start    = pix_alloc<uint32_t>(PHYS_DYN_BUCKETS + 1);
+    w.dyn_cursor   = pix_alloc<uint32_t>(PHYS_DYN_BUCKETS + 1);
+    w.dyn_items    = pix_alloc<uint32_t>(PHYS_MAX_BODIES);
     // Snappier than 9.8: a character falling at real gravity reads as floaty
     // at game scale. Overwrite it for a simulation.
     w.gravity = v3(0.0f, -22.0f, 0.0f);
@@ -209,11 +229,16 @@ static void phys_create_world(phys_world& w) {
     w.step_height = 0.45f;
 }
 
-static void phys_destroy_world(phys_world& w) {
+void phys_destroy_world(phys_world& w) {
     free(w.cell_start);
     free(w.cell_items);
-    w.cell_start = 0;
-    w.cell_items = 0;
+    pix_free(w.statics);
+    pix_free(w.static_shape);
+    pix_free(w.bodies);
+    pix_free(w.dyn_start);
+    pix_free(w.dyn_cursor);
+    pix_free(w.dyn_items);
+    memset(&w, 0, sizeof(w));
 }
 
 // Drops every static collider and the grid built over them, leaving every
@@ -223,7 +248,7 @@ static void phys_destroy_world(phys_world& w) {
 // second time replaces its geometry, but without this the colliders from the
 // first run are still standing - invisible walls in the middle of whatever got
 // built over them. Generators should call it before they repopulate.
-static void phys_reset_statics(phys_world& w) {
+void phys_reset_statics(phys_world& w) {
     free(w.cell_start);
     free(w.cell_items);
     w.cell_start = 0;
@@ -232,7 +257,7 @@ static void phys_reset_statics(phys_world& w) {
     w.static_count = 0;
 }
 
-static void phys_add_static_box(phys_world& w, vec3 min, vec3 max) {
+void phys_add_static_box(phys_world& w, vec3 min, vec3 max) {
     if (w.static_count >= PHYS_MAX_STATICS) return;
     size_t i = w.static_count++;
     w.statics[i] = aabb_make(min, max);
@@ -241,7 +266,7 @@ static void phys_add_static_box(phys_world& w, vec3 min, vec3 max) {
     w.static_shape[i].rotated = false;
 }
 
-static void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height) {
+void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height) {
     if (w.static_count >= PHYS_MAX_STATICS) return;
     obb2 box = { v2(position.x, position.z), half, yaw };
     size_t i = w.static_count++;
@@ -256,7 +281,7 @@ static void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 h
     w.static_shape[i].rotated = fabsf(turns - snapped) > 0.02f;
 }
 
-static void phys_build_statics(phys_world& w) {
+void phys_build_statics(phys_world& w) {
     free(w.cell_start);
     free(w.cell_items);
     w.cell_start = 0;
@@ -321,7 +346,7 @@ static void phys_build_statics(phys_world& w) {
     free(cursor);
 }
 
-static idx phys_add_body(phys_world& w, const phys_body& body) {
+idx phys_add_body(phys_world& w, const phys_body& body) {
     for (size_t i = 0; i < w.body_count; i++)
         if (!w.bodies[i].active) { w.bodies[i] = body; w.bodies[i].active = true; return (idx)i; }
     if (w.body_count >= PHYS_MAX_BODIES) return (idx)-1;
@@ -331,11 +356,11 @@ static idx phys_add_body(phys_world& w, const phys_body& body) {
     return id;
 }
 
-static phys_body* phys_get_body(phys_world& w, idx id) {
+phys_body* phys_get_body(phys_world& w, idx id) {
     return (id < w.body_count && w.bodies[id].active) ? &w.bodies[id] : 0;
 }
 
-static void phys_remove_body(phys_world& w, idx id) {
+void phys_remove_body(phys_world& w, idx id) {
     if (id < w.body_count) w.bodies[id].active = false;
 }
 
@@ -438,8 +463,6 @@ static void phys__resolve_statics(phys_world& w, phys_body& b) {
 
 // ---- dynamic broadphase ----
 
-#define PHYS_DYN_BUCKETS 4096
-
 static uint32_t phys__dyn_bucket(float x, float z) {
     int cx = (int)floorf(x / PHYS_CELL);
     int cz = (int)floorf(z / PHYS_CELL);
@@ -447,15 +470,15 @@ static uint32_t phys__dyn_bucket(float x, float z) {
 }
 
 static void phys__build_dynamic_grid(phys_world& w) {
-    memset(w.dyn_start, 0, sizeof(w.dyn_start));
+    memset(w.dyn_start, 0, sizeof(uint32_t) * (PHYS_DYN_BUCKETS + 1));
     for (size_t i = 0; i < w.body_count; i++) {
         if (!w.bodies[i].active) continue;
         w.dyn_start[phys__dyn_bucket(w.bodies[i].position.x, w.bodies[i].position.z) + 1]++;
     }
     for (int i = 0; i < PHYS_DYN_BUCKETS; i++) w.dyn_start[i + 1] += w.dyn_start[i];
 
-    uint32_t cursor[PHYS_DYN_BUCKETS + 1];
-    memcpy(cursor, w.dyn_start, sizeof(cursor));
+    uint32_t* cursor = w.dyn_cursor;
+    memcpy(cursor, w.dyn_start, sizeof(uint32_t) * (PHYS_DYN_BUCKETS + 1));
     for (size_t i = 0; i < w.body_count; i++) {
         if (!w.bodies[i].active) continue;
         w.dyn_items[cursor[phys__dyn_bucket(w.bodies[i].position.x, w.bodies[i].position.z)]++] = (uint32_t)i;
@@ -616,7 +639,7 @@ static void phys__job_statics(void* user, size_t begin, size_t end, int) {
     }
 }
 
-static void phys_step(phys_world& w, float dt) {
+void phys_step(phys_world& w, float dt) {
     if (dt <= 0.0f) return;
 
     phys__phase phase;
@@ -639,7 +662,7 @@ static void phys_step(phys_world& w, float dt) {
 
 // ---- queries ----
 
-static bool phys_raycast(const phys_world& w, vec3 origin, vec3 direction,
+bool phys_raycast(const phys_world& w, vec3 origin, vec3 direction,
                          float max_distance, float* out_distance) {
     if (!w.cell_start || !w.cell_items) return false;
     vec3 d = v3norm(direction);
@@ -676,7 +699,7 @@ static bool phys_raycast(const phys_world& w, vec3 origin, vec3 direction,
     return found;
 }
 
-static size_t phys_overlap_bodies(const phys_world& w, vec3 centre, float radius,
+size_t phys_overlap_bodies(const phys_world& w, vec3 centre, float radius,
                                   idx* out, size_t capacity) {
     size_t n = 0;
     float r2 = radius * radius;
@@ -689,7 +712,7 @@ static size_t phys_overlap_bodies(const phys_world& w, vec3 centre, float radius
     return n;
 }
 
-static size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radius,
+size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radius,
                                     idx* out, size_t capacity) {
     size_t n = 0;
     int reach = (int)(radius / PHYS_CELL) + 1;
@@ -709,7 +732,7 @@ static size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radi
     return n;
 }
 
-static bool phys_point_blocked(const phys_world& w, vec3 position, float radius, float height) {
+bool phys_point_blocked(const phys_world& w, vec3 position, float radius, float height) {
     if (!w.cell_start || !w.cell_items) return false;
     int cx0 = (int)floorf((position.x - radius) / PHYS_CELL) - w.grid_x0;
     int cx1 = (int)floorf((position.x + radius) / PHYS_CELL) - w.grid_x0;
@@ -810,7 +833,7 @@ static bool phys__ray_body(const phys_body& b, vec3 origin, vec3 dir, float max_
     return true;
 }
 
-static idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
+idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
                                float max_distance, uint16_t mask, idx ignore,
                                float* out_distance) {
     vec3 d = v3norm(direction);
@@ -832,3 +855,5 @@ static idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
     if (best != (idx)-1 && out_distance) *out_distance = best_t;
     return best;
 }
+
+#endif // PIX_PHYSICS_IMPL

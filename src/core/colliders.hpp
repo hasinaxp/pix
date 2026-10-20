@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_COLLIDERS_HPP
+#define PIX_COLLIDERS_HPP
 #include <math.h>
 #include "dtype.hpp"
 #include "math.hpp"
@@ -51,30 +52,30 @@ struct contact2 {
 
 // ---- constructors ----
 
-static aabb   aabb_make(vec3 min, vec3 max);
-static aabb   aabb_from_centre(vec3 centre, vec3 half_extents);
-static vec3   aabb_centre(const aabb& b);
-static vec3   aabb_half(const aabb& b);
-static float  aabb_height(const aabb& b);
-static rect2  aabb_footprint(const aabb& b);
+static inline aabb   aabb_make(vec3 min, vec3 max);
+static inline aabb   aabb_from_centre(vec3 centre, vec3 half_extents);
+static inline vec3   aabb_centre(const aabb& b);
+static inline vec3   aabb_half(const aabb& b);
+static inline float  aabb_height(const aabb& b);
+static inline rect2  aabb_footprint(const aabb& b);
 // the axis aligned bound of a rotated rectangle extruded to `height`
-static aabb   aabb_from_obb(const obb2& box, float base_y, float height);
+static inline aabb   aabb_from_obb(const obb2& box, float base_y, float height);
 
-static bool   aabb_overlap(const aabb& a, const aabb& b);
-static bool   aabb_contains_xz(const aabb& b, vec2 p);
+static inline bool   aabb_overlap(const aabb& a, const aabb& b);
+static inline bool   aabb_contains_xz(const aabb& b, vec2 p);
 // do two vertical spans [a0, a0+ah) and [b0, b0+bh) share any height at all
-static bool   span_overlap(float a0, float ah, float b0, float bh);
+static inline bool   span_overlap(float a0, float ah, float b0, float bh);
 
 // ---- 2D queries ----
 
-static vec2 closest_point_rect(const rect2& r, vec2 p);
-static vec2 closest_point_obb(const obb2& b, vec2 p);
+static inline vec2 closest_point_rect(const rect2& r, vec2 p);
+static inline vec2 closest_point_obb(const obb2& b, vec2 p);
 
-static bool collide_circle_circle(const circle2& a, const circle2& b, contact2* out);
-static bool collide_circle_rect(const circle2& c, const rect2& r, contact2* out);
-static bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out);
-static bool collide_obb_obb(const obb2& a, const obb2& b, contact2* out);
-static bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out);
+static inline bool collide_circle_circle(const circle2& a, const circle2& b, contact2* out);
+static inline bool collide_circle_rect(const circle2& c, const rect2& r, contact2* out);
+static inline bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out);
+static inline bool collide_obb_obb(const obb2& a, const obb2& b, contact2* out);
+static inline bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out);
 
 // ---- rays ----
 
@@ -82,29 +83,29 @@ static bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out);
 // direction, precomputed because a raycast tests the same ray against many
 // boxes. *out_t is the near hit distance, clamped to 0 when the ray starts
 // inside.
-static bool ray_vs_aabb(vec3 origin, vec3 inv_dir, const aabb& box, float max_distance,
+static inline bool ray_vs_aabb(vec3 origin, vec3 inv_dir, const aabb& box, float max_distance,
                         float* out_t);
 
 // ---------------- implementation ----------------
 
-static aabb aabb_make(vec3 min, vec3 max) { aabb b; b.min = min; b.max = max; return b; }
+static inline aabb aabb_make(vec3 min, vec3 max) { aabb b; b.min = min; b.max = max; return b; }
 
-static aabb aabb_from_centre(vec3 centre, vec3 half_extents) {
+static inline aabb aabb_from_centre(vec3 centre, vec3 half_extents) {
     return aabb_make(v3sub(centre, half_extents), v3add(centre, half_extents));
 }
 
-static vec3 aabb_centre(const aabb& b) { return v3scale(v3add(b.min, b.max), 0.5f); }
-static vec3 aabb_half(const aabb& b)   { return v3scale(v3sub(b.max, b.min), 0.5f); }
-static float aabb_height(const aabb& b) { return b.max.y - b.min.y; }
+static inline vec3 aabb_centre(const aabb& b) { return v3scale(v3add(b.min, b.max), 0.5f); }
+static inline vec3 aabb_half(const aabb& b)   { return v3scale(v3sub(b.max, b.min), 0.5f); }
+static inline float aabb_height(const aabb& b) { return b.max.y - b.min.y; }
 
-static rect2 aabb_footprint(const aabb& b) {
+static inline rect2 aabb_footprint(const aabb& b) {
     rect2 r;
     r.min = v2(b.min.x, b.min.z);
     r.max = v2(b.max.x, b.max.z);
     return r;
 }
 
-static aabb aabb_from_obb(const obb2& box, float base_y, float height) {
+static inline aabb aabb_from_obb(const obb2& box, float base_y, float height) {
     // project both local axes onto world X and Z
     float c = fabsf(cosf(box.yaw)), s = fabsf(sinf(box.yaw));
     float ex = box.half.x * c + box.half.y * s;
@@ -113,47 +114,47 @@ static aabb aabb_from_obb(const obb2& box, float base_y, float height) {
                      v3(box.centre.x + ex, base_y + height, box.centre.y + ez));
 }
 
-static bool aabb_overlap(const aabb& a, const aabb& b) {
+static inline bool aabb_overlap(const aabb& a, const aabb& b) {
     return a.min.x <= b.max.x && a.max.x >= b.min.x
         && a.min.y <= b.max.y && a.max.y >= b.min.y
         && a.min.z <= b.max.z && a.max.z >= b.min.z;
 }
 
-static bool aabb_contains_xz(const aabb& b, vec2 p) {
+static inline bool aabb_contains_xz(const aabb& b, vec2 p) {
     return p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.z && p.y <= b.max.z;
 }
 
-static bool span_overlap(float a0, float ah, float b0, float bh) {
+static inline bool span_overlap(float a0, float ah, float b0, float bh) {
     return a0 < b0 + bh && b0 < a0 + ah;
 }
 
 // ---- 2D ----
 
-static vec2 closest_point_rect(const rect2& r, vec2 p) {
+static inline vec2 closest_point_rect(const rect2& r, vec2 p) {
     return v2(p.x < r.min.x ? r.min.x : (p.x > r.max.x ? r.max.x : p.x),
               p.y < r.min.y ? r.min.y : (p.y > r.max.y ? r.max.y : p.y));
 }
 
 // rotates a world offset into a box's local frame. Local +X is (cos, -sin), so
 // the inverse rotation is this pair of dot products.
-static vec2 obb__to_local(const obb2& b, vec2 world) {
+static inline vec2 obb__to_local(const obb2& b, vec2 world) {
     float cs = cosf(b.yaw), sn = sinf(b.yaw);
     float dx = world.x - b.centre.x, dz = world.y - b.centre.y;
     return v2(dx * cs - dz * sn, dx * sn + dz * cs);
 }
 
-static vec2 obb__to_world_dir(const obb2& b, vec2 local) {
+static inline vec2 obb__to_world_dir(const obb2& b, vec2 local) {
     float cs = cosf(b.yaw), sn = sinf(b.yaw);
     return v2(local.x * cs + local.y * sn, -local.x * sn + local.y * cs);
 }
 
-static vec2 closest_point_obb(const obb2& b, vec2 p) {
+static inline vec2 closest_point_obb(const obb2& b, vec2 p) {
     rect2 local = { v2(-b.half.x, -b.half.y), v2(b.half.x, b.half.y) };
     vec2 c = closest_point_rect(local, obb__to_local(b, p));
     return v2add(b.centre, obb__to_world_dir(b, c));
 }
 
-static bool collide_circle_circle(const circle2& a, const circle2& b, contact2* out) {
+static inline bool collide_circle_circle(const circle2& a, const circle2& b, contact2* out) {
     vec2 d = v2sub(b.centre, a.centre);
     float rr = a.radius + b.radius;
     float d2 = d.x * d.x + d.y * d.y;
@@ -165,7 +166,7 @@ static bool collide_circle_circle(const circle2& a, const circle2& b, contact2* 
     return true;
 }
 
-static bool collide_circle_rect(const circle2& c, const rect2& r, contact2* out) {
+static inline bool collide_circle_rect(const circle2& c, const rect2& r, contact2* out) {
     vec2 closest = closest_point_rect(r, c.centre);
     vec2 d = v2sub(c.centre, closest);
     float d2 = d.x * d.x + d.y * d.y;
@@ -194,7 +195,7 @@ static bool collide_circle_rect(const circle2& c, const rect2& r, contact2* out)
     return true;
 }
 
-static bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out) {
+static inline bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out) {
     circle2 local = { obb__to_local(b, c.centre), c.radius };
     rect2 lr = { v2(-b.half.x, -b.half.y), v2(b.half.x, b.half.y) };
     contact2 hit;
@@ -207,7 +208,7 @@ static bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out) {
 // Separating axis test. Two rectangles cannot overlap if any of their four edge
 // normals separates them, so testing all four and keeping the smallest overlap
 // gives both the answer and the cheapest way out.
-static bool collide_obb_obb(const obb2& a, const obb2& b, contact2* out) {
+static inline bool collide_obb_obb(const obb2& a, const obb2& b, contact2* out) {
     vec2 axis[4];
     axis[0] = v2(cosf(a.yaw), -sinf(a.yaw));   // a's local x
     axis[1] = v2(sinf(a.yaw),  cosf(a.yaw));   // a's local z
@@ -235,7 +236,7 @@ static bool collide_obb_obb(const obb2& a, const obb2& b, contact2* out) {
     return true;
 }
 
-static bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out) {
+static inline bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out) {
     obb2 b;
     b.centre = v2scale(v2add(r.min, r.max), 0.5f);
     b.half   = v2scale(v2sub(r.max, r.min), 0.5f);
@@ -245,7 +246,7 @@ static bool collide_obb_rect(const obb2& a, const rect2& r, contact2* out) {
 
 // ---- rays ----
 
-static bool ray_vs_aabb(vec3 origin, vec3 inv_dir, const aabb& box, float max_distance,
+static inline bool ray_vs_aabb(vec3 origin, vec3 inv_dir, const aabb& box, float max_distance,
                         float* out_t) {
     float t0 = 0.0f, t1 = max_distance;
     const float* bmin = &box.min.x;
@@ -310,48 +311,48 @@ struct contact3 {
 
 // ---- constructors ----
 
-static sphere  sphere_make(vec3 centre, float radius);
-static capsule capsule_make(vec3 a, vec3 b, float radius);
+static inline sphere  sphere_make(vec3 centre, float radius);
+static inline capsule capsule_make(vec3 a, vec3 b, float radius);
 // the character case: a capsule standing on `base`, `height` tall overall, so
 // the segment runs from one radius up to `height - radius`. A `height` under
 // two radii cannot be a capsule at all and collapses to a sphere.
-static capsule capsule_upright(vec3 base, float height, float radius);
-static plane   plane_make(vec3 normal, float distance);
-static plane   plane_through(vec3 normal, vec3 point);
+static inline capsule capsule_upright(vec3 base, float height, float radius);
+static inline plane   plane_make(vec3 normal, float distance);
+static inline plane   plane_through(vec3 normal, vec3 point);
 
-static aabb sphere_bounds(const sphere& s);
-static aabb capsule_bounds(const capsule& c);
+static inline aabb sphere_bounds(const sphere& s);
+static inline aabb capsule_bounds(const capsule& c);
 
 // signed: positive in front of the plane, negative behind, zero on it
-static float plane_distance_to(const plane& p, vec3 point);
+static inline float plane_distance_to(const plane& p, vec3 point);
 
 // ---- closest points ----
 
-static vec3 closest_point_segment(vec3 a, vec3 b, vec3 p);
-static vec3 closest_point_aabb(const aabb& box, vec3 p);
-static vec3 closest_point_plane(const plane& p, vec3 point);
+static inline vec3 closest_point_segment(vec3 a, vec3 b, vec3 p);
+static inline vec3 closest_point_aabb(const aabb& box, vec3 p);
+static inline vec3 closest_point_plane(const plane& p, vec3 point);
 // The pair of closest points between two segments, which is the one primitive
 // capsule-vs-capsule needs and the only one here worth writing out. Degenerate
 // cases (either segment a point, the two parallel) are handled by clamping
 // rather than by branching into special cases.
-static void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2,
+static inline void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2,
                                     vec3* out_c1, vec3* out_c2);
 
 // ---- overlaps ----
 
-static bool collide_sphere_sphere(const sphere& a, const sphere& b, contact3* out);
-static bool collide_sphere_plane(const sphere& s, const plane& p, contact3* out);
-static bool collide_sphere_aabb(const sphere& s, const aabb& box, contact3* out);
-static bool collide_sphere_capsule(const sphere& s, const capsule& c, contact3* out);
-static bool collide_capsule_capsule(const capsule& a, const capsule& b, contact3* out);
-static bool collide_capsule_plane(const capsule& c, const plane& p, contact3* out);
+static inline bool collide_sphere_sphere(const sphere& a, const sphere& b, contact3* out);
+static inline bool collide_sphere_plane(const sphere& s, const plane& p, contact3* out);
+static inline bool collide_sphere_aabb(const sphere& s, const aabb& box, contact3* out);
+static inline bool collide_sphere_capsule(const sphere& s, const capsule& c, contact3* out);
+static inline bool collide_capsule_capsule(const capsule& a, const capsule& b, contact3* out);
+static inline bool collide_capsule_plane(const capsule& c, const plane& p, contact3* out);
 // Capsule against a box, resolved as a sphere at the point on the capsule's
 // axis nearest the box. That is exact whenever the contact is on a face or an
 // end cap, which is nearly every contact a character makes, and slightly
 // generous on an edge hit at a steep angle. It costs one iteration instead of
 // the full segment-vs-box minimisation, and for a character controller the
 // difference never shows.
-static bool collide_capsule_aabb(const capsule& c, const aabb& box, contact3* out);
+static inline bool collide_capsule_aabb(const capsule& c, const aabb& box, contact3* out);
 
 // ---- rays ----
 //
@@ -359,26 +360,26 @@ static bool collide_capsule_aabb(const capsule& c, const aabb& box, contact3* ou
 // to 0 when the ray starts inside the shape. `max_distance` bounds the search
 // so a miss costs no more than a hit.
 
-static bool ray_vs_sphere(vec3 origin, vec3 dir, const sphere& s, float max_distance,
+static inline bool ray_vs_sphere(vec3 origin, vec3 dir, const sphere& s, float max_distance,
                           float* out_t);
 // one-sided is the useful default for a floor: a ray travelling with the
 // normal (from behind) passes through rather than hitting the underside
-static bool ray_vs_plane(vec3 origin, vec3 dir, const plane& p, float max_distance,
+static inline bool ray_vs_plane(vec3 origin, vec3 dir, const plane& p, float max_distance,
                          bool two_sided, float* out_t);
-static bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float max_distance,
+static inline bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float max_distance,
                            float* out_t);
 
 // ---------------- implementation ----------------
 
-static sphere sphere_make(vec3 centre, float radius) {
+static inline sphere sphere_make(vec3 centre, float radius) {
     sphere s; s.centre = centre; s.radius = radius; return s;
 }
 
-static capsule capsule_make(vec3 a, vec3 b, float radius) {
+static inline capsule capsule_make(vec3 a, vec3 b, float radius) {
     capsule c; c.a = a; c.b = b; c.radius = radius; return c;
 }
 
-static capsule capsule_upright(vec3 base, float height, float radius) {
+static inline capsule capsule_upright(vec3 base, float height, float radius) {
     float half = height * 0.5f;
     if (radius > half) radius = half;           // a sphere is as tall as it gets
     float lo = base.y + radius;
@@ -387,21 +388,21 @@ static capsule capsule_upright(vec3 base, float height, float radius) {
     return capsule_make(v3(base.x, lo, base.z), v3(base.x, hi, base.z), radius);
 }
 
-static plane plane_make(vec3 normal, float distance) {
+static inline plane plane_make(vec3 normal, float distance) {
     plane p; p.normal = v3norm(normal); p.distance = distance; return p;
 }
 
-static plane plane_through(vec3 normal, vec3 point) {
+static inline plane plane_through(vec3 normal, vec3 point) {
     vec3 n = v3norm(normal);
     plane p; p.normal = n; p.distance = v3dot(n, point); return p;
 }
 
-static aabb sphere_bounds(const sphere& s) {
+static inline aabb sphere_bounds(const sphere& s) {
     vec3 r = v3(s.radius, s.radius, s.radius);
     return aabb_make(v3sub(s.centre, r), v3add(s.centre, r));
 }
 
-static aabb capsule_bounds(const capsule& c) {
+static inline aabb capsule_bounds(const capsule& c) {
     vec3 lo = v3(c.a.x < c.b.x ? c.a.x : c.b.x,
                  c.a.y < c.b.y ? c.a.y : c.b.y,
                  c.a.z < c.b.z ? c.a.z : c.b.z);
@@ -412,13 +413,13 @@ static aabb capsule_bounds(const capsule& c) {
     return aabb_make(v3sub(lo, r), v3add(hi, r));
 }
 
-static float plane_distance_to(const plane& p, vec3 point) {
+static inline float plane_distance_to(const plane& p, vec3 point) {
     return v3dot(p.normal, point) - p.distance;
 }
 
 // ---- closest points ----
 
-static vec3 closest_point_segment(vec3 a, vec3 b, vec3 p) {
+static inline vec3 closest_point_segment(vec3 a, vec3 b, vec3 p) {
     vec3 ab = v3sub(b, a);
     float denom = v3dot(ab, ab);
     if (denom < 1e-12f) return a;               // the segment is a point
@@ -426,17 +427,17 @@ static vec3 closest_point_segment(vec3 a, vec3 b, vec3 p) {
     return v3add(a, v3scale(ab, t));
 }
 
-static vec3 closest_point_aabb(const aabb& box, vec3 p) {
+static inline vec3 closest_point_aabb(const aabb& box, vec3 p) {
     return v3(clampf(p.x, box.min.x, box.max.x),
               clampf(p.y, box.min.y, box.max.y),
               clampf(p.z, box.min.z, box.max.z));
 }
 
-static vec3 closest_point_plane(const plane& p, vec3 point) {
+static inline vec3 closest_point_plane(const plane& p, vec3 point) {
     return v3sub(point, v3scale(p.normal, plane_distance_to(p, point)));
 }
 
-static void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2,
+static inline void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2,
                                     vec3* out_c1, vec3* out_c2) {
     vec3 d1 = v3sub(q1, p1);        // direction of segment 1
     vec3 d2 = v3sub(q2, p2);
@@ -476,7 +477,7 @@ static void closest_points_segments(vec3 p1, vec3 q1, vec3 p2, vec3 q2,
 
 // ---- overlaps ----
 
-static bool collide_sphere_sphere(const sphere& a, const sphere& b, contact3* out) {
+static inline bool collide_sphere_sphere(const sphere& a, const sphere& b, contact3* out) {
     vec3 d = v3sub(b.centre, a.centre);
     float rr = a.radius + b.radius;
     float d2 = v3dot(d, d);
@@ -488,7 +489,7 @@ static bool collide_sphere_sphere(const sphere& a, const sphere& b, contact3* ou
     return true;
 }
 
-static bool collide_sphere_plane(const sphere& s, const plane& p, contact3* out) {
+static inline bool collide_sphere_plane(const sphere& s, const plane& p, contact3* out) {
     float d = plane_distance_to(p, s.centre);
     if (d > s.radius || d < -s.radius) return false;
     // normal points sphere -> plane, so it is the plane normal reversed when
@@ -498,7 +499,7 @@ static bool collide_sphere_plane(const sphere& s, const plane& p, contact3* out)
     return true;
 }
 
-static bool collide_sphere_aabb(const sphere& s, const aabb& box, contact3* out) {
+static inline bool collide_sphere_aabb(const sphere& s, const aabb& box, contact3* out) {
     vec3 closest = closest_point_aabb(box, s.centre);
     vec3 d = v3sub(s.centre, closest);
     float d2 = v3dot(d, d);
@@ -528,19 +529,19 @@ static bool collide_sphere_aabb(const sphere& s, const aabb& box, contact3* out)
     return true;
 }
 
-static bool collide_sphere_capsule(const sphere& s, const capsule& c, contact3* out) {
+static inline bool collide_sphere_capsule(const sphere& s, const capsule& c, contact3* out) {
     vec3 on_axis = closest_point_segment(c.a, c.b, s.centre);
     sphere as = sphere_make(on_axis, c.radius);
     return collide_sphere_sphere(s, as, out);
 }
 
-static bool collide_capsule_capsule(const capsule& a, const capsule& b, contact3* out) {
+static inline bool collide_capsule_capsule(const capsule& a, const capsule& b, contact3* out) {
     vec3 ca, cb;
     closest_points_segments(a.a, a.b, b.a, b.b, &ca, &cb);
     return collide_sphere_sphere(sphere_make(ca, a.radius), sphere_make(cb, b.radius), out);
 }
 
-static bool collide_capsule_plane(const capsule& c, const plane& p, contact3* out) {
+static inline bool collide_capsule_plane(const capsule& c, const plane& p, contact3* out) {
     // the deeper end decides it, and for a capsule lying flat on a floor both
     // ends are equally deep, which is the same answer either way
     float da = plane_distance_to(p, c.a);
@@ -549,14 +550,14 @@ static bool collide_capsule_plane(const capsule& c, const plane& p, contact3* ou
     return collide_sphere_plane(sphere_make(deepest, c.radius), p, out);
 }
 
-static bool collide_capsule_aabb(const capsule& c, const aabb& box, contact3* out) {
+static inline bool collide_capsule_aabb(const capsule& c, const aabb& box, contact3* out) {
     vec3 on_axis = closest_point_segment(c.a, c.b, aabb_centre(box));
     return collide_sphere_aabb(sphere_make(on_axis, c.radius), box, out);
 }
 
 // ---- rays ----
 
-static bool ray_vs_sphere(vec3 origin, vec3 dir, const sphere& s, float max_distance,
+static inline bool ray_vs_sphere(vec3 origin, vec3 dir, const sphere& s, float max_distance,
                           float* out_t) {
     vec3 m = v3sub(origin, s.centre);
     float b = v3dot(m, dir);
@@ -573,7 +574,7 @@ static bool ray_vs_sphere(vec3 origin, vec3 dir, const sphere& s, float max_dist
     return true;
 }
 
-static bool ray_vs_plane(vec3 origin, vec3 dir, const plane& p, float max_distance,
+static inline bool ray_vs_plane(vec3 origin, vec3 dir, const plane& p, float max_distance,
                          bool two_sided, float* out_t) {
     float denom = v3dot(p.normal, dir);
     // parallel, or approaching the back face when only the front counts
@@ -585,7 +586,7 @@ static bool ray_vs_plane(vec3 origin, vec3 dir, const plane& p, float max_distan
     return true;
 }
 
-static bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float max_distance,
+static inline bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float max_distance,
                            float* out_t) {
     // The capsule is an infinite cylinder clipped to the segment's span, with a
     // sphere at each end filling in what the clip cuts off. Solve the cylinder
@@ -641,3 +642,5 @@ static bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float max_di
     if (hit && out_t) *out_t = best;
     return hit;
 }
+
+#endif // PIX_COLLIDERS_HPP

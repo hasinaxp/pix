@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_FRAMEBUFFER_HPP
+#define PIX_FRAMEBUFFER_HPP
 #include <windows.h>
 #include "dtype.hpp"
 #include "opengl_api.hpp"
@@ -29,21 +30,27 @@ struct framebuffer {
     bool hdr;
 };
 
-// `hdr` picks RGBA16F over RGBA8, which is what lets a bloom or tonemap pass
-// work with values above 1 instead of clipping them at the source
-static framebuffer pix_create_render_target(int width, int height, bool hdr = true,
-                                            bool mipmapped = false);
-static framebuffer pix_create_shadow_map(int width, int height);
-static void pix_destroy_framebuffer(framebuffer& target);
+// `hdr` picks a packed float format (R11G11B10F: HDR range at half the memory
+// of RGBA16F, no alpha) over RGBA8, which is what lets a bloom or tonemap pass
+// work with values above 1 instead of clipping them at the source. `depth`
+// attaches a sampleable depth texture.
+PIXDEF framebuffer pix_create_render_target(int width, int height, bool hdr = true,
+                                            bool mipmapped = false, bool depth = true);
+PIXDEF framebuffer pix_create_shadow_map(int width, int height);
+PIXDEF void pix_destroy_framebuffer(framebuffer& target);
 
-static void pix_bind_framebuffer(const framebuffer& target);
-static void pix_bind_backbuffer(int width, int height);
+PIXDEF void pix_bind_framebuffer(const framebuffer& target);
+PIXDEF void pix_bind_backbuffer(int width, int height);
 
 // a full-screen triangle, drawn with no vertex buffer at all - the vertex
 // shader builds it from gl_VertexID
-static void pix_draw_fullscreen(void);
+PIXDEF void pix_draw_fullscreen(void);
 
-// ---------------- implementation ----------------
+#endif // PIX_FRAMEBUFFER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_FRAMEBUFFER_IMPL)
+#define PIX_FRAMEBUFFER_IMPL
 
 // `mipmapped` is for a target something else samples at a heavy, uneven
 // minification - a planar reflection, say, projected across a wide range of
@@ -56,8 +63,8 @@ static idx fb__make_color(int width, int height, bool hdr, bool mipmapped = fals
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height, 0,
-                 GL_RGBA, hdr ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE, 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_R11F_G11F_B10F : GL_RGBA8, width, height, 0,
+                 hdr ? GL_RGB : GL_RGBA, hdr ? GL_FLOAT : GL_UNSIGNED_BYTE, 0);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                     mipmapped ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -96,13 +103,11 @@ static idx fb__make_depth(int width, int height, bool comparison) {
 static bool fb__complete(const char* what) {
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status == GL_FRAMEBUFFER_COMPLETE) return true;
-    char message[128];
-    wsprintfA(message, "incomplete framebuffer (%s): 0x%04X", what, (unsigned)status);
-    MessageBoxA(0, message, "pix", MB_OK);
+    pix_log("pix: incomplete framebuffer (%s): 0x%04X", what, (unsigned)status);
     return false;
 }
 
-static framebuffer pix_create_render_target(int width, int height, bool hdr, bool mipmapped) {
+framebuffer pix_create_render_target(int width, int height, bool hdr, bool mipmapped, bool depth) {
     framebuffer t = {};
     t.width = width;
     t.height = height;
@@ -114,8 +119,10 @@ static framebuffer pix_create_render_target(int width, int height, bool hdr, boo
     t.color = fb__make_color(width, height, hdr, mipmapped);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.color, 0);
 
-    t.depth = fb__make_depth(width, height, false);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, t.depth, 0);
+    if (depth) {
+        t.depth = fb__make_depth(width, height, false);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, t.depth, 0);
+    }
 
     fb__complete("scene");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -125,7 +132,7 @@ static framebuffer pix_create_render_target(int width, int height, bool hdr, boo
 // `width` may be several tiles wide: cascaded shadows keep every cascade in one
 // texture side by side, so the whole set needs one sampler and one bind, and a
 // cascade is selected by offsetting the lookup rather than by swapping textures.
-static framebuffer pix_create_shadow_map(int width, int height) {
+framebuffer pix_create_shadow_map(int width, int height) {
     framebuffer t = {};
     t.width = width;
     t.height = height;
@@ -145,29 +152,31 @@ static framebuffer pix_create_shadow_map(int width, int height) {
     return t;
 }
 
-static void pix_destroy_framebuffer(framebuffer& t) {
+void pix_destroy_framebuffer(framebuffer& t) {
     if (t.color) glDeleteTextures(1, &t.color);
     if (t.depth) glDeleteTextures(1, &t.depth);
     if (t.fbo)   glDeleteFramebuffers(1, &t.fbo);
     t = framebuffer();
 }
 
-static void pix_bind_framebuffer(const framebuffer& t) {
+void pix_bind_framebuffer(const framebuffer& t) {
     glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
     glViewport(0, 0, t.width, t.height);
 }
 
-static void pix_bind_backbuffer(int width, int height) {
+void pix_bind_backbuffer(int width, int height) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, width, height);
 }
 
 // One triangle big enough to cover the screen beats two that meet down the
 // middle: no seam, and every pixel is shaded exactly once.
-static void pix_draw_fullscreen(void) {
+void pix_draw_fullscreen(void) {
     static GLuint vao = 0;
     if (!vao) glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
 }
+
+#endif // PIX_FRAMEBUFFER_IMPL

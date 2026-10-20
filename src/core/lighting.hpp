@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_LIGHTING_HPP
+#define PIX_LIGHTING_HPP
 #include <math.h>
 #include "dtype.hpp"
 #include "math.hpp"
@@ -27,7 +28,9 @@
 // is three glUniform4fv calls and no per-light work.
 
 // what a frame may collect before culling
+#ifndef MAX_SCENE_LIGHTS
 #define MAX_SCENE_LIGHTS   512
+#endif
 // what one draw actually uploads. Every one of these is evaluated per fragment,
 // so this is a real cost; the nearest N to the camera are the ones that survive.
 #define MAX_SHADER_LIGHTS  32
@@ -44,7 +47,7 @@ struct pix_light {
 };
 
 // a point light: falls off to nothing at `radius`, shines in every direction
-static pix_light pix_point_light(vec3 position, float radius, vec3 color) {
+static inline pix_light pix_point_light(vec3 position, float radius, vec3 color) {
     pix_light l;
     l.position = position;
     l.radius = radius;
@@ -56,7 +59,7 @@ static pix_light pix_point_light(vec3 position, float radius, vec3 color) {
 }
 
 // a cone light: full strength inside `inner` radians of the axis, gone by `outer`
-static pix_light pix_spot_light(vec3 position, vec3 direction, float radius,
+static inline pix_light pix_spot_light(vec3 position, vec3 direction, float radius,
                                 float inner, float outer, vec3 color) {
     pix_light l;
     l.position = position;
@@ -124,12 +127,12 @@ static const pix_daylight PIX_DAY[PIX_DAY_KEYS] = {
     { 21.0f,  -12.0f, 300.0f, 1.60f, { {}, { 0.16f, 0.16f, 0.26f } }, { { 0.020f, 0.026f, 0.060f }, { 0.070f, 0.070f, 0.110f }, { 0.010f, 0.010f, 0.016f }, { 0.085f, 0.095f, 0.145f }, { 0.038f, 0.038f, 0.048f }, { 0.09f, 0.10f, 0.15f }, 0.0018f } }
 };
 
-static vec3 pix__mix3(vec3 a, vec3 b, float t) { return v3lerp(a, b, t); }
+static inline vec3 pix__mix3(vec3 a, vec3 b, float t) { return v3lerp(a, b, t); }
 
 // Sun direction from an elevation and azimuth in degrees. Azimuth turns from
 // +X toward +Z, so it agrees with the direction convention the rest of the
 // world uses.
-static vec3 pix_sun_direction(float elevation_deg, float azimuth_deg) {
+static inline vec3 pix_sun_direction(float elevation_deg, float azimuth_deg) {
     float e = elevation_deg * 0.01745329f;
     float a = azimuth_deg * 0.01745329f;
     float ce = cosf(e);
@@ -138,7 +141,7 @@ static vec3 pix_sun_direction(float elevation_deg, float azimuth_deg) {
 
 // The complete lighting setup for an hour of the day, 0..24.
 // `hour` is wrapped, so a caller may wind the clock past either end of a day.
-static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky,
+static inline void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky,
                             float* out_exposure) {
     hour = fmodf(hour, 24.0f);
     if (hour < 0.0f) hour += 24.0f;
@@ -177,98 +180,6 @@ static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky,
     out_sky->fog_density  = A.sky.fog_density + (B.sky.fog_density - A.sky.fog_density) * t;
 }
 
-// ---- weather ----
-//
-// Weather is a filter over the hour, not a second lighting setup. Every key in
-// PIX_DAY is a clear sky; a cloud deck is what happens to that clear sky when
-// something grey is put between it and the sun, and that is a transformation
-// the same at every hour: the sun loses most of its strength and all of its
-// colour, the dome flattens toward the grey of the cloud base, the fog thickens
-// and the camera opens up to compensate. Doing it this way means a new hour
-// keyframe is automatically correct in the rain, and an overcast noon and an
-// overcast dusk stay as different from each other as the clear ones are.
-//
-// `overcast` is the cloud deck, 0..1. `rain` is how hard it is falling, which
-// only ever exists under cloud; `wetness` lags rain so the ground stays shiny
-// for a while after it stops.
-struct pix_weather {
-    float overcast;
-    float rain;
-    float wetness;
-};
-
-// The grey a thick cloud base scatters. Slightly blue, because it is still lit
-// by a sky - a neutral grey here is what makes overcast renders look dead.
-static const vec3 PIX_OVERCAST_GREY = { 0.44f, 0.47f, 0.52f };
-
-// Bends a clear-sky setup toward that cloud deck. Applied after
-// pix_daylight_at, so the hour is chosen first and the weather then acts on it.
-static void pix_weather_apply(const pix_weather& w, pix_sun* sun, pix_sky* sky,
-                              float* exposure) {
-    float o = w.overcast < 0.0f ? 0.0f : (w.overcast > 1.0f ? 1.0f : w.overcast);
-    if (o <= 0.0f) return;
-
-    // The sun behind cloud is not a shadow-casting disc any more, it is the
-    // brightest part of a uniform dome. Killing most of its radiance is what
-    // makes the shadows go away, which is the single strongest cue that the
-    // sky has closed over.
-    float lum = sun->color.x * 0.2126f + sun->color.y * 0.7152f + sun->color.z * 0.0722f;
-    vec3 grey_sun = v3(lum, lum, lum);
-    sun->color = v3scale(pix__mix3(sun->color, grey_sun, o * 0.85f), 1.0f - o * 0.88f);
-
-    // How bright the sky is at this hour at all.
-    //
-    // The deck colour above is the grey of a cloud base at *midday*. Used as
-    // an absolute it turns an overcast midnight into an overcast noon: the
-    // dome is a fixed mid grey, the exposure is still the one night needs, and
-    // the result is half past nine at night lit like an afternoon. A cloud base
-    // is only ever as bright as the sky lighting it, so the grey is scaled by
-    // what this hour's clear sky was already doing - which makes
-    // one deck colour work at every hour instead of only at the one it was
-    // picked for.
-    float sky_lum = sky->horizon.x * 0.2126f + sky->horizon.y * 0.7152f
-                  + sky->horizon.z * 0.0722f;
-    float k = sky_lum / 0.66f;              // 0.66 is that midday horizon
-    if (k > 1.4f) k = 1.4f;
-    if (k < 0.015f) k = 0.015f;
-    vec3 grey = v3scale(PIX_OVERCAST_GREY, k);
-
-    // The dome loses its gradient: overcast sky is nearly the same brightness
-    // straight up as at the horizon, which is why it has no depth to it.
-    vec3 deck_up   = v3scale(grey, 0.62f);
-    vec3 deck_horiz = grey;
-    float dim = 1.0f - o * 0.35f;
-    sky->zenith  = pix__mix3(sky->zenith,  v3scale(deck_up, dim), o);
-    sky->horizon = pix__mix3(sky->horizon, v3scale(deck_horiz, dim), o);
-    sky->ground  = pix__mix3(sky->ground,  v3scale(grey, 0.18f * dim), o);
-
-    // The irradiance the sun stopped delivering does not all vanish - cloud
-    // scatters a good part of it back down as a huge soft source. Overcast is
-    // dimmer than clear noon, but nothing like as dim as the sun term alone
-    // would suggest, and this is the term that keeps a rainy scene readable.
-    float up_lum = sky->diffuse_up.x * 0.2126f + sky->diffuse_up.y * 0.7152f + sky->diffuse_up.z * 0.0722f;
-    vec3 flat_up = v3scale(PIX_OVERCAST_GREY, up_lum * 1.55f + 0.02f * k);
-    sky->diffuse_up   = pix__mix3(sky->diffuse_up, flat_up, o);
-    sky->diffuse_down = pix__mix3(sky->diffuse_down, v3scale(flat_up, 0.45f), o);
-
-    // Rain is haze you can see through less far.
-    vec3 fog_grey = pix__mix3(sky->fog, grey, 0.75f);
-    sky->fog = pix__mix3(sky->fog, fog_grey, o);
-    sky->fog_density *= 1.0f + o * 1.8f + w.rain * 1.6f;
-
-    // and the eye opens up under it, the way it does walking out into a grey day
-    *exposure *= 1.0f + o * 0.30f;
-}
-
-// How much artificial light the world should be running, 0 by day and 1 at
-// night. Lamps and headlights fade in and out on this rather than switching,
-// so dusk is a gradient instead of an event.
-static float pix_night_factor(const pix_sun& sun) {
-    // -0.08 is a few degrees below the horizon; by then the lamps are fully on
-    float t = (0.14f - sun.direction.y) / 0.22f;
-    return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-}
-
 // ---- the per-frame light list ----
 //
 // Lights are submitted every frame the same way draw calls are, then reduced to
@@ -287,12 +198,12 @@ struct pix_light_list {
     int   packed_count;
 };
 
-static void pix_lights_clear(pix_light_list& list) {
+static inline void pix_lights_clear(pix_light_list& list) {
     list.count = 0;
     list.packed_count = 0;
 }
 
-static void pix_lights_add(pix_light_list& list, const pix_light& light) {
+static inline void pix_lights_add(pix_light_list& list, const pix_light& light) {
     if (list.count < MAX_SCENE_LIGHTS) list.lights[list.count++] = light;
 }
 
@@ -310,7 +221,7 @@ static void pix_lights_add(pix_light_list& list, const pix_light& light) {
 // brightest somewhere across the map, and nothing near the camera lights
 // anything at all. A hundredth of a candela per metre keeps the tie-break it
 // was there for and takes away its ability to win outright.
-static void pix_lights_pack(pix_light_list& list, vec3 eye) {
+static inline void pix_lights_pack(pix_light_list& list, vec3 eye) {
     static float score[MAX_SCENE_LIGHTS];
     static int   order[MAX_SCENE_LIGHTS];
 
@@ -354,3 +265,5 @@ static void pix_lights_pack(pix_light_list& list, vec3 eye) {
         list.packed_count++;
     }
 }
+
+#endif // PIX_LIGHTING_HPP

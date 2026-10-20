@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_TEXT_HPP
+#define PIX_TEXT_HPP
 #include "font.hpp"
 #include "sprite.hpp"
 
@@ -18,7 +19,7 @@ struct text_style {
     float outline_width;    // 0 = no outline; normalized sdf units, ~0.05..0.3 is visible
 };
 
-static text_style pix_default_style(vec4 color = { 1.0f, 1.0f, 1.0f, 1.0f }) {
+static inline text_style pix_default_style(vec4 color = { 1.0f, 1.0f, 1.0f, 1.0f }) {
     text_style s = {};
     s.color = color;
     s.outline_color = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -32,25 +33,29 @@ struct pixi_text {
     vec2 position; // baseline of the first character; pix_update_text re-lays-out from here
 };
 
-pixi_text pix_create_text(
+PIXDEF pixi_text pix_create_text(
     font_data* font,
     const char* text,
     vec2 position,
     text_style style = pix_default_style(),
     size_t capacity = 0); // glyph slots to bake room for; 0 = exactly fit `text`
 
-void pix_destroy_text(pixi_text& text);
+PIXDEF void pix_destroy_text(pixi_text& text);
 
 // re-lays-out the same baked batch for new content (reuses the GPU buffer, no realloc);
 // glyphs beyond the batch's capacity are silently dropped, same as push_sprite
-void pix_update_text(pixi_text& text, const char* new_text);
+PIXDEF void pix_update_text(pixi_text& text, const char* new_text);
 
 // pixel width `text` would occupy, widest line if it contains '\n' - handy for right/centre alignment
-static float pix_text_width(font_data* font, const char* text, const text_style& style = pix_default_style());
+PIXDEF float pix_text_width(font_data* font, const char* text, const text_style& style = pix_default_style());
 
-static void draw_text(const pixi_text& text, idx shader, const mat4& view_proj);
+PIXDEF void draw_text(const pixi_text& text, idx shader, const mat4& view_proj);
 
-//----------------------------implementation----------------------------
+#endif // PIX_TEXT_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_TEXT_IMPL)
+#define PIX_TEXT_IMPL
 
 // decodes one UTF-8 codepoint so callers can embed the icon glyphs (font_icon_entries
 // keys them by real unicode codepoint, e.g. U+2191) directly in a source literal
@@ -67,17 +72,11 @@ static unsigned int text__utf8_next(const char** p) {
     return cp;
 }
 
-// expands the 1-channel sdf bitmap to RGBA8 so it can go through the shared texture helper
+// the sdf is one channel, and goes up as one: a quarter of the memory an
+// RGBA expansion costs, and the shaders only ever read .r
 static idx text__upload_atlas(font_data& font) {
-    size_t n = font.width * font.height;
-    unsigned char* rgba = (unsigned char*)malloc(n * 4);
-    for (size_t i = 0; i < n; i++) {
-        unsigned char v = (unsigned char)font.bitmap[i];
-        rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rgba[i * 4 + 3] = v;
-    }
-    idx tex = opengl_create_texture2d((int)font.width, (int)font.height, 4, rgba, TEXTURE_LINEAR);
-    free(rgba);
-    return tex;
+    return opengl_create_texture2d((int)font.width, (int)font.height, 1, font.bitmap,
+                                   TEXTURE_LINEAR | TEXTURE_CLAMP);
 }
 
 // size / the font's own em span; the sdf atlas stays sharp at any scale, so
@@ -134,7 +133,7 @@ void pix_update_text(pixi_text& text, const char* new_text) {
     text__layout(text, new_text);
 }
 
-static float pix_text_width(font_data* font, const char* text, const text_style& style) {
+float pix_text_width(font_data* font, const char* text, const text_style& style) {
     float scale = text__scale(font, style);
     float width = 0.0f, max_width = 0.0f;
     const char* p = text;
@@ -146,7 +145,7 @@ static float pix_text_width(font_data* font, const char* text, const text_style&
     return width > max_width ? width : max_width;
 }
 
-static void draw_text(const pixi_text& text, idx shader, const mat4& view_proj) {
+void draw_text(const pixi_text& text, idx shader, const mat4& view_proj) {
     glUseProgram(shader);
     const text_style& st = text.style;
     glUniform4f(glGetUniformLocation(shader, "uColor"), st.color.x, st.color.y, st.color.z, st.color.w);
@@ -157,3 +156,5 @@ static void draw_text(const pixi_text& text, idx shader, const mat4& view_proj) 
     glUniform1f(glGetUniformLocation(shader, "uItalic"), st.italic);
     draw_sprites(text.batch, shader, view_proj);
 }
+
+#endif // PIX_TEXT_IMPL

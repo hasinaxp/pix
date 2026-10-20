@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_ASSET_TYPES_HPP
+#define PIX_ASSET_TYPES_HPP
 #include <stdint.h>
 #include "../core/dtype.hpp"
 
@@ -34,13 +35,16 @@ struct mesh_file_data {
     size_t   vertex_count;
     vertex*  vertex_data;
     size_t   index_count;
-    uint16_t* index_data;
+    uint32_t* index_data;
 
     size_t      group_count;
     mesh_group* groups;
 
     vec3 bounds_min;   // model space, before any placement scale
     vec3 bounds_max;
+
+    // the first map_Kd the file's .mtl names, resolved next to the .obj; empty if none
+    char texture_path[260];
 };
 
 struct image_file_data {
@@ -107,7 +111,7 @@ struct skinned_mesh_file_data {
     size_t         vertex_count;
     vertex_rigged* vertex_data;
     size_t         index_count;
-    uint16_t*      index_data;
+    uint32_t*      index_data;
     int32_t        skeleton;        // index into pix_data_loader::skeletons, -1 if unskinned
 };
 
@@ -135,3 +139,5 @@ struct model_file_data {
     // vertices instead.
     vec3    node_offset;
 };
+
+#endif // PIX_ASSET_TYPES_HPP

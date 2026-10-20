@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_JOBS_HPP
+#define PIX_JOBS_HPP
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -74,20 +75,24 @@ struct pix_task {
     bool    started;
 };
 
-static void pix_jobs_start(pix_jobs& j, int workers = -1);
-static void pix_jobs_stop(pix_jobs& j);
+PIXDEF void pix_jobs_start(pix_jobs& j, int workers = -1);
+PIXDEF void pix_jobs_stop(pix_jobs& j);
 // Runs `fn` over [0, count) and returns once every item is done. `grain` is
 // the smallest slice a worker will claim; below it the range is not worth
 // splitting and the calling thread just runs the lot.
-static void pix_parallel_for(pix_jobs& j, size_t count, pix_job_fn fn, void* user,
+PIXDEF void pix_parallel_for(pix_jobs& j, size_t count, pix_job_fn fn, void* user,
                              size_t grain = 16);
 
-static void pix_task_start(pix_task& t);
-static void pix_task_stop(pix_task& t);
-static void pix_task_run(pix_task& t, void (*fn)(void*), void* user);
-static void pix_task_wait(pix_task& t);
+PIXDEF void pix_task_start(pix_task& t);
+PIXDEF void pix_task_stop(pix_task& t);
+PIXDEF void pix_task_run(pix_task& t, void (*fn)(void*), void* user);
+PIXDEF void pix_task_wait(pix_task& t);
 
-// ---------------- implementation ----------------
+#endif // PIX_JOBS_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_JOBS_IMPL)
+#define PIX_JOBS_IMPL
 
 static void pix__jobs_run_chunks(pix_jobs& j, pix_job_fn fn, void* user,
                                  size_t total, size_t grain, int worker) {
@@ -109,7 +114,7 @@ static void pix__worker_main(pix_jobs* j, int worker) {
         {
             std::unique_lock<std::mutex> guard(j->lock);
             j->go.wait(guard, [&] { return j->quit || j->generation != seen; });
-            if (j->quit) return;
+            if (j->quit) { pix_mem_thread_exit(); return; }   // give back its scope stack
             seen = j->generation;
             fn = j->fn; user = j->user; total = j->total; grain = j->grain;
         }
@@ -126,7 +131,7 @@ static void pix__worker_main(pix_jobs* j, int worker) {
     }
 }
 
-static void pix_jobs_start(pix_jobs& j, int workers) {
+void pix_jobs_start(pix_jobs& j, int workers) {
     j.worker_count = 0;
     j.fn = 0; j.user = 0; j.total = 0; j.grain = 1;
     j.generation = 0;
@@ -145,7 +150,7 @@ static void pix_jobs_start(pix_jobs& j, int workers) {
         j.threads[j.worker_count++] = std::thread(pix__worker_main, &j, i + 1);
 }
 
-static void pix_jobs_stop(pix_jobs& j) {
+void pix_jobs_stop(pix_jobs& j) {
     {
         std::lock_guard<std::mutex> guard(j.lock);
         j.quit = true;
@@ -157,7 +162,7 @@ static void pix_jobs_stop(pix_jobs& j) {
     j.worker_count = 0;
 }
 
-static void pix_parallel_for(pix_jobs& j, size_t count, pix_job_fn fn, void* user, size_t grain) {
+void pix_parallel_for(pix_jobs& j, size_t count, pix_job_fn fn, void* user, size_t grain) {
     if (!count) return;
     if (grain < 1) grain = 1;
 
@@ -197,7 +202,7 @@ static void pix__task_main(pix_task* t) {
         {
             std::unique_lock<std::mutex> guard(t->lock);
             t->go.wait(guard, [&] { return t->quit || t->running; });
-            if (t->quit) return;
+            if (t->quit) { pix_mem_thread_exit(); return; }
             fn = t->fn; user = t->user;
         }
         if (fn) fn(user);
@@ -209,13 +214,13 @@ static void pix__task_main(pix_task* t) {
     }
 }
 
-static void pix_task_start(pix_task& t) {
+void pix_task_start(pix_task& t) {
     t.fn = 0; t.user = 0; t.running = false; t.quit = false;
     t.thread = std::thread(pix__task_main, &t);
     t.started = true;
 }
 
-static void pix_task_stop(pix_task& t) {
+void pix_task_stop(pix_task& t) {
     if (!t.started) return;
     pix_task_wait(t);
     {
@@ -227,7 +232,7 @@ static void pix_task_stop(pix_task& t) {
     t.started = false;
 }
 
-static void pix_task_run(pix_task& t, void (*fn)(void*), void* user) {
+void pix_task_run(pix_task& t, void (*fn)(void*), void* user) {
     if (!t.started) { fn(user); return; }     // no thread: do it here, same result
     pix_task_wait(t);                         // one at a time, by design
     {
@@ -237,8 +242,10 @@ static void pix_task_run(pix_task& t, void (*fn)(void*), void* user) {
     t.go.notify_one();
 }
 
-static void pix_task_wait(pix_task& t) {
+void pix_task_wait(pix_task& t) {
     if (!t.started) return;
     std::unique_lock<std::mutex> guard(t.lock);
     t.done.wait(guard, [&] { return !t.running; });
 }
+
+#endif // PIX_JOBS_IMPL

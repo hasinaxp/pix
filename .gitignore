@@ -1,0 +1,7 @@
+# build output
+build/
+*.obj
+*.pdb
+*.ilk
+# runtime logs
+shader_error.txt

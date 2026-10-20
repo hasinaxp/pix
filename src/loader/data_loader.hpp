@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_DATA_LOADER_HPP
+#define PIX_DATA_LOADER_HPP
 #include <stdlib.h>
 #include <string.h>
 #include "../core/dtype.hpp"
@@ -56,10 +57,11 @@ struct pix_data_loader {
     size_t                    sound_file_count;
 };
 
-static pix_data_loader pix_create_data_loader(size_t capacity = 128 * MB) {
+static inline pix_data_loader pix_create_data_loader(size_t capacity = 4ull * GB) {
     pix_data_loader loader = {};
-    loader.arena.capacity = capacity;
-    loader.arena.data = (char*)malloc(capacity);
+    // Reserved, not allocated: a 4 GB reservation holds no memory until a
+    // load actually writes into it, so the cap is a ceiling rather than a cost.
+    loader.arena = pix_arena_create(capacity);
     loader.mesh_files  = allocate<mesh_file_data>(loader.arena, MAX_MESH_FILES);
     loader.image_files = allocate<image_file_data>(loader.arena, MAX_IMAGE_FILES);
 
@@ -71,9 +73,8 @@ static pix_data_loader pix_create_data_loader(size_t capacity = 128 * MB) {
     return loader;
 }
 
-static void pix_destroy_data_loader(pix_data_loader& loader) {
-    free(loader.arena.data);
-    loader.arena = mem_arena();
+static inline void pix_destroy_data_loader(pix_data_loader& loader) {
+    pix_arena_destroy(loader.arena);
 }
 
 // ---- transient loads ----
@@ -98,7 +99,7 @@ struct pix_loader_mark {
     size_t arena, mesh_files, image_files, skeletons, skinned_meshes, clips, model_files;
 };
 
-static pix_loader_mark pix_loader_mark_now(const pix_data_loader& l) {
+static inline pix_loader_mark pix_loader_mark_now(const pix_data_loader& l) {
     pix_loader_mark m;
     m.arena          = l.arena.size;
     m.mesh_files     = l.mesh_file_count;
@@ -110,7 +111,7 @@ static pix_loader_mark pix_loader_mark_now(const pix_data_loader& l) {
     return m;
 }
 
-static void pix_loader_rewind(pix_data_loader& l, const pix_loader_mark& m) {
+static inline void pix_loader_rewind(pix_data_loader& l, const pix_loader_mark& m) {
     l.arena.size              = m.arena;
     l.mesh_file_count         = m.mesh_files;
     l.image_file_count        = m.image_files;
@@ -120,15 +121,15 @@ static void pix_loader_rewind(pix_data_loader& l, const pix_loader_mark& m) {
     l.model_file_count        = m.model_files;
 }
 
-static idx load_mesh_obj_file(pix_data_loader& loader, const char* filepath);
+PIXDEF idx load_mesh_obj_file(pix_data_loader& loader, const char* filepath);
 // splits a named `g`/`o` part of an already loaded model into a mesh of its
 // own, centred on its own pivot, so the part can be animated independently of
 // the body it came off; returns an index into loader.mesh_files
-static idx load_mesh_obj_group(pix_data_loader& loader, idx mesh_file, const char* group,
+PIXDEF idx load_mesh_obj_group(pix_data_loader& loader, idx mesh_file, const char* group,
                                vec3* out_pivot);
-static idx load_image_file(pix_data_loader& loader, const char* filepath, size_t channels);
+PIXDEF idx load_image_file(pix_data_loader& loader, const char* filepath, size_t channels);
 // decodes a .wav into loader.sound_files; hand the result to sound.hpp's load_sound
-static idx load_sound_wav_file(pix_data_loader& loader, const char* filepath);
+PIXDEF idx load_sound_wav_file(pix_data_loader& loader, const char* filepath);
 
 // Loads a .glb / .gltf into the skeleton, skinned mesh and animation tables in
 // one call. Returns an index into loader.model_files describing what came out
@@ -141,18 +142,22 @@ static idx load_sound_wav_file(pix_data_loader& loader, const char* filepath);
 //
 // `skip_nodes` excludes mesh nodes instead of selecting one, which is what
 // taking a vehicle's shell without its wheels needs - see gltf_load_file.
-static idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, int only_node = -1,
+PIXDEF idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, int only_node = -1,
                                 int only_material = -1,
                                 const int* skip_nodes = 0, int skip_count = 0);
 
 // convenience lookups over the tables a model call filled in
-static skinned_mesh_file_data* get_model_mesh(pix_data_loader& loader, idx model);
-static skeleton_file_data*     get_model_skeleton(pix_data_loader& loader, idx model);
-static animation_clip_file_data* find_animation(pix_data_loader& loader, idx model, const char* name);
+PIXDEF skinned_mesh_file_data* get_model_mesh(pix_data_loader& loader, idx model);
+PIXDEF skeleton_file_data*     get_model_skeleton(pix_data_loader& loader, idx model);
+PIXDEF animation_clip_file_data* find_animation(pix_data_loader& loader, idx model, const char* name);
 
-// ----------- implementation --------------------
+#endif // PIX_DATA_LOADER_HPP
 
-static idx load_mesh_obj_file(pix_data_loader& loader, const char* filepath) {
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_DATA_LOADER_IMPL)
+#define PIX_DATA_LOADER_IMPL
+
+idx load_mesh_obj_file(pix_data_loader& loader, const char* filepath) {
     if (loader.mesh_file_count >= MAX_MESH_FILES) return (idx)-1;
     mesh_file_data m = {};
     if (!obj_load_file(loader.arena, filepath, &m, &loader.palette)) return (idx)-1;
@@ -161,7 +166,7 @@ static idx load_mesh_obj_file(pix_data_loader& loader, const char* filepath) {
     return id;
 }
 
-static idx load_mesh_obj_group(pix_data_loader& loader, idx mesh_file, const char* group,
+idx load_mesh_obj_group(pix_data_loader& loader, idx mesh_file, const char* group,
                                vec3* out_pivot) {
     if (mesh_file >= loader.mesh_file_count) return (idx)-1;
     if (loader.mesh_file_count >= MAX_MESH_FILES) return (idx)-1;
@@ -175,7 +180,7 @@ static idx load_mesh_obj_group(pix_data_loader& loader, idx mesh_file, const cha
     return id;
 }
 
-static idx load_sound_wav_file(pix_data_loader& loader, const char* filepath) {
+idx load_sound_wav_file(pix_data_loader& loader, const char* filepath) {
     if (loader.sound_file_count >= MAX_SOUND_FILES) return (idx)-1;
     sound_file_data s = {};
     if (!wav_load_file(loader.arena, filepath, &s)) return (idx)-1;
@@ -184,7 +189,7 @@ static idx load_sound_wav_file(pix_data_loader& loader, const char* filepath) {
     return id;
 }
 
-static idx load_image_file(pix_data_loader& loader, const char* filepath, size_t channels) {
+idx load_image_file(pix_data_loader& loader, const char* filepath, size_t channels) {
     (void)channels; // png_loader always returns RGBA8
     if (loader.image_file_count >= MAX_IMAGE_FILES) return (idx)-1;
     idx id = (idx)loader.image_file_count++;
@@ -208,7 +213,7 @@ static idx load_image_file(pix_data_loader& loader, const char* filepath, size_t
     return id;
 }
 
-static idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, int only_node,
+idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, int only_node,
                                 int only_material, const int* skip_nodes, int skip_count) {
     if (loader.model_file_count >= MAX_MODEL_FILES) return (idx)-1;
 
@@ -250,19 +255,19 @@ static idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, i
     return id;
 }
 
-static skinned_mesh_file_data* get_model_mesh(pix_data_loader& loader, idx model) {
+skinned_mesh_file_data* get_model_mesh(pix_data_loader& loader, idx model) {
     if (model >= loader.model_file_count) return 0;
     int32_t i = loader.model_files[model].skinned_mesh;
     return (i >= 0) ? &loader.skinned_mesh_files[i] : 0;
 }
 
-static skeleton_file_data* get_model_skeleton(pix_data_loader& loader, idx model) {
+skeleton_file_data* get_model_skeleton(pix_data_loader& loader, idx model) {
     if (model >= loader.model_file_count) return 0;
     int32_t i = loader.model_files[model].skeleton;
     return (i >= 0) ? &loader.skeletons[i] : 0;
 }
 
-static animation_clip_file_data* find_animation(pix_data_loader& loader, idx model, const char* name) {
+animation_clip_file_data* find_animation(pix_data_loader& loader, idx model, const char* name) {
     if (model >= loader.model_file_count) return 0;
     const model_file_data& mf = loader.model_files[model];
     for (size_t i = 0; i < mf.animation_count; i++) {
@@ -271,3 +276,5 @@ static animation_clip_file_data* find_animation(pix_data_loader& loader, idx mod
     }
     return 0;
 }
+
+#endif // PIX_DATA_LOADER_IMPL

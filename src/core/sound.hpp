@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_SOUND_HPP
+#define PIX_SOUND_HPP
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -57,29 +58,33 @@ struct pix_audio {
     float  scratch[PIX_AUDIO_FRAMES * PIX_AUDIO_CHANNELS];
 };
 
-static bool pix_create_audio(pix_audio& audio, size_t capacity = 16 * MB);
-static void pix_destroy_audio(pix_audio& audio);
+PIXDEF bool pix_create_audio(pix_audio& audio, size_t capacity = 512 * MB);
+PIXDEF void pix_destroy_audio(pix_audio& audio);
 
 // takes ownership of a copy, mirroring how load_mesh copies onto the GPU: the
 // decoded file in the data loader's arena can be dropped afterwards
-static idx load_sound(pix_audio& audio, const sound_file_data& data);
+PIXDEF idx load_sound(pix_audio& audio, const sound_file_data& data);
 // takes a copy of `samples`, so callers can build sounds on the stack
-static idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate);
+PIXDEF idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate);
 
-static idx  play_sound(pix_audio& audio, idx sound_id, float volume = 1.0f,
+PIXDEF idx  play_sound(pix_audio& audio, idx sound_id, float volume = 1.0f,
                        float pitch = 1.0f, bool loop = false, float pan = 0.0f);
-static void stop_sound(pix_audio& audio, idx voice);
-static void stop_all_sounds(pix_audio& audio);
-static bool is_sound_playing(pix_audio& audio, idx voice);
-static void set_sound_volume(pix_audio& audio, idx voice, float volume);
-static void set_sound_pan(pix_audio& audio, idx voice, float pan);
-static void set_master_volume(pix_audio& audio, float volume);
-static size_t active_voice_count(pix_audio& audio);
+PIXDEF void stop_sound(pix_audio& audio, idx voice);
+PIXDEF void stop_all_sounds(pix_audio& audio);
+PIXDEF bool is_sound_playing(pix_audio& audio, idx voice);
+PIXDEF void set_sound_volume(pix_audio& audio, idx voice, float volume);
+PIXDEF void set_sound_pan(pix_audio& audio, idx voice, float pan);
+PIXDEF void set_master_volume(pix_audio& audio, float volume);
+PIXDEF size_t active_voice_count(pix_audio& audio);
 
 // mixes the active voices; the device calls this, and tests can drive it directly
-static void pix_audio_mix(pix_audio& audio, int16_t* out, size_t frames);
+PIXDEF void pix_audio_mix(pix_audio& audio, int16_t* out, size_t frames);
 
-// ---------------- implementation ----------------
+#endif // PIX_SOUND_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_SOUND_IMPL)
+#define PIX_SOUND_IMPL
 
 static idx snd__handle(uint16_t generation, uint16_t slot) {
     return ((idx)generation << 16) | (idx)slot;
@@ -98,11 +103,11 @@ static void snd__device_fill(int16_t* frames, size_t count, void* user) {
     pix_audio_mix(*(pix_audio*)user, frames, count);
 }
 
-static bool pix_create_audio(pix_audio& audio, size_t capacity) {
+bool pix_create_audio(pix_audio& audio, size_t capacity) {
     audio = pix_audio();
     audio.master_volume = 1.0f;
-    audio.arena.capacity = capacity;
-    audio.arena.data = (char*)malloc(capacity);
+    // address space only; pages are committed as sounds are loaded into it
+    audio.arena = pix_arena_create(capacity);
     if (!audio.arena.data) return false;
     InitializeCriticalSection(&audio.lock);
 
@@ -112,15 +117,14 @@ static bool pix_create_audio(pix_audio& audio, size_t capacity) {
     return audio.device_ok;
 }
 
-static void pix_destroy_audio(pix_audio& audio) {
+void pix_destroy_audio(pix_audio& audio) {
     pix_close_audio(audio.device);       // stop the thread before freeing anything it reads
     DeleteCriticalSection(&audio.lock);
-    free(audio.arena.data);
-    audio.arena = mem_arena();
+    pix_arena_destroy(audio.arena);
     audio.device_ok = false;
 }
 
-static idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate) {
+idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate) {
     if (audio.sound_count >= MAX_SOUNDS || !frames || channels < 1 || channels > 2) return SOUND_INVALID;
     int16_t* copy = allocate<int16_t>(audio.arena, frames * (size_t)channels);
     if (!copy) return SOUND_INVALID;
@@ -137,11 +141,11 @@ static idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames,
 
 // ---- playback ----
 
-static idx load_sound(pix_audio& audio, const sound_file_data& data) {
+idx load_sound(pix_audio& audio, const sound_file_data& data) {
     return create_sound(audio, data.samples, data.frame_count, data.channels, data.rate);
 }
 
-static idx play_sound(pix_audio& audio, idx sound_id, float volume, float pitch, bool loop, float pan) {
+idx play_sound(pix_audio& audio, idx sound_id, float volume, float pitch, bool loop, float pan) {
     if (sound_id >= audio.sound_count) return SOUND_INVALID;
     const sound& s = audio.sounds[sound_id];
     if (!s.frame_count) return SOUND_INVALID;
@@ -165,20 +169,20 @@ static idx play_sound(pix_audio& audio, idx sound_id, float volume, float pitch,
     return handle;
 }
 
-static void stop_sound(pix_audio& audio, idx voice) {
+void stop_sound(pix_audio& audio, idx voice) {
     EnterCriticalSection(&audio.lock);
     sound_voice* v = snd__voice(audio, voice);
     if (v) v->active = false;
     LeaveCriticalSection(&audio.lock);
 }
 
-static void stop_all_sounds(pix_audio& audio) {
+void stop_all_sounds(pix_audio& audio) {
     EnterCriticalSection(&audio.lock);
     for (int i = 0; i < MAX_VOICES; i++) audio.voices[i].active = false;
     LeaveCriticalSection(&audio.lock);
 }
 
-static bool is_sound_playing(pix_audio& audio, idx voice) {
+bool is_sound_playing(pix_audio& audio, idx voice) {
     EnterCriticalSection(&audio.lock);
     sound_voice* v = snd__voice(audio, voice);
     bool playing = v && v->active;
@@ -186,25 +190,25 @@ static bool is_sound_playing(pix_audio& audio, idx voice) {
     return playing;
 }
 
-static void set_sound_volume(pix_audio& audio, idx voice, float volume) {
+void set_sound_volume(pix_audio& audio, idx voice, float volume) {
     EnterCriticalSection(&audio.lock);
     sound_voice* v = snd__voice(audio, voice);
     if (v) v->volume = volume < 0.0f ? 0.0f : volume;
     LeaveCriticalSection(&audio.lock);
 }
 
-static void set_sound_pan(pix_audio& audio, idx voice, float pan) {
+void set_sound_pan(pix_audio& audio, idx voice, float pan) {
     EnterCriticalSection(&audio.lock);
     sound_voice* v = snd__voice(audio, voice);
     if (v) v->pan = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
     LeaveCriticalSection(&audio.lock);
 }
 
-static void set_master_volume(pix_audio& audio, float volume) {
+void set_master_volume(pix_audio& audio, float volume) {
     audio.master_volume = volume < 0.0f ? 0.0f : volume;
 }
 
-static size_t active_voice_count(pix_audio& audio) {
+size_t active_voice_count(pix_audio& audio) {
     size_t n = 0;
     EnterCriticalSection(&audio.lock);
     for (int i = 0; i < MAX_VOICES; i++) if (audio.voices[i].active) n++;
@@ -282,7 +286,7 @@ static void snd__mix_chunk(pix_audio& audio, int16_t* out, size_t frames) {
         out[i] = snd__soft_clip(acc[i] * master);
 }
 
-static void pix_audio_mix(pix_audio& audio, int16_t* out, size_t frames) {
+void pix_audio_mix(pix_audio& audio, int16_t* out, size_t frames) {
     while (frames) {
         size_t n = frames < PIX_AUDIO_FRAMES ? frames : PIX_AUDIO_FRAMES;
         snd__mix_chunk(audio, out, n);
@@ -290,3 +294,5 @@ static void pix_audio_mix(pix_audio& audio, int16_t* out, size_t frames) {
         frames -= n;
     }
 }
+
+#endif // PIX_SOUND_IMPL

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_PNG_WRITER_HPP
+#define PIX_PNG_WRITER_HPP
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,15 @@
 //
 // Rows are filtered with filter type 0 (none), which is what makes them
 // literal; every other filter exists to help the compressor we are not running.
+
+// Writes an 8-bit RGB image (rows top to bottom) as an uncompressed PNG.
+PIXDEF bool png_write_rgb(const char* path, const unsigned char* rgb, int width, int height);
+
+#endif // PIX_PNG_WRITER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_PNG_WRITER_IMPL)
+#define PIX_PNG_WRITER_IMPL
 
 static uint32_t png__crc_table[256];
 static bool     png__crc_ready = false;
@@ -56,7 +66,7 @@ static void png__chunk(FILE* f, const char* type, const unsigned char* data, siz
 }
 
 // `rgb` is width*height*3 bytes, top row first
-static bool png_write_rgb(const char* path, const unsigned char* rgb, int width, int height) {
+bool png_write_rgb(const char* path, const unsigned char* rgb, int width, int height) {
     FILE* f = fopen(path, "wb");
     if (!f) return false;
 
@@ -120,3 +130,5 @@ static bool png_write_rgb(const char* path, const unsigned char* rgb, int width,
     fclose(f);
     return true;
 }
+
+#endif // PIX_PNG_WRITER_IMPL

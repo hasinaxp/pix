@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_FONT_HPP
+#define PIX_FONT_HPP
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,10 +7,11 @@
 #include <math.h>
 #include "dtype.hpp"
 
-const char * FONT_CHAR_SET = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+static const char* const FONT_CHAR_SET = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
 #define FONT_ATLAS_WIDTH 1024
-#define FONT_ATLAS_HEIGHT 1024
+// 16 x 8 cells of 64 px: slots are 0..127, so the atlas never needs more rows
+#define FONT_ATLAS_HEIGHT 512
 
 #define FONT_ATLAS_PADDING 2
 #define FONT_ATLAS_GLYPH_WIDTH 64
@@ -77,13 +79,17 @@ struct font_data {
     glyph glyphs[128];
 };
 
-font_data pix_load_font_ttf(const char* path);
-void pix_free_font(font_data& font);
+PIXDEF font_data pix_load_font_ttf(const char* path);
+PIXDEF void pix_free_font(font_data& font);
 
 // unicode codepoint -> font_data::glyphs index (0 when unsupported)
-static idx pix_font_slot(idx codepoint);
+PIXDEF idx pix_font_slot(idx codepoint);
 
-//----------------------------implementation----------------------------
+#endif // PIX_FONT_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_FONT_IMPL)
+#define PIX_FONT_IMPL
 
 // Minimal TrueType loader: 'glyf' outlines (simple + composite), cmap formats
 // 0/4/6/12, flattened to line segments once and used twice - a non-zero
@@ -439,10 +445,10 @@ static float ttf__seg_dist2(float px, float py, const ttf__edge* e) {
 
 // signed distance over [x0,x1) x [y0,y1), sign taken from the coverage mask
 static void ttf__sdf(const ttf__edge* e, int ne, const unsigned char* cov,
-                     unsigned char* dst, int stride, int x0, int y0, int x1, int y1) {
+                     unsigned char* dst, int stride, int x0, int y0, int x1, int y1,
+                     int* active) {   // scratch, TTF_MAX_EDGES long
     const float spread = (float)FONT_SDF_SPREAD;
     const float far2 = spread * spread;
-    int active[TTF_MAX_EDGES];
 
     for (int py = y0; py < y1; py++) {
         float fy = (float)py + 0.5f;
@@ -476,7 +482,7 @@ static void ttf__sdf(const ttf__edge* e, int ne, const unsigned char* cov,
 
 // ---------------- atlas ----------------
 
-static idx pix_font_slot(idx codepoint) {
+idx pix_font_slot(idx codepoint) {
     if (codepoint >= 32 && codepoint < 127) return codepoint;
     for (idx i = 0; i < sizeof(font_icon_entries) / sizeof(font_icon_entries[0]); i++)
         if (font_icon_entries[i].charcode == codepoint) return font_icon_entries[i].glyph_index;
@@ -545,9 +551,10 @@ font_data pix_load_font_ttf(const char* path) {
 
     ttf__outline* out   = (ttf__outline*)malloc(sizeof(ttf__outline));
     ttf__edge*    edges = (ttf__edge*)malloc(sizeof(ttf__edge) * TTF_MAX_EDGES);
+    int*          active = (int*)malloc(sizeof(int) * TTF_MAX_EDGES);
     unsigned char cov[TTF_CELL * TTF_CELL];
     unsigned char cell[TTF_CELL * TTF_CELL];
-    if (!out || !edges) { free(out); free(edges); free(src); return font; }
+    if (!out || !edges || !active) { free(out); free(edges); free(active); free(src); return font; }
 
     for (int slot = 0; slot < 128; slot++) {
         if (!cps[slot]) continue;
@@ -590,7 +597,7 @@ font_data pix_load_font_ttf(const char* path) {
         memset(cov, 0, sizeof(cov));
         memset(cell, 0, sizeof(cell));
         ttf__raster(edges, ne, cov, TTF_CELL, TTF_CELL, by0, by1);
-        ttf__sdf(edges, ne, cov, cell, TTF_CELL, gx0, gy0, gx1, gy1);
+        ttf__sdf(edges, ne, cov, cell, TTF_CELL, gx0, gy0, gx1, gy1, active);
 
         int cx = (slot % TTF_COLS) * TTF_CELL;
         int cy = (slot / TTF_COLS) * TTF_CELL;
@@ -608,6 +615,9 @@ font_data pix_load_font_ttf(const char* path) {
 
     free(out);
     free(edges);
+    free(active);
     free(src);
     return font;
 }
+
+#endif // PIX_FONT_IMPL

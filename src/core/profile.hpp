@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_PROFILE_HPP
+#define PIX_PROFILE_HPP
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
@@ -33,7 +34,7 @@ struct pix_profiler {
     int         frames;
 };
 
-static void pix_profiler_init(pix_profiler& p, const char* const* names, int count) {
+static inline void pix_profiler_init(pix_profiler& p, const char* const* names, int count) {
     memset(&p, 0, sizeof(p));
     p.sections = count < PIX_PROF_MAX_SECTIONS ? count : PIX_PROF_MAX_SECTIONS;
     for (int i = 0; i < p.sections; i++) p.names[i] = names[i];
@@ -46,13 +47,13 @@ static void pix_profiler_init(pix_profiler& p, const char* const* names, int cou
     p.window_start = now.QuadPart;
 }
 
-static long long pix_profile_now() {
+static inline long long pix_profile_now() {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return t.QuadPart;
 }
 
-static void pix_profile_add(pix_profiler& p, int section, long long begin) {
+static inline void pix_profile_add(pix_profiler& p, int section, long long begin) {
     if ((unsigned)section >= (unsigned)p.sections) return;
     p.accum[section] += (double)(pix_profile_now() - begin) * p.inv_frequency;
 }
@@ -64,7 +65,7 @@ static void pix_profile_add(pix_profiler& p, int section, long long begin) {
 // Returns true on the frame that closes an accumulation window and prints, so
 // a caller with numbers of its own to report can put them next to these rather
 // than on some unrelated clock of its own.
-static bool pix_profile_frame(pix_profiler& p) {
+static inline bool pix_profile_frame(pix_profiler& p) {
     p.frames++;
     long long now = pix_profile_now();
     double elapsed = (double)(now - p.window_start) * p.inv_frequency;
@@ -99,3 +100,5 @@ struct pix_profile_scope {
 };
 
 #define PIX_PROFILE(prof, section) pix_profile_scope pix__scope_##section(prof, section)
+
+#endif // PIX_PROFILE_HPP

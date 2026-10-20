@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_PLATFORM_AUDIO_HPP
+#define PIX_PLATFORM_AUDIO_HPP
 #include <windows.h>
 #include <mmsystem.h>
 #include <stdint.h>
@@ -34,10 +35,14 @@ struct pix_audio_device {
 };
 
 // `dev` is handed to the audio thread by address, so it must outlive the device
-static bool pix_open_audio(pix_audio_device& dev, pix_audio_fill fill, void* user);
-static void pix_close_audio(pix_audio_device& dev);
+PIXDEF bool pix_open_audio(pix_audio_device& dev, pix_audio_fill fill, void* user);
+PIXDEF void pix_close_audio(pix_audio_device& dev);
 
-// ---------------- implementation ----------------
+#endif // PIX_PLATFORM_AUDIO_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_PLATFORM_AUDIO_IMPL)
+#define PIX_PLATFORM_AUDIO_IMPL
 
 #define PIX_AUDIO_BLOCK_SAMPLES (PIX_AUDIO_FRAMES * PIX_AUDIO_CHANNELS)
 
@@ -65,7 +70,7 @@ static DWORD WINAPI pix_audio__thread(LPVOID param) {
     return 0;
 }
 
-static bool pix_open_audio(pix_audio_device& dev, pix_audio_fill fill, void* user) {
+bool pix_open_audio(pix_audio_device& dev, pix_audio_fill fill, void* user) {
     dev = pix_audio_device();
     dev.fill = fill;
     dev.user = user;
@@ -111,7 +116,7 @@ static bool pix_open_audio(pix_audio_device& dev, pix_audio_fill fill, void* use
     return true;
 }
 
-static void pix_close_audio(pix_audio_device& dev) {
+void pix_close_audio(pix_audio_device& dev) {
     if (dev.thread) {
         InterlockedExchange(&dev.running, 0);
         SetEvent(dev.block_done);
@@ -131,3 +136,5 @@ static void pix_close_audio(pix_audio_device& dev) {
     free(dev.blocks);
     dev = pix_audio_device();
 }
+
+#endif // PIX_PLATFORM_AUDIO_IMPL

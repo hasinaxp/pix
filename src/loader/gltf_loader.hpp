@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_GLTF_LOADER_HPP
+#define PIX_GLTF_LOADER_HPP
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,14 +57,14 @@ struct gltf_result {
 // them). Listing the wheels and taking everything else is the only way round
 // that does not
 // depend on how finely the artist split the bodywork.
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+PIXDEF bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
                            int only_node = -1, int only_material = -1,
                            const int* skip_nodes = 0, int skip_count = 0);
 
 // The distinct materials used by a file's mesh primitives, in first-seen
 // order. `node` narrows it to one mesh node, or -1 for the whole file.
 // Returns how many were written, capped at `max_out`.
-static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+PIXDEF int gltf_list_materials(mem_arena& arena, const char* path, int node,
                                int* out, int max_out);
 
 // Every mesh-carrying node's name and index, for a caller that needs to pick
@@ -71,7 +72,13 @@ static int gltf_list_materials(mem_arena& arena, const char* path, int node,
 // as `only_node`, once per node the caller wants. Returns
 // the number of names written, capped at `max_out`.
 struct gltf_node_info { char name[64]; int node; };
-static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out);
+PIXDEF int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out);
+
+#endif // PIX_GLTF_LOADER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_GLTF_LOADER_IMPL)
+#define PIX_GLTF_LOADER_IMPL
 
 // ---------------- json ----------------
 
@@ -612,7 +619,7 @@ static void gltf__palette_pixels(const gltf__palette& p, unsigned char* rgba) {
 
 // ---------------- load ----------------
 
-static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out) {
+int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out) {
     gltf_file g;
     if (!gltf__open(arena, path, &g)) return 0;
     const js_doc& d = g.json;
@@ -629,7 +636,7 @@ static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* o
     return found;
 }
 
-static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+int gltf_list_materials(mem_arena& arena, const char* path, int node,
                                int* out, int max_out) {
     gltf_file g;
     if (!gltf__open(arena, path, &g)) return 0;
@@ -657,7 +664,7 @@ static int gltf_list_materials(mem_arena& arena, const char* path, int node,
     return found;
 }
 
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
                            int only_node, int only_material,
                            const int* skip_nodes, int skip_count) {
     *out = gltf_result();
@@ -818,10 +825,9 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
         }
     }
     if (total_verts == 0) return false;
-    if (total_verts > 65535) return false; // renderer draws with GL_UNSIGNED_SHORT
 
     vertex_rigged* verts = allocate<vertex_rigged>(arena, total_verts);
-    uint16_t* inds = allocate<uint16_t>(arena, total_inds ? total_inds : 1);
+    uint32_t* inds = allocate<uint32_t>(arena, total_inds ? total_inds : 1);
     if (!verts || !inds) return false;
 
     gltf__palette palette = {};
@@ -957,9 +963,9 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
                 uint32_t* tmpi = allocate<uint32_t>(arena, ic);
                 if (!tmpi) return false;
                 gltf_read_uints(g, idx_acc, tmpi, 1);
-                for (size_t i = 0; i < ic; i++) inds[iat++] = (uint16_t)(tmpi[i] + vbase);
+                for (size_t i = 0; i < ic; i++) inds[iat++] = (uint32_t)(tmpi[i] + vbase);
             } else {
-                for (size_t i = 0; i < vc; i++) inds[iat++] = (uint16_t)(vbase + i); // non-indexed
+                for (size_t i = 0; i < vc; i++) inds[iat++] = (uint32_t)(vbase + i); // non-indexed
             }
 
             // derive normals the file didn't ship, area-weighted across shared vertices
@@ -1171,3 +1177,5 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
     }
     return true;
 }
+
+#endif // PIX_GLTF_LOADER_IMPL

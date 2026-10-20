@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_SPRITE_HPP
+#define PIX_SPRITE_HPP
 #include <stddef.h>
 #include "dtype.hpp"
 #include "math.hpp"
@@ -26,28 +27,32 @@ struct sprite_batch {
     size_t tex_count;                 // <= MAX_SPRITE_TEXTURES
 };
 
-static sprite_batch pix_create_sprite_batch(size_t capacity = MAX_SPRITES);
-static void pix_destroy_sprite_batch(sprite_batch& b);
+PIXDEF sprite_batch pix_create_sprite_batch(size_t capacity = MAX_SPRITES);
+PIXDEF void pix_destroy_sprite_batch(sprite_batch& b);
 
 // registers a GL texture with the batch (deduping) and returns its sprite::texture index
-static idx pix_batch_texture(sprite_batch& b, idx gl_texture);
+PIXDEF idx pix_batch_texture(sprite_batch& b, idx gl_texture);
 
-static void push_sprite(sprite_batch& b, const sprite & s);
+PIXDEF void push_sprite(sprite_batch& b, const sprite & s);
 
-static void replace_sprites(
+PIXDEF void replace_sprites(
     sprite_batch& b,
     const sprite* s,
     size_t count = 1,
     size_t offset = 0);
 
-static void clear_sprites(sprite_batch& b);
+PIXDEF void clear_sprites(sprite_batch& b);
 
-static void draw_sprites(
+PIXDEF void draw_sprites(
     const sprite_batch& b,
     idx shader,
     const mat4& view_proj);
 
-//----------------------------implementation----------------------------
+#endif // PIX_SPRITE_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_SPRITE_IMPL)
+#define PIX_SPRITE_IMPL
 
 // one unit quad shared by every batch; per-instance box/crop/texture-index
 // attributes (divisor 1) place, crop and texture it
@@ -66,7 +71,7 @@ static idx sprite__quad_vbo() {
 // straight into b.vbo via glBufferSubData, and draw_sprites never touches its
 // contents - it just binds the batch's registered textures and issues one
 // instanced draw over whatever is already resident
-static sprite_batch pix_create_sprite_batch(size_t capacity) {
+sprite_batch pix_create_sprite_batch(size_t capacity) {
     sprite_batch b = {};
     b.capacity = capacity;
 
@@ -94,25 +99,25 @@ static sprite_batch pix_create_sprite_batch(size_t capacity) {
     return b;
 }
 
-static void pix_destroy_sprite_batch(sprite_batch& b) {
+void pix_destroy_sprite_batch(sprite_batch& b) {
     (void)b; // nothing heap-allocated to free; the VAO/VBO live for the program's lifetime
 }
 
-static idx pix_batch_texture(sprite_batch& b, idx gl_texture) {
+idx pix_batch_texture(sprite_batch& b, idx gl_texture) {
     for (size_t i = 0; i < b.tex_count; i++) if (b.tex_ids[i] == gl_texture) return (idx)i;
     if (b.tex_count >= MAX_SPRITE_TEXTURES) return (idx)(b.tex_count - 1); // full: reuse the last slot
     b.tex_ids[b.tex_count] = gl_texture;
     return (idx)b.tex_count++;
 }
 
-static void push_sprite(sprite_batch& b, const sprite& s) {
+void push_sprite(sprite_batch& b, const sprite& s) {
     if (b.size >= b.capacity) return;
     glBindBuffer(GL_ARRAY_BUFFER, b.vbo);
     glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(b.size * sizeof(sprite)), sizeof(sprite), &s);
     b.size++;
 }
 
-static void replace_sprites(sprite_batch& b, const sprite* s, size_t count, size_t offset) {
+void replace_sprites(sprite_batch& b, const sprite* s, size_t count, size_t offset) {
     if (offset >= b.capacity) return;
     if (offset + count > b.capacity) count = b.capacity - offset;
 
@@ -121,11 +126,11 @@ static void replace_sprites(sprite_batch& b, const sprite* s, size_t count, size
     if (offset + count > b.size) b.size = offset + count;
 }
 
-static void clear_sprites(sprite_batch& b) {
+void clear_sprites(sprite_batch& b) {
     b.size = 0;
 }
 
-static void draw_sprites(const sprite_batch& b, idx shader, const mat4& view_proj) {
+void draw_sprites(const sprite_batch& b, idx shader, const mat4& view_proj) {
     if (!b.size || !b.tex_count) return;
 
     glUseProgram(shader);
@@ -155,3 +160,5 @@ static void draw_sprites(const sprite_batch& b, idx shader, const mat4& view_pro
 
     glDisable(GL_BLEND);
 }
+
+#endif // PIX_SPRITE_IMPL

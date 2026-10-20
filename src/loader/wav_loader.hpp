@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_WAV_LOADER_HPP
+#define PIX_WAV_LOADER_HPP
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +13,13 @@
 //
 // Not handled: compressed formats (ADPCM, mp3-in-wav), >2 channels.
 
-static bool wav_load_file(mem_arena& arena, const char* path, sound_file_data* out);
+PIXDEF bool wav_load_file(mem_arena& arena, const char* path, sound_file_data* out);
 
-// ---------------- implementation ----------------
+#endif // PIX_WAV_LOADER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_WAV_LOADER_IMPL)
+#define PIX_WAV_LOADER_IMPL
 
 static uint32_t wav__u32(const unsigned char* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -23,7 +28,7 @@ static uint16_t wav__u16(const unsigned char* p) {
     return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
 }
 
-static bool wav_load_file(mem_arena& arena, const char* path, sound_file_data* out) {
+bool wav_load_file(mem_arena& arena, const char* path, sound_file_data* out) {
     *out = sound_file_data();
 
     FILE* f = fopen(path, "rb");
@@ -96,3 +101,5 @@ static bool wav_load_file(mem_arena& arena, const char* path, sound_file_data* o
     out->rate        = rate;
     return true;
 }
+
+#endif // PIX_WAV_LOADER_IMPL

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_PNG_LOADER_HPP
+#define PIX_PNG_LOADER_HPP
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,10 +17,15 @@ struct png_result {
     unsigned char* pixels; // width * height * 4, allocated from the passed arena
 };
 
-static bool png_load_file(mem_arena& arena, const char* path, png_result* out);
+PIXDEF bool png_load_file(mem_arena& arena, const char* path, png_result* out);
 // same decoder over an already-resident buffer (glTF embeds textures in its binary chunk)
-static bool png_load_memory(mem_arena& arena, const unsigned char* file, size_t size, png_result* out);
+PIXDEF bool png_load_memory(mem_arena& arena, const unsigned char* file, size_t size, png_result* out);
 
+#endif // PIX_PNG_LOADER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_PNG_LOADER_IMPL)
+#define PIX_PNG_LOADER_IMPL
 
 // ---------------- inflate ----------------
 
@@ -300,3 +306,5 @@ bool png_load_memory(mem_arena& arena, const unsigned char* file, size_t size, p
     out->pixels = rgba;
     return true;
 }
+
+#endif // PIX_PNG_LOADER_IMPL

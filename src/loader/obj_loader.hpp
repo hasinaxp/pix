@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PIX_OBJ_LOADER_HPP
+#define PIX_OBJ_LOADER_HPP
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,25 +36,29 @@ struct obj_palette {
     size_t count;
 };
 
-static idx  obj_palette_slot(obj_palette& palette, vec3 color);   // dedupes
+PIXDEF idx  obj_palette_slot(obj_palette& palette, vec3 color);   // dedupes
 // the uv a vertex needs to sample one palette slot; generated geometry that
 // wants to share the palette material asks for it directly
-static vec2 obj_palette_uv(idx slot);
+PIXDEF vec2 obj_palette_uv(idx slot);
 // RGBA8, OBJ_PALETTE_DIM x OBJ_PALETTE_DIM, ready for opengl_create_texture2d
-static void obj_palette_pixels(const obj_palette& palette, unsigned char* out_rgba);
+PIXDEF void obj_palette_pixels(const obj_palette& palette, unsigned char* out_rgba);
 
 // `palette` may be null, in which case untextured materials fall back to uv 0
-static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* out,
+PIXDEF bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* out,
                           obj_palette* palette = 0);
 
 // Carves one named group out of a loaded model into a mesh of its own, with the
 // vertices re-centred on the group's own centre so it can be rotated in place
 // (wheels). *out_pivot receives that centre in the parent's model space.
-static bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_t group,
+PIXDEF bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_t group,
                               mesh_file_data* out, vec3* out_pivot);
-static int  obj_find_group(const mesh_file_data& src, const char* name);
+PIXDEF int  obj_find_group(const mesh_file_data& src, const char* name);
 
-// ---------------- implementation ----------------
+#endif // PIX_OBJ_LOADER_HPP
+
+// ============================================================================
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_OBJ_LOADER_IMPL)
+#define PIX_OBJ_LOADER_IMPL
 
 static const char* obj__skip_ws(const char* p) {
     while (*p == ' ' || *p == '\t') p++;
@@ -97,7 +102,7 @@ static void obj__read_token(const char* p, char* dst, size_t cap) {
 
 // ---- palette ----
 
-static idx obj_palette_slot(obj_palette& palette, vec3 color) {
+idx obj_palette_slot(obj_palette& palette, vec3 color) {
     for (size_t i = 0; i < palette.count; i++) {
         vec3 c = palette.colors[i];
         if (fabsf(c.x - color.x) < 0.002f &&
@@ -110,7 +115,7 @@ static idx obj_palette_slot(obj_palette& palette, vec3 color) {
     return id;
 }
 
-static void obj_palette_pixels(const obj_palette& palette, unsigned char* out_rgba) {
+void obj_palette_pixels(const obj_palette& palette, unsigned char* out_rgba) {
     for (int i = 0; i < OBJ_PALETTE_MAX; i++) {
         vec3 c = (size_t)i < palette.count ? palette.colors[i] : v3(1.0f, 0.0f, 1.0f);
         out_rgba[i * 4 + 0] = (unsigned char)(clampf(c.x, 0.0f, 1.0f) * 255.0f + 0.5f);
@@ -120,15 +125,15 @@ static void obj_palette_pixels(const obj_palette& palette, unsigned char* out_rg
     }
 }
 
-// the uv that lands in the middle of a palette cell. VSHDER_BASIC flips V
-// (OBJ's origin is bottom-left), so the stored V is pre-flipped to cancel it
-// and the sampled texel is row `slot / DIM` of the uploaded image.
-static vec2 obj_palette_uv(idx slot) {
+// the uv that lands in the middle of a palette cell, in the same top-left
+// convention the loader converts every file uv to: row `slot / DIM` of the
+// uploaded image.
+vec2 obj_palette_uv(idx slot) {
     float col = (float)(slot % OBJ_PALETTE_DIM);
     float row = (float)(slot / OBJ_PALETTE_DIM);
     vec2 uv;
     uv.x = (col + 0.5f) / (float)OBJ_PALETTE_DIM;
-    uv.y = 1.0f - (row + 0.5f) / (float)OBJ_PALETTE_DIM;
+    uv.y = (row + 0.5f) / (float)OBJ_PALETTE_DIM;
     return uv;
 }
 
@@ -140,6 +145,7 @@ struct obj__material {
     char  name[48];
     vec3  color;
     bool  textured;   // has a map_Kd, so the file's own uvs are meaningful
+    char  map[128];   // the map_Kd file name, relative to the .mtl
 };
 
 // The source text and the index tables it parses into are scratch: they are
@@ -185,12 +191,14 @@ static size_t obj__load_mtl(const char* obj_path, const char* mtl_name,
             obj__read_token(p + 6, m.name, sizeof(m.name));
             m.color = v3(1.0f, 1.0f, 1.0f);
             m.textured = false;
+            m.map[0] = 0;
         } else if (count && p[0] == 'K' && p[1] == 'd' && p[2] == ' ') {
             float c[3];
             obj__read_floats(p + 3, c, 3);
             out[count - 1].color = v3(c[0], c[1], c[2]);
         } else if (count && strncmp(p, "map_Kd", 6) == 0) {
             out[count - 1].textured = true;
+            obj__read_token(p + 6, out[count - 1].map, sizeof(out[count - 1].map));
         }
     }
 
@@ -198,7 +206,7 @@ static size_t obj__load_mtl(const char* obj_path, const char* mtl_name,
     return count;
 }
 
-static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* out,
+bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* out,
                           obj_palette* palette) {
     char* src = obj__read_whole_file(path);
     if (!src) return false;
@@ -239,7 +247,7 @@ static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* ou
     vec2* uv  = (vec2*)malloc((n_uv  ? n_uv  : 1) * sizeof(vec2));
     vec3* nrm = (vec3*)malloc((n_nrm ? n_nrm : 1) * sizeof(vec3));
     vertex*   verts = allocate<vertex>(arena, n_out ? n_out : 1);
-    uint16_t* inds  = allocate<uint16_t>(arena, n_out ? n_out : 1);
+    uint32_t* inds  = allocate<uint32_t>(arena, n_out ? n_out : 1);
     mesh_group* groups = allocate<mesh_group>(arena, n_groups ? n_groups : 1);
     if (!pos || !uv || !nrm || !verts || !inds || !groups) {
         free(src); free(pos); free(uv); free(nrm);
@@ -257,7 +265,10 @@ static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* ou
             pos[ip++] = v3(t[0], t[1], t[2]);
         } else if (p[0] == 'v' && p[1] == 't') {
             float t[2]; obj__read_floats(p + 3, t, 2);
-            vec2 c = { t[0], t[1] }; uv[iu++] = c;
+            // OBJ/Blender put the V origin at the bottom, GL textures at the top.
+            // Flipped once here so every mesh the renderer sees - OBJ, glTF or
+            // generated - shares glTF's top-left convention.
+            vec2 c = { t[0], 1.0f - t[1] }; uv[iu++] = c;
         } else if (p[0] == 'v' && p[1] == 'n') {
             float t[3]; obj__read_floats(p + 3, t, 3);
             nrm[in++] = v3(t[0], t[1], t[2]);
@@ -298,7 +309,7 @@ static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* ou
                     if (cn[c] != 0 && n_nrm) vout.normal = nrm[obj__resolve(cn[c], (int)n_nrm)];
                     if (use_palette)              vout.uv = palette_uv;
                     else if (ct[c] != 0 && n_uv)  vout.uv = uv[obj__resolve(ct[c], (int)n_uv)];
-                    inds[iv] = (uint16_t)iv;
+                    inds[iv] = (uint32_t)iv;
                     verts[iv] = vout;
                     iv++;
                 }
@@ -337,6 +348,12 @@ static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* ou
     out->index_data   = inds;
     out->group_count  = ig;
     out->groups       = groups;
+    out->texture_path[0] = 0;
+    for (size_t m = 0; m < material_count; m++)
+        if (materials[m].textured && materials[m].map[0]) {
+            obj__sibling_path(path, materials[m].map, out->texture_path, sizeof(out->texture_path));
+            break;
+        }
 
     // bounds, so callers can fit a model to a lot or size a collider
     if (iv) {
@@ -355,27 +372,27 @@ static bool obj_load_file(mem_arena& arena, const char* path, mesh_file_data* ou
     return true;
 }
 
-static int obj_find_group(const mesh_file_data& src, const char* name) {
+int obj_find_group(const mesh_file_data& src, const char* name) {
     for (size_t i = 0; i < src.group_count; i++)
         if (strcmp(src.groups[i].name, name) == 0) return (int)i;
     return -1;
 }
 
-static bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_t group,
+bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_t group,
                               mesh_file_data* out, vec3* out_pivot) {
     if (group >= src.group_count) return false;
     const mesh_group& g = src.groups[group];
     if (!g.vertex_count) return false;
 
     vertex*   verts = allocate<vertex>(arena, g.vertex_count);
-    uint16_t* inds  = allocate<uint16_t>(arena, g.vertex_count);
+    uint32_t* inds  = allocate<uint32_t>(arena, g.vertex_count);
     if (!verts || !inds) return false;
 
     vec3 lo = v3(1e30f, 1e30f, 1e30f), hi = v3(-1e30f, -1e30f, -1e30f);
     for (size_t i = 0; i < g.vertex_count; i++) {
         verts[i] = src.vertex_data[g.vertex_offset + i];
         verts[i].position = v3sub(verts[i].position, g.pivot);
-        inds[i] = (uint16_t)i;
+        inds[i] = (uint32_t)i;
         vec3 p = verts[i].position;
         if (p.x < lo.x) lo.x = p.x; if (p.x > hi.x) hi.x = p.x;
         if (p.y < lo.y) lo.y = p.y; if (p.y > hi.y) hi.y = p.y;
@@ -392,3 +409,5 @@ static bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_
     if (out_pivot) *out_pivot = g.pivot;
     return true;
 }
+
+#endif // PIX_OBJ_LOADER_IMPL
