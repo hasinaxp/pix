@@ -39,8 +39,10 @@ full set is in [`docs/`](docs/index.md):
 | [Getting started](docs/getting-started.md) | setup, compiling, the frame loop, coordinates, types, errors |
 | [Input](docs/inputs.md) | keyboard, mouse, gamepads, text entry |
 | [2D rendering](docs/2d-rendering.md) | shapes, images, sprites, text, 2D cameras |
+| [Tilemaps](docs/tilemaps.md) | Tiled maps, autotiling, animated tiles, objects, parallax |
 | [3D rendering](docs/3d-rendering.md) | cameras, meshes, materials, models, lights, shadows, post-processing |
 | [Physics](docs/physics.md) | the physics world and shape tests |
+| [Math](docs/math.md) | conventions, helpers, rotations, colour, easing and curves, fast approximations |
 | [Memory](docs/memory.md) | optional: scoped memory, stack buffers, arenas, limits, a custom heap |
 | [Cheatsheet](docs/cheatsheet.md) | the common calls on one page |
 

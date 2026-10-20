@@ -19,9 +19,11 @@ and how pix reports errors.
 |---|---|
 | [Getting started](getting-started.md) | setup, compiling, the frame loop, timing, coordinates, types, errors, the examples |
 | [Input](inputs.md) | keyboard, mouse, mouse look, gamepads and rumble, typed text |
-| [2D rendering](2d-rendering.md) | shapes, colours, images, sprite sheets, text, 2D cameras, clipping |
+| [2D rendering](2d-rendering.md) | shapes, images, sprites and animation (Aseprite, atlases), text, cameras, shake, blend modes, canvases, pixel-art resolution, screen effects |
+| [Tilemaps](tilemaps.md) | Tiled maps, layers, autotiling, animated tiles, objects, parallax |
 | [3D rendering](3d-rendering.md) | cameras, transforms, meshes, materials, models, animation, lights, shadows, post-processing, picking |
-| [Physics](physics.md) | the physics world (walls, bodies, raycasts) and shape tests for 2D and 3D |
+| [Physics](physics.md) | the physics world (walls, bodies, raycasts) and shape tests for 2D and 3D: boxes, oriented boxes, capsules, triangles |
+| [Math](math.md) | conventions, everyday helpers, rotations, colour, easing and curves, trajectories, `mat3`, fast approximations |
 | [Memory](memory.md) | optional: scoped temporary memory, stack buffers, arenas, statistics, limits, a custom heap |
 | [Cheatsheet](cheatsheet.md) | the common calls on one page, including math, random numbers and audio |
 

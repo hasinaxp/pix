@@ -97,6 +97,14 @@ static const pix_color PIX_ORANGE     = { 255, 161,   0, 255 };
 static const pix_color PIX_PURPLE     = { 160,  90, 220, 255 };
 static const pix_color PIX_SKYBLUE    = { 102, 191, 255, 255 };
 
+// How a colour combines with what is already drawn - for 2D (pix_begin_blend)
+// and for 3D materials (material.blend).
+#define PIX_BLEND_OPAQUE        0   // replaces (3D materials; 2D treats it as ALPHA)
+#define PIX_BLEND_ALPHA         1   // classic transparency, by the colour's alpha
+#define PIX_BLEND_ADDITIVE      2   // adds light: glows, fire, lasers, sparks
+#define PIX_BLEND_MULTIPLY      3   // darkens: shadows, tinted glass, night overlays
+#define PIX_BLEND_PREMULTIPLIED 4   // colour already multiplied by its alpha (canvases drawn back)
+
 // ---------------- logging ----------------
 //
 // To stderr and to the debugger's output window, so a message is visible

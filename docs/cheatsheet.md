@@ -29,7 +29,7 @@ cl /std:c++14 /O2 /EHsc game.cpp          (with dist/pix.h next to game.cpp)
 | `pix_quit()` | end the loop |
 | `pix_time()` | seconds since start |
 | `pix_fps()` | frames per second |
-| `pix_width()`, `pix_height()` | window size |
+| `pix_width()`, `pix_height()` | the size you draw in (window, or `pix_set_resolution`) |
 | `pix_set_title(s)`, `pix_toggle_fullscreen()`, `pix_set_vsync_enabled(b)` | |
 | `pix_log("hp %d", hp)` | print to the console |
 
@@ -84,6 +84,38 @@ pix_draw_fps(x, y);
 pix_camera2d cam = {}; cam.zoom = 1;  cam.target = player;  cam.offset = v2(w / 2, h / 2);
 pix_begin_2d(cam);  /* world */  pix_end_2d();    /* HUD after */
 pix_begin_clip(rect);  /* ... */  pix_end_clip();
+
+pix_draw_ellipse(c, rx, ry, color)   pix_draw_ring(c, inner, outer, from_deg, to_deg, color)   pix_draw_circle_sector(...)
+pix_draw_polyline(pts, n, thickness, color, closed)   pix_draw_polygon(pts, n, color)   pix_draw_rect_rounded_lines(...)
+pix_draw_nine_slice(tex, src, v4(l, t, r, b), dst);                 // UI panels
+
+pix_rect rects[64];
+int n = pix_rects_grid(rects, 64, tex.width, tex.height, 32, 32);   // or pix_rects_row / _column / by hand
+pix_atlas hero = pix_create_atlas(tex, rects, n);                   // frame i = rects[i]
+pix_atlas_add_anim(hero, "run", 0, 6, 12.0f);                       // frames 0..5 at 12 fps
+// Aseprite / TexturePacker: n = pix_rects_from_json("hero.json", rects, 64); ... pix_atlas_apply_json(hero, "hero.json");
+pix_sprite_player p = {};
+pix_sprite_play(p, hero, "run");  pix_sprite_update(p, hero, dt);  // tags are animations
+pix_draw_sprite_anim(hero, p, pos, scale, rot_deg, tint, PIX_FLIP_X);
+pix_draw_sprite(hero, "sword", pos);   pix_sprite_entered(p, 3)    // frame events
+pix_atlas_builder b = {};  pix_atlas_builder_add_file(b, "coin", "coin.png");  pix_atlas items = pix_atlas_build(b);
+
+pix_tilemap level = pix_load_tilemap("level.tmj");                 // Tiled JSON; or pix_create_tilemap(w, h, tw, th, atlas)
+pix_draw_tilemap(level);   pix_draw_tilemap_layer(level, pix_tilemap_find_layer(level, "ground"));
+pix_tilemap_set(map, layer, x, y, tile, PIX_TILE_FLIP_X);   pix_tilemap_get(map, layer, x, y)   // -1 = empty
+pix_tilemap_set_terrain(map, 1, pix_autotile_make(PIX_AUTOTILE_47, first));  pix_tilemap_paint(map, layer, x, y, 1);
+pix_tilemap_object_property(level, level.objects[i], "hp")       // Tiled objects
+pix_draw_parallax(sky, v2(0.2f, 0.2f));                            // background at 0.2x camera speed
+pix_begin_blend(PIX_BLEND_ADDITIVE);  /* glows */  pix_end_blend();  // also MULTIPLY
+pix_mouse_world_2d(cam)   pix_camera2d_visible(cam)   pix_rect_overlaps(a, b)   // culling, picking
+static pix_shake shake;  pix_shake_add(shake, 0.4f);  pix_begin_2d(pix_shake_camera(shake, cam, dt));
+
+framebuffer cv = pix_create_canvas(256, 256);                       // draw into an image
+pix_begin_canvas(cv);  pix_clear(PIX_BLANK);  /* draw */  pix_end_canvas();
+pix_draw_target(cv, dst);
+
+pix_set_resolution(320, 180);                                       // pixel art: fixed res, integer scaled
+pix_apply_effects();                                                // effects now, HUD after stays clean
 ```
 
 Colours: `pix_rgba(r, g, b, a = 255)`, `pix_hex(0xRRGGBBAA)`,
@@ -137,7 +169,9 @@ m->emissive = v3(4, 1, 0);   m->toon = 1;   m->unlit = true;   m->double_sided =
 | `vec3 dir = pix_screen_to_ray(r, mx, my)` | ray from the camera through a pixel |
 | `pix_world_to_screen(r, world, &px)` | false if behind the camera |
 
-## Transforms and math
+## Transforms and math ([Math](math.md))
+
+Y up, right-handed, radians, column-major (`a * b` applies `b` first).
 
 ```cpp
 mat4_identity()   mat4_translate(x, y, z)   mat4_scale(x, y, z)   mat4_rotate_y(rad)   // _x, _z
@@ -155,7 +189,19 @@ clampf(v, lo, hi)  lerpf(a, b, t)  minf  maxf  smoothstepf(e0, e1, x)  approachf
 damp(cur, target, rate, dt)           // smooth follow, same at any frame rate
 damp_angle(cur, target, rate, dt)     // the same for angles, takes the short way round
 angle_delta(from, to)                 // shortest signed angle between two headings
+saturatef  signf  fractf  wrapf(x, lo, hi)  inverse_lerpf(a, b, x)  remapf(x, a0, a1, b0, b1)  approx_equalf(a, b)
+v3reflect(v, n)  v3project(v, onto)  v3reject(v, onto)      // also v2 versions
 PIX_PI  PIX_TAU  PIX_DEG2RAD  PIX_RAD2DEG
+```
+
+```cpp
+quat_to_euler(q, &pitch, &yaw, &roll)   quat_to_axis_angle(q, &axis, &angle)   quat_from_mat4(m)
+mat3 n = mat3_normal_matrix(model);     mat3_from_quat(q)  mat3_inverse(m)  m * v
+pix_hsv(hue_deg, s, v)  pix_hsl(hue_deg, s, l)  pix_color_to_hsv(c)  pix_color_to_linear(c)  pix_color_from_linear(v)
+ease_out_back(t)  ease_in_out_sine(t)   // ease_{in,out,in_out}_{quad,cubic,quart,sine,expo,circ,back,elastic,bounce}
+catmull_rom(p0, p1, p2, p3, t)  bezier_cubic(a, b, c, d, t)  hermite(p0, m0, p1, m1, t)   // float, vec2, vec3
+ballistic_launch(from, to, speed, gravity, high, &velocity)  ballistic_position(p0, v0, g, t)
+fast_inv_sqrt  fast_rsqrt  v3norm_fast  fast_sin  fast_cos  fast_atan2   // hot loops only; see the error table
 ```
 
 Random numbers:
@@ -203,9 +249,11 @@ phys_remove_body(world, id);    phys_destroy_world(world);
 Shape tests (`contact` pointer required):
 
 ```cpp
-contact3 c;  collide_sphere_sphere(a, b, &c)  // also sphere_plane/aabb/capsule, capsule_capsule/plane/aabb
+contact3 c;  collide_sphere_sphere(a, b, &c)  // also sphere_plane/aabb/capsule/obb/triangle, capsule_capsule/plane/aabb, obb_obb
 contact2 c2; collide_circle_rect(circle, rect, &c2)   // also circle_circle/obb, obb_obb, obb_rect
-ray_vs_sphere / ray_vs_capsule / ray_vs_plane / ray_vs_aabb (takes 1/dir)
+obb box = obb_make(centre, half, rotation);  obb_from_aabb(bounds, transform);  obb_bounds(box)
+ray_vs_sphere / ray_vs_capsule / ray_vs_plane / ray_vs_obb / ray_vs_aabb (takes 1/dir)
+ray_vs_triangle(o, d, a, b, c, max, two_sided, &t, &bary)   barycentric(p, a, b, c)   closest_point_triangle(p, a, b, c)
 ```
 
 ## Audio

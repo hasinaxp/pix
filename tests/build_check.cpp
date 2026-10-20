@@ -410,6 +410,377 @@ int main() {
         near_eq(v3len(sun.direction), 1.0f, 1e-3f, "sun direction stays normalised");
     }
 
+    // ---- math: scalar and vector helpers ----
+    near_eq(remapf(5, 0, 10, 100, 200), 150, 1e-4f, "remapf");
+    near_eq(inverse_lerpf(2, 4, 3), 0.5f, 1e-6f, "inverse_lerpf");
+    near_eq(fractf(-0.25f), 0.75f, 1e-6f, "fractf of a negative");
+    near_eq(wrapf(370, 0, 360), 10, 1e-3f, "wrapf from above");
+    near_eq(wrapf(-30, 0, 360), 330, 1e-3f, "wrapf from below");
+    near_eq(saturatef(1.5f) + saturatef(-1) + signf(-3), 0.0f, 0.0f, "saturatef / signf");
+    check(approx_equalf(1e6f, 1e6f + 1.0f), "approx_equalf is relative for large values");
+    check(!approx_equalf(1.0f, 1.001f), "approx_equalf sees a real difference");
+    check(v3approx_equal(v3reflect(v3(1, -1, 0), v3(0, 1, 0)), v3(1, 1, 0)), "v3reflect");
+    check(v3approx_equal(v3project(v3(2, 3, 4), v3(0, 5, 0)), v3(0, 3, 0)), "v3project");
+    check(v3approx_equal(v3reject(v3(2, 3, 4), v3(0, 5, 0)), v3(2, 0, 4)), "v3reject");
+
+    // ---- math: quaternion conversions ----
+    {
+        float p = 0.3f, y = -1.2f, r = 0.7f, p2, y2, r2;
+        quat q = quat_from_euler(p, y, r);
+        quat_to_euler(q, &p2, &y2, &r2);
+        near_eq(p2, p, 1e-4f, "quat_to_euler pitch");
+        near_eq(y2, y, 1e-4f, "quat_to_euler yaw");
+        near_eq(r2, r, 1e-4f, "quat_to_euler roll");
+        quat g = quat_from_euler(PIX_PI * 0.5f, 0.4f, 0.3f);           // looking straight up
+        quat_to_euler(g, &p2, &y2, &r2);
+        quat g2 = quat_from_euler(p2, y2, r2);
+        vec3 t = v3(0.3f, 0.5f, 0.8f);
+        check(v3approx_equal(quat_rotate(g, t), quat_rotate(g2, t), 1e-3f), "euler at the pole still gives the same rotation");
+        quat m = quat_from_mat4(mat4_from_trs(v3(1, 2, 3), q, v3(2, 3, 4)));
+        check(fabsf(m.x * q.x + m.y * q.y + m.z * q.z + m.w * q.w) > 0.9999f, "quat_from_mat4 sees through scale");
+        vec3 axis; float angle;
+        quat_to_axis_angle(quat_from_axis_angle(v3(0, 0, 2), 1.1f), &axis, &angle);
+        near_eq(angle, 1.1f, 1e-5f, "axis-angle round trip: angle");
+        near_eq(axis.z, 1.0f, 1e-5f, "axis-angle round trip: axis");
+    }
+
+    // ---- math: mat3 ----
+    {
+        mat4 m4 = mat4_from_trs(v3(1, 2, 3), quat_from_euler(0.2f, 0.5f, -0.3f), v3(2, 0.5f, 3));
+        mat3 m = mat3_from_mat4(m4);
+        mat3 id = mat3_mul(mat3_inverse(m), m);
+        float off = 0.0f;
+        for (int i = 0; i < 9; i++) off = maxf(off, fabsf(id.data[i] - ((i % 4) == 0 ? 1.0f : 0.0f)));
+        check(off < 1e-5f, "mat3_inverse * m is the identity");
+        near_eq(mat3_determinant(m), 3.0f, 1e-4f, "mat3_determinant is the volume scale");
+        vec3 tangent = v3(1, 1, 0), normal = v3norm(v3(1, -1, 0));
+        float dotp = v3dot(mat4_mul_dir(m4, tangent), mat3_mul_vec3(mat3_normal_matrix(m4), normal));
+        near_eq(dotp, 0.0f, 1e-5f, "normal matrix keeps normals perpendicular under uneven scale");
+        quat q = quat_from_euler(0.1f, 0.9f, 0.4f);
+        check(v3approx_equal(mat3_mul_vec3(mat3_from_quat(q), v3(1, 2, 3)), quat_rotate(q, v3(1, 2, 3)), 1e-5f),
+              "mat3_from_quat matches quat_rotate");
+    }
+
+    // ---- math: colour ----
+    {
+        bool round_trip = true;
+        for (int i = 0; i < 256; i++) {
+            pix_color c = pix_rgba(i, 255 - i, i / 2, i);
+            pix_color back = pix_color_from_linear(pix_color_to_linear(c));
+            if (back.r != c.r || back.g != c.g || back.b != c.b || back.a != c.a) round_trip = false;
+        }
+        check(round_trip, "sRGB -> linear -> sRGB is exact on every 8-bit value");
+        near_eq(pix_srgb_to_linear(0.5f), 0.21404f, 1e-4f, "sRGB 0.5 is about 21% linear light");
+        pix_color red = pix_hsv(0, 1, 1), green = pix_hsv(120, 1, 1), blue = pix_hsv(-120, 1, 1);
+        check(red.r == 255 && red.g == 0 && green.g == 255 && green.r == 0 && blue.b == 255 && blue.g == 0,
+              "pix_hsv primaries, with wrapping hue");
+        vec4 hsv = pix_color_to_hsv(pix_rgba(255, 128, 0));
+        near_eq(hsv.x, 30.1f, 0.2f, "orange hue");
+        vec4 hsl = pix_color_to_hsl(pix_hsl(200, 0.6f, 0.4f));
+        near_eq(hsl.x, 200, 1.0f, "hsl round trip hue");
+        near_eq(hsl.y, 0.6f, 0.01f, "hsl round trip saturation");
+        near_eq(hsl.z, 0.4f, 0.01f, "hsl round trip lightness");
+    }
+
+    // ---- math: curves, easing, trajectories ----
+    {
+        float (*eases[])(float) = {
+            ease_in_quad, ease_out_quad, ease_in_out_quad, ease_in_cubic, ease_out_cubic, ease_in_out_cubic,
+            ease_in_quart, ease_out_quart, ease_in_out_quart, ease_in_sine, ease_out_sine, ease_in_out_sine,
+            ease_in_expo, ease_out_expo, ease_in_out_expo, ease_in_circ, ease_out_circ, ease_in_out_circ,
+            ease_in_back, ease_out_back, ease_in_out_back, ease_in_elastic, ease_out_elastic, ease_in_out_elastic,
+            ease_in_bounce, ease_out_bounce, ease_in_out_bounce };
+        bool ends = true, mids = true;
+        for (size_t i = 0; i < PIX_ARRAY_COUNT(eases); i++) {
+            if (fabsf(eases[i](0.0f)) > 1e-4f || fabsf(eases[i](1.0f) - 1.0f) > 1e-4f) ends = false;
+            // the in_out ones pass through the middle
+            if (i % 3 == 2 && fabsf(eases[i](0.5f) - 0.5f) > 1e-4f) mids = false;
+        }
+        check(ends, "every easing runs 0 -> 1");
+        check(mids, "every in_out easing passes through 0.5");
+        near_eq(catmull_rom(0, 1, 2, 3, 0.5f), 1.5f, 1e-6f, "catmull_rom on a straight line");
+        near_eq(catmull_rom(5, 1, 2, -7, 0.0f) + catmull_rom(5, 1, 2, -7, 1.0f), 3.0f, 1e-6f, "catmull_rom passes its middle points");
+        vec3 b0 = bezier_cubic(v3(0, 0, 0), v3(1, 2, 0), v3(3, 2, 0), v3(4, 0, 0), 0.0f);
+        vec3 b1 = bezier_cubic(v3(0, 0, 0), v3(1, 2, 0), v3(3, 2, 0), v3(4, 0, 0), 1.0f);
+        check(v3approx_equal(b0, v3(0, 0, 0)) && v3approx_equal(b1, v3(4, 0, 0)), "bezier_cubic ends on its end points");
+        near_eq(bezier_quadratic(0, 2, 0, 0.5f), 1.0f, 1e-6f, "bezier_quadratic peak");
+        near_eq(hermite(0, 0, 1, 0, 0.5f), 0.5f, 1e-6f, "hermite with flat tangents is smoothstep");
+
+        vec3 from = v3(0, 1, 0), to = v3(20, 4, 5), vel;
+        for (int high = 0; high < 2; high++) {
+            check(ballistic_launch(from, to, 20.0f, 9.8f, high != 0, &vel), "ballistic_launch finds an arc");
+            near_eq(v3len(vel), 20.0f, 1e-3f, "launch velocity has the asked speed");
+            float flight = v2len(v2(to.x - from.x, to.z - from.z)) / v2len(v2(vel.x, vel.z));
+            vec3 land = ballistic_position(from, vel, v3(0, -9.8f, 0), flight);
+            check(v3approx_equal(land, to, 1e-3f), high ? "the lob lands on the target" : "the flat shot lands on the target");
+        }
+        check(!ballistic_launch(from, v3(1000, 0, 0), 10.0f, 9.8f, false, &vel), "out of range is refused");
+    }
+
+    // ---- colliders: oriented boxes ----
+    {
+        contact3 c;
+        obb a = obb_make(v3(0, 0, 0), v3(1, 1, 1), quat_identity());
+        obb b = obb_make(v3(1.5f, 0, 0), v3(1, 1, 1), quat_identity());
+        check(collide_obb_obb(a, b, &c), "touching boxes overlap");
+        near_eq(c.depth, 0.5f, 1e-5f, "obb/obb depth");
+        near_eq(c.normal.x, 1.0f, 1e-5f, "obb/obb normal points a to b");
+        quat spin = quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.25f);   // a diamond in xy
+        obb d = obb_make(v3(2.2f, 2.2f, 0), v3(1, 1, 1), spin);
+        check(aabb_overlap(obb_bounds(a), obb_bounds(d)) && !collide_obb_obb(a, d, &c),
+              "rotated boxes can be apart while their bounds overlap");
+        d.centre = v3(1.6f, 1.6f, 0);
+        check(collide_obb_obb(a, d, &c), "rotated boxes overlapping");
+        near_eq(c.depth, 1.0f + sqrtf(2.0f) - 1.6f * sqrtf(2.0f), 1e-4f, "rotated overlap is along the diagonal");
+        near_eq(c.normal.x, c.normal.y, 1e-4f, "rotated overlap normal is diagonal");
+        obb diamond = obb_make(v3(0, 0, 0), v3(1, 1, 1), spin);
+        check(collide_sphere_obb(sphere_make(v3(0, sqrtf(2.0f) + 0.3f, 0), 0.5f), diamond, &c), "sphere on a box corner");
+        near_eq(c.depth, 0.2f, 1e-4f, "sphere/obb depth");
+        near_eq(c.normal.y, -1.0f, 1e-4f, "sphere/obb normal points sphere to box");
+        float t;
+        check(ray_vs_obb(v3(-5, 0, 0), v3(1, 0, 0), diamond, 100.0f, &t), "ray hits a rotated box");
+        near_eq(t, 5.0f - sqrtf(2.0f), 1e-4f, "ray/obb distance to the corner");
+        aabb local = aabb_make(v3(-1, 0, -1), v3(1, 2, 1));
+        obb moved = obb_from_aabb(local, mat4_from_trs(v3(10, 0, 0), spin, v3(2, 2, 2)));
+        near_eq(moved.half.x, 2.0f, 1e-5f, "obb_from_aabb puts scale into half");
+        check(v3approx_equal(moved.centre, v3(10, 0, 0) + quat_rotate(spin, v3(0, 2, 0)), 1e-4f), "obb_from_aabb centre");
+    }
+
+    // ---- colliders: triangles ----
+    {
+        vec3 ta = v3(0, 0, 0), tb = v3(1, 0, 0), tc = v3(0, 0, -1);   // front faces +Y
+        check(v3approx_equal(triangle_normal(ta, tb, tc), v3(0, 1, 0)), "triangle_normal");
+        float t; vec3 bary;
+        check(ray_vs_triangle(v3(0.25f, 5, -0.25f), v3(0, -1, 0), ta, tb, tc, 100.0f, false, &t, &bary), "ray hits the front");
+        near_eq(t, 5.0f, 1e-5f, "ray/triangle distance");
+        check(v3approx_equal(bary, v3(0.5f, 0.25f, 0.25f)), "ray/triangle barycentrics");
+        check(!ray_vs_triangle(v3(0.25f, -5, -0.25f), v3(0, 1, 0), ta, tb, tc, 100.0f, false, &t), "one-sided ignores the back");
+        check(ray_vs_triangle(v3(0.25f, -5, -0.25f), v3(0, 1, 0), ta, tb, tc, 100.0f, true, &t), "two-sided hits the back");
+        check(!ray_vs_triangle(v3(2, 5, 0), v3(0, -1, 0), ta, tb, tc, 100.0f, true, &t), "ray beside the triangle misses");
+        check(v3approx_equal(barycentric(v3(0.25f, 0, -0.25f), ta, tb, tc), v3(0.5f, 0.25f, 0.25f)), "barycentric");
+        check(v3approx_equal(closest_point_triangle(v3(2, 3, 0), ta, tb, tc), tb), "closest point: corner");
+        check(v3approx_equal(closest_point_triangle(v3(0.5f, 3, 0.5f), ta, tb, tc), v3(0.5f, 0, 0)), "closest point: edge");
+        check(v3approx_equal(closest_point_triangle(v3(0.2f, 3, -0.2f), ta, tb, tc), v3(0.2f, 0, -0.2f)), "closest point: face");
+        contact3 c;
+        check(collide_sphere_triangle(sphere_make(v3(0.2f, 0.3f, -0.2f), 0.5f), ta, tb, tc, &c), "sphere resting on a triangle");
+        near_eq(c.depth, 0.2f, 1e-5f, "sphere/triangle depth");
+        near_eq(c.normal.y, -1.0f, 1e-5f, "sphere/triangle normal points sphere to triangle");
+    }
+
+    // ---- 2D: cameras, rectangles, shake ----
+    {
+        pix_camera2d cam = {};
+        cam.offset = v2(640, 360); cam.target = v2(100, 50); cam.rotation = 30.0f; cam.zoom = 2.0f;
+        vec2 w = v2(123.0f, -45.0f);
+        vec2 back = pix_screen_to_world_2d(cam, pix_world_to_screen_2d(cam, w));
+        check(fabsf(back.x - w.x) < 1e-3f && fabsf(back.y - w.y) < 1e-3f, "2D screen/world round trip");
+        vec2 centre = pix_screen_to_world_2d(cam, cam.offset);
+        check(fabsf(centre.x - 100.0f) < 1e-4f && fabsf(centre.y - 50.0f) < 1e-4f, "the offset shows the target");
+        cam.rotation = 0.0f;
+        pix_rect vis = pix_camera2d_visible(cam, 1280, 720);
+        near_eq(vis.w, 640.0f, 1e-3f, "visible width at zoom 2");
+        near_eq(vis.x, 100.0f - 320.0f, 1e-3f, "visible rect is centred on the target");
+        cam.rotation = 90.0f;
+        vis = pix_camera2d_visible(cam, 1280, 720);
+        near_eq(vis.w, 360.0f, 1e-2f, "rotated view swaps the visible extents");
+        pix_rect a = { 0, 0, 10, 10 }, b = { 9, 9, 5, 5 }, d = { 10, 0, 5, 5 };
+        check(pix_rect_overlaps(a, b) && !pix_rect_overlaps(a, d), "pix_rect_overlaps, touching edges do not count");
+        check(pix_rect_contains(a, v2(0, 0)) && !pix_rect_contains(a, v2(10, 5)), "pix_rect_contains is half open");
+
+        pix_shake sh = {};
+        pix_shake_update(sh, 1.0f / 60.0f);
+        check(sh.offset.x == 0.0f && sh.angle == 0.0f, "no trauma, no shake");
+        pix_shake_add(sh, 2.0f);
+        near_eq(sh.trauma, 1.0f, 0.0f, "trauma clamps at 1");
+        float biggest = 0.0f;
+        for (int i = 0; i < 30; i++) { pix_shake_update(sh, 1.0f / 60.0f); biggest = maxf(biggest, v2len(sh.offset)); }
+        check(biggest > 2.0f && biggest <= 20.0f * 1.5f, "full trauma shakes within max_offset");
+        for (int i = 0; i < 120; i++) pix_shake_update(sh, 1.0f / 60.0f);
+        check(sh.trauma == 0.0f && v2len(sh.offset) == 0.0f, "trauma drains to a standstill");
+    }
+
+    // ---- JSON reader ----
+    {
+        const char* text = "{\"name\": \"hero\", \"hp\": 42, \"speed\": 3.5, \"alive\": true,"
+                           " \"tags\": [\"a\", \"b\", \"c\"], \"pos\": {\"x\": -1.25, \"y\": 2e2}, \"none\": null}";
+        js_doc d;
+        int root = js_parse(d, text, strlen(text));
+        check(root == 0, "js_parse returns the root");
+        char s[16];
+        js_str(d, js_get(d, root, "name"), s, sizeof(s));
+        check(strcmp(s, "hero") == 0, "js_str");
+        check(js_int(d, js_get(d, root, "hp"), 0) == 42, "js_int");
+        near_eq(js_float(d, js_get(d, js_get(d, root, "pos"), "y"), 0), 200.0f, 1e-3f, "js_float with exponent");
+        check(js_bool(d, js_get(d, root, "alive"), false), "js_bool");
+        check(js_type(d, js_get(d, root, "none")) == JS_NULL && js_get(d, root, "missing") < 0, "null and missing keys");
+        int tags = js_get(d, root, "tags"), n = 0;
+        for (int e = js_first(d, tags); e >= 0; e = js_next(d, tags, e)) n++;
+        check(n == 3 && js_len(d, tags) == 3, "js_first / js_next walk an array");
+        int keys = 0;
+        for (int k = js_first(d, root); k >= 0; k = js_next(d, root, js_value_of(d, k))) keys++;
+        check(keys == 7, "js_first / js_next walk an object's keys");
+        js_free(d);
+        js_doc bad;
+        check(js_parse(bad, "{\"a\": [1, 2}", 12) < 0, "malformed JSON is refused");
+        js_free(bad);
+    }
+
+    // ---- sprite animation (no GL: a grid over a pretend texture) ----
+    {
+        pix_texture fake = { 1, 64, 32 };
+        pix_rect rects[16];
+        int nr = pix_rects_grid(rects, 16, fake.width, fake.height, 16, 16);
+        check(nr == 8 && rects[5].x == 16 && rects[5].y == 16, "pix_rects_grid: 4 x 2 cells, row by row");
+        check(pix_rects_grid(rects, 3, 64, 32, 16, 16) == 3, "pix_rects_grid stops at max");
+        // 74 x 40, margin 2, spacing 2: columns at 2 20 38 56 (56 + 16 = 72 = 74 - 2), rows at 2 20
+        check(pix_rects_grid(rects, 16, 74, 40, 16, 16, 2, 2) == 8 && rects[1].x == 20 && rects[4].y == 20,
+              "pix_rects_grid with margin and spacing");
+        check(pix_rects_grid(rects, 16, 73, 40, 16, 16, 2, 2) == 6, "a cell that would cross the margin is left out");
+        pix_rect strip[4];
+        check(pix_rects_row(strip, 4, 8, 40, 16, 24, 4, 2) == 4 && strip[3].x == 8 + 3 * 18 && strip[3].y == 40,
+              "pix_rects_row");
+        check(pix_rects_column(strip, 4, 8, 40, 16, 24, 3) == 3 && strip[2].y == 40 + 48, "pix_rects_column");
+        nr = pix_rects_grid(rects, 16, fake.width, fake.height, 16, 16);
+        pix_atlas a = pix_create_atlas(fake, rects, nr);
+        check(a.frame_count == 8 && !a.owns_texture, "pix_create_atlas: one frame per rect, texture stays yours");
+        near_eq(a.frames[5].src.x, 16.0f, 0.0f, "grid order is row by row");
+        near_eq(a.frames[0].pivot.x, 8.0f, 0.0f, "default pivot is the centre");
+        int run = pix_atlas_add_anim(a, "run", 0, 4, 10.0f);         // 0.1 s per frame
+        int once = pix_atlas_add_anim(a, "die", 4, 3, 10.0f, PIX_ANIM_ONCE);
+        int ping = pix_atlas_add_anim(a, "bob", 4, 3, 10.0f, PIX_ANIM_PINGPONG);
+        int custom[3] = { 7, 0, 7 };
+        int seq = pix_atlas_add_anim_frames(a, "blink", custom, 3, 10.0f);
+        check(run == 0 && once == 1 && ping == 2 && seq == 3 && pix_atlas_find_anim(a, "die") == 1, "animations by index and name");
+        check(pix_atlas_add_anim(a, "bad", 6, 5, 10.0f) < 0, "an animation past the last frame is refused");
+
+        pix_sprite_player p = {};
+        check(pix_sprite_frame(p, a) == -1, "nothing plays before pix_sprite_play");
+        pix_sprite_play(p, a, "run");
+        check(pix_sprite_frame(p, a) == 0 && pix_sprite_entered(p, 0), "play starts on the first frame");
+        pix_sprite_update(p, a, 0.25f);                              // 2.5 frames
+        check(p.step == 2 && pix_sprite_entered(p, 1) && pix_sprite_entered(p, 2), "steps entered in one long update");
+        pix_sprite_play(p, a, "run");                                // same animation: keeps going
+        check(p.step == 2, "playing the current animation again does not restart it");
+        pix_sprite_update(p, a, 0.2f);
+        check(p.step == 0 && p.loops == 1, "loops wrap and count");
+
+        pix_sprite_play(p, a, "die");
+        pix_sprite_update(p, a, 1.0f);
+        check(p.finished && pix_sprite_frame(p, a) == 6, "once stops on its last frame");
+        pix_sprite_play(p, a, "die");
+        check(p.finished, "finished stays until restart");
+        pix_sprite_play(p, a, "die", true);
+        check(!p.finished && p.step == 0, "restart starts over");
+
+        pix_sprite_play(p, a, "bob");
+        int seen[8] = {}, k = 0;
+        for (int i = 0; i < 8; i++) { seen[k++] = p.step; pix_sprite_update(p, a, 0.1f); }
+        check(seen[0] == 0 && seen[1] == 1 && seen[2] == 2 && seen[3] == 1 && seen[4] == 0 && seen[5] == 1,
+              "ping-pong goes 0 1 2 1 0 1");
+
+        pix_sprite_play(p, a, "blink");
+        pix_sprite_update(p, a, 0.1f);
+        check(pix_sprite_frame(p, a) == 0, "frame lists play in their own order");
+
+        a.frames[0].duration = 0.5f;                                 // per-frame timing beats fps
+        pix_sprite_play(p, a, "run", true);
+        pix_sprite_update(p, a, 0.3f);
+        check(p.step == 0, "a long frame holds");
+        pix_sprite_update(p, a, 0.25f);
+        check(p.step == 1, "and then moves on");
+
+        p.speed = 2.0f;
+        pix_sprite_update(p, a, 0.05f);
+        check(p.step == 2, "speed scales time");
+        p.paused = true;
+        pix_sprite_update(p, a, 5.0f);
+        check(p.step == 2 && p.entered == 0, "paused holds still");
+        a.texture.id = 0;                                            // nothing to free on the GPU
+        pix_unload_atlas(a);
+    }
+
+    // ---- tilemaps (no GL until drawn) ----
+    {
+        pix_texture fake = { 1, 256, 256 };
+        pix_rect cells[256];
+        pix_atlas tiles = pix_create_atlas(fake, cells, pix_rects_grid(cells, 256, 256, 256, 16, 16));   // 256 tiles
+        pix_tilemap m = pix_create_tilemap(40, 30, 16, 16, tiles);
+        int ground = pix_tilemap_add_layer(m, "ground");
+        check(m.width == 40 && ground == 0 && pix_tilemap_find_layer(m, "ground") == 0, "tilemap and layer");
+        pix_tilemap_set(m, ground, 3, 4, 7, PIX_TILE_FLIP_X);
+        check(pix_tilemap_get(m, ground, 3, 4) == 7, "set / get");
+        check((m.layers[0].cells[4 * 40 + 3] & PIX_TILE_FLIP_X) != 0, "flip flag stored with the tile");
+        check(pix_tilemap_get(m, ground, -1, 0) == -1 && pix_tilemap_get(m, ground, 3, 5) == -1, "outside and empty read -1");
+        pix_tilemap_fill(m, ground, 0, 0, 5, 2, 1);
+        check(pix_tilemap_get(m, ground, 4, 1) == 1 && pix_tilemap_get(m, ground, 5, 1) == -1, "fill");
+        pix_tilemap_set(m, ground, 0, 0, -1);
+        check(pix_tilemap_get(m, ground, 0, 0) == -1, "set -1 clears");
+        int tx, ty;
+        check(pix_tilemap_tile_at(m, v2(33.0f, 70.0f), &tx, &ty) && tx == 2 && ty == 4, "world point to cell");
+        check(!pix_tilemap_tile_at(m, v2(-1.0f, 5.0f), &tx, &ty), "outside the map");
+        pix_rect tr = pix_tilemap_tile_rect(m, 2, 4);
+        check(tr.x == 32 && tr.y == 64 && tr.w == 16, "cell to world rect");
+
+        uint8_t masks[256];
+        check(pix_autotile_masks(PIX_AUTOTILE_47, masks) == 47 && pix_autotile_masks(PIX_AUTOTILE_16, masks) == 16,
+              "47 blob arrangements, 16 edge arrangements");
+        pix_autotile blob = pix_autotile_make(PIX_AUTOTILE_47, 100);
+        check(blob.table[0] == 100 && blob.table[255] == 146, "blob: alone is the first tile, surrounded the last");
+        check(blob.table[2] == 100, "a lone corner without its edges does not count");
+
+        int deco = pix_tilemap_add_layer(m, "deco");
+        pix_tilemap_set_terrain(m, 1, pix_autotile_make(PIX_AUTOTILE_16, 0));
+        pix_tilemap_paint(m, deco, 10, 10, 1);
+        check(pix_tilemap_get(m, deco, 10, 10) == 0, "a lone painted cell: no neighbours");
+        pix_tilemap_paint(m, deco, 11, 10, 1);
+        check(pix_tilemap_get(m, deco, 10, 10) == 2 && pix_tilemap_get(m, deco, 11, 10) == 8,
+              "painting a neighbour re-tiles both (E = 2, W = 8)");
+        pix_tilemap_paint(m, deco, 11, 10, 0);
+        check(pix_tilemap_get(m, deco, 11, 10) == -1 && pix_tilemap_get(m, deco, 10, 10) == 0, "erasing re-tiles too");
+
+        pix_tilemap_set_terrain(m, 2, blob);
+        for (int y = 20; y < 23; y++) for (int x = 20; x < 23; x++) pix_tilemap_paint(m, deco, x, y, 2);
+        check(pix_tilemap_get(m, deco, 21, 21) == 146, "blob centre is the full tile");
+        int corner = -1;                                          // E, SE, S = 4 | 8 | 16 = 28
+        pix_autotile_masks(PIX_AUTOTILE_47, masks);
+        for (int i = 0; i < 47; i++) if (masks[i] == 28) corner = 100 + i;
+        check(pix_tilemap_get(m, deco, 20, 20) == corner, "blob top-left corner");
+        check(pix_tilemap_terrain(m, deco, 22, 22) == 2, "terrain is kept per cell");
+        check(m.layers[1].chunk_dirty[0], "edits mark their chunk for upload");
+        pix_unload_tilemap(m);
+    }
+
+    // ---- math: fast approximations, worst error over their ranges ----
+    {
+        float e_quake = 0, e_rsqrt = 0, e_sin = 0, e_sin_far = 0, e_atan = 0, e_atan2 = 0;
+        const int N = 400000;
+        for (int i = 0; i < N; i++) {
+            float u = (float)i / (float)(N - 1);
+            float x = expf(-40.0f + 80.0f * u);                         // 4e-18 .. 2e17
+            float exact = 1.0f / sqrtf(x);
+            e_quake = maxf(e_quake, fabsf(fast_inv_sqrt(x) - exact) / exact);
+            e_rsqrt = maxf(e_rsqrt, fabsf(fast_rsqrt(x) - exact) / exact);
+            float a = -PIX_TAU + 2.0f * PIX_TAU * u;
+            e_sin   = maxf(e_sin, fabsf(fast_sin(a) - sinf(a)));
+            float wide = -1000.0f + 2000.0f * u;
+            e_sin_far = maxf(e_sin_far, fabsf(fast_sin(wide) - sinf(wide)));
+            float z = -100.0f + 200.0f * u;
+            e_atan  = maxf(e_atan, fabsf(fast_atan(z) - atanf(z)));
+            float ang = -PIX_PI + 2.0f * PIX_PI * u, rad = 0.001f + 1000.0f * u;
+            e_atan2 = maxf(e_atan2, fabsf(fast_atan2(sinf(ang) * rad, cosf(ang) * rad) - atan2f(sinf(ang) * rad, cosf(ang) * rad)));
+        }
+        printf("info  fast math worst error: inv_sqrt %.2e  rsqrt %.2e  sin %.2e (|x|<1000: %.2e)  atan %.2e  atan2 %.2e\n",
+               e_quake, e_rsqrt, e_sin, e_sin_far, e_atan, e_atan2);
+        check(e_quake < 1.8e-3f, "fast_inv_sqrt relative error under 0.18%");
+        check(e_rsqrt < 5e-7f,   "fast_rsqrt relative error under 5e-7");
+        check(e_sin < 1e-6f,     "fast_sin error under 1e-6 within a turn");
+        check(e_sin_far < 1e-4f, "fast_sin error under 1e-4 for |x| < 1000");
+        check(e_atan < 2.5e-6f,  "fast_atan error under 2.5e-6");
+        check(e_atan2 < 2.5e-6f, "fast_atan2 error under 2.5e-6");
+        vec3 nv = v3norm_fast(v3(3, 4, 12));
+        near_eq(v3len(nv), 1.0f, 1e-5f, "v3norm_fast gives unit length");
+    }
+
     if (failures == 0) printf("all checks passed\n");
     else               printf("%d check(s) failed\n", failures);
     return failures;

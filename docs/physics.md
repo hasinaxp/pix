@@ -411,14 +411,21 @@ if (collide_sphere_sphere(a, b, &c))
 | `capsule` | `capsule_make(a, b, radius)`, or `capsule_upright(base, height, radius)` for a standing character |
 | `aabb` (axis-aligned box) | `aabb_make(min, max)`, `aabb_from_centre(centre, half_size)` |
 | `plane` | `plane_make(normal, distance)`, `plane_through(normal, point)` |
+| `obb` (a box at any angle) | `obb_make(centre, half_size, rotation_quat)`, or `obb_from_aabb(model_bounds, transform)` to carry a mesh's bounds through its transform |
+| triangle | just three `vec3` corners. The front is the side they run counter-clockwise from. |
 
 Overlap tests (each returns `bool` and fills a `contact3*`). The contact
 pointer must not be null. Pass a local `contact3` even when you only need yes
 or no:
 
 `collide_sphere_sphere`, `collide_sphere_plane`, `collide_sphere_aabb`,
-`collide_sphere_capsule`, `collide_capsule_capsule`, `collide_capsule_plane`,
-`collide_capsule_aabb`, and `aabb_overlap(a, b)` (yes or no only).
+`collide_sphere_capsule`, `collide_sphere_obb`, `collide_sphere_triangle`,
+`collide_capsule_capsule`, `collide_capsule_plane`, `collide_capsule_aabb`,
+`collide_obb_obb`, and `aabb_overlap(a, b)` (yes or no only).
+
+`obb_bounds(box)` gives the axis-aligned box around an `obb`, for quick
+rejection before the exact test. `obb_to_local(box, p)` puts a point into the
+box's own frame.
 
 Ray tests (direction must be **normalised**, distance written to `*out_t`):
 
@@ -429,14 +436,39 @@ ray_vs_capsule(origin, dir, c, max_distance, &t);
 ray_vs_plane(origin, dir, p, max_distance, /*two_sided*/ false, &t);
 vec3 inv = v3(1 / dir.x, 1 / dir.y, 1 / dir.z);     // ray_vs_aabb takes 1/direction
 ray_vs_aabb(origin, inv, box, max_distance, &t);
+ray_vs_obb(origin, dir, rotated_box, max_distance, &t);
+vec3 bary;
+ray_vs_triangle(origin, dir, a, b, c, max_distance, /*two_sided*/ false, &t, &bary);
 ```
 
-A one-sided `ray_vs_plane` only hits the front of the plane (the side the
-normal points to). A ray coming from below a floor passes through it.
+A one-sided `ray_vs_plane` or `ray_vs_triangle` only hits the front, the
+side the normal points to. A ray coming from below a floor passes through it.
 
 Closest points: `closest_point_segment(a, b, p)`, `closest_point_aabb(box, p)`,
+`closest_point_obb(box, p)`, `closest_point_triangle(p, a, b, c)`,
 `closest_point_plane(plane, p)`, and `plane_distance_to(plane, p)` (signed:
 positive in front).
+
+### Triangles and barycentric coordinates
+
+Barycentric coordinates say where a point sits inside a triangle, as three
+weights that add up to 1, one per corner. Use them to read anything stored
+per vertex at an exact point: a UV under the mouse, a terrain height, a
+blended normal.
+
+```cpp
+float t; vec3 w;
+if (ray_vs_triangle(cam_pos, ray, a, b, c, 1000.0f, false, &t, &w)) {
+    vec2 uv = v2(a_uv.x * w.x + b_uv.x * w.y + c_uv.x * w.z,
+                 a_uv.y * w.x + b_uv.y * w.y + c_uv.y * w.z);    // the texel under the mouse
+}
+vec3 w2 = barycentric(p, a, b, c);         // for a point you already have; all three in 0..1 = inside
+vec3 n  = triangle_normal(a, b, c);
+```
+
+`collide_sphere_triangle` lets a ball or character roll over arbitrary mesh
+geometry. Test it against the triangles near the sphere and push the sphere
+out along each contact.
 
 A trigger zone, for example a door that opens when the player is near:
 

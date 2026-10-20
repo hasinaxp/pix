@@ -513,6 +513,9 @@ pix_effect_params(crt, v4(0.8f, 0.1f, 0, 0));
 | `PIX_EFFECT_OUTLINE` | cartoon ink lines. x: thickness in pixels, y: sensitivity (0.05), z: darkness 0..1 |
 | `PIX_EFFECT_DEPTH_BLUR` | blur away from a focus distance. x: focus distance, y: focus range, z: maximum blur in pixels |
 
+The same effects work in 2D games; see
+[Screen effects in 2D](2d-rendering.md#screen-effects-in-2d).
+
 Up to 8 effects can be added. You can also write your own as a short GLSL
 `main()` function:
 

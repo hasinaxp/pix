@@ -8,6 +8,7 @@
 #include "../core/math.hpp"
 #include "asset_types.hpp"
 #include "png_loader.hpp"
+#include "json.hpp"
 
 // Minimal glTF 2.0 reader: .glb (binary) and .gltf with an external .bin,
 // covering skinned meshes, skeletons and skeletal animation. Includes its own
@@ -80,152 +81,6 @@ PIXDEF int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* o
 #if defined(PIX_IMPLEMENTATION) && !defined(PIX_GLTF_LOADER_IMPL)
 #define PIX_GLTF_LOADER_IMPL
 
-// ---------------- json ----------------
-
-enum { JS_OBJ = 1, JS_ARR, JS_STR, JS_NUM, JS_BOOL, JS_NULL };
-
-struct js_tok {
-    uint8_t type;
-    int32_t start;  // for strings, the first char inside the quotes
-    int32_t end;    // exclusive
-    int32_t count;  // OBJ: member pairs, ARR: elements
-    int32_t next;   // token index just past this whole subtree
-};
-
-struct js_doc {
-    const char* text;  // NUL terminated
-    js_tok* toks;
-    int count;
-    int cap;
-};
-
-static void js__ws(const char* s, int* p) {
-    while (s[*p] == ' ' || s[*p] == '\t' || s[*p] == '\n' || s[*p] == '\r') (*p)++;
-}
-
-static int js__push(js_doc* d, uint8_t type, int start) {
-    if (d->count >= d->cap) return -1;
-    int i = d->count++;
-    js_tok* t = &d->toks[i];
-    t->type = type; t->start = start; t->end = start; t->count = 0; t->next = 0;
-    return i;
-}
-
-// recursive descent; tokens land in document order so `next` can be filled on the way out
-static int js__value(js_doc* d, int* p) {
-    const char* s = d->text;
-    js__ws(s, p);
-    char c = s[*p];
-    int me;
-
-    if (c == '{') {
-        me = js__push(d, JS_OBJ, *p);
-        if (me < 0) return -1;
-        (*p)++;
-        js__ws(s, p);
-        if (s[*p] == '}') (*p)++;
-        else for (;;) {
-            js__ws(s, p);
-            if (s[*p] != '"' || js__value(d, p) < 0) return -1; // key
-            js__ws(s, p);
-            if (s[*p] != ':') return -1;
-            (*p)++;
-            if (js__value(d, p) < 0) return -1;                 // value
-            d->toks[me].count++;
-            js__ws(s, p);
-            if (s[*p] == ',') { (*p)++; continue; }
-            if (s[*p] == '}') { (*p)++; break; }
-            return -1;
-        }
-    } else if (c == '[') {
-        me = js__push(d, JS_ARR, *p);
-        if (me < 0) return -1;
-        (*p)++;
-        js__ws(s, p);
-        if (s[*p] == ']') (*p)++;
-        else for (;;) {
-            if (js__value(d, p) < 0) return -1;
-            d->toks[me].count++;
-            js__ws(s, p);
-            if (s[*p] == ',') { (*p)++; continue; }
-            if (s[*p] == ']') { (*p)++; break; }
-            return -1;
-        }
-    } else if (c == '"') {
-        (*p)++;
-        int st = *p;
-        while (s[*p] && s[*p] != '"') { if (s[*p] == '\\') (*p)++; (*p)++; }
-        me = js__push(d, JS_STR, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-        if (s[*p] == '"') (*p)++;
-    } else if (c == 't' || c == 'f' || c == 'n') {
-        int st = *p;
-        while (s[*p] >= 'a' && s[*p] <= 'z') (*p)++;
-        me = js__push(d, c == 'n' ? JS_NULL : JS_BOOL, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-    } else {
-        int st = *p;
-        while (s[*p] && (s[*p] == '-' || s[*p] == '+' || s[*p] == '.' ||
-                         s[*p] == 'e' || s[*p] == 'E' || (s[*p] >= '0' && s[*p] <= '9'))) (*p)++;
-        if (*p == st) return -1;
-        me = js__push(d, JS_NUM, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-    }
-
-    d->toks[me].next = d->count;
-    return me;
-}
-
-static bool js_is(const js_doc& d, int tok, const char* lit) {
-    if (tok < 0 || d.toks[tok].type != JS_STR) return false;
-    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
-    return strlen(lit) == n && memcmp(d.text + d.toks[tok].start, lit, n) == 0;
-}
-
-static int js_get(const js_doc& d, int obj, const char* key) {
-    if (obj < 0 || d.toks[obj].type != JS_OBJ) return -1;
-    int k = obj + 1;
-    for (int i = 0; i < d.toks[obj].count; i++) {
-        int v = d.toks[k].next;
-        if (js_is(d, k, key)) return v;
-        k = d.toks[v].next;
-    }
-    return -1;
-}
-
-static int js_len(const js_doc& d, int arr) {
-    return (arr >= 0 && d.toks[arr].type == JS_ARR) ? d.toks[arr].count : 0;
-}
-
-static int js_at(const js_doc& d, int arr, int i) {
-    if (arr < 0 || d.toks[arr].type != JS_ARR || i < 0 || i >= d.toks[arr].count) return -1;
-    int e = arr + 1;
-    while (i-- > 0) e = d.toks[e].next;
-    return e;
-}
-
-static float js_float(const js_doc& d, int tok, float def) {
-    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
-    return strtof(d.text + d.toks[tok].start, 0);
-}
-
-static int js_int(const js_doc& d, int tok, int def) {
-    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
-    return (int)strtol(d.text + d.toks[tok].start, 0, 10);
-}
-
-static void js_str(const js_doc& d, int tok, char* out, size_t cap) {
-    out[0] = 0;
-    if (tok < 0 || d.toks[tok].type != JS_STR || cap == 0) return;
-    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, d.text + d.toks[tok].start, n);
-    out[n] = 0;
-}
-
 // ---------------- container ----------------
 
 struct gltf_file {
@@ -289,6 +144,8 @@ static bool gltf__open(mem_arena& arena, const char* path, gltf_file* g) {
 
     g->json.text = json_text;
     g->json.cap  = (int)(json_len / 3) + 64;      // ~3.5 chars per token in practice
+    g->json.count = 0;
+    g->json.owns = false;                         // tokens live in the arena
     g->json.toks = allocate<js_tok>(arena, (size_t)g->json.cap);
     if (!g->json.toks) return false;
     int pos = 0;

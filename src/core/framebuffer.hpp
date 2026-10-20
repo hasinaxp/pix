@@ -28,6 +28,10 @@ struct framebuffer {
     int width;
     int height;
     bool hdr;
+    // Rows stored top first, so the colour texture reads upright like any
+    // image: 2D canvases (pix_create_canvas). 3D targets keep GL's bottom-up
+    // rows; pix_draw_target flips those.
+    bool top_down;
 };
 
 // `hdr` picks a packed float format (R11G11B10F: HDR range at half the memory

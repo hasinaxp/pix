@@ -532,6 +532,471 @@ static inline float mat4_max_scale(const mat4& m) {
     return sqrtf(s > sz ? s : sz);
 }
 
+// ---------------- more scalar helpers ----------------
+
+static inline float saturatef(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
+// -1, 0 or +1
+static inline float signf(float x) { return x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f); }
+// where `x` sits between a and b as 0..1 (unclamped): the inverse of lerpf
+static inline float inverse_lerpf(float a, float b, float x) { return b != a ? (x - a) / (b - a) : 0.0f; }
+// maps x from the range a0..a1 onto b0..b1 (unclamped), e.g. a health value onto a bar width
+static inline float remapf(float x, float a0, float a1, float b0, float b1) {
+    return lerpf(b0, b1, inverse_lerpf(a0, a1, x));
+}
+// the part after the decimal point, always 0..1, also for negatives: fractf(-0.25f) == 0.75f
+static inline float fractf(float x) { return x - floorf(x); }
+// wraps x into lo..hi (hi excluded): looping timers, angles, tiled worlds
+static inline float wrapf(float x, float lo, float hi) {
+    float w = hi - lo;
+    return w > 0.0f ? x - w * floorf((x - lo) / w) : lo;
+}
+// equal within `eps` near zero, and within a relative `eps` for large values,
+// where a fixed tolerance would be too strict
+static inline bool approx_equalf(float a, float b, float eps = 1e-5f) {
+    float d = fabsf(a - b);
+    if (d <= eps) return true;
+    float m = fabsf(a) > fabsf(b) ? fabsf(a) : fabsf(b);
+    return d <= eps * m;
+}
+
+// ---------------- more vector helpers ----------------
+
+// v bounced off a surface with unit normal n (a ball off a wall, a ray off a mirror)
+static inline vec3 v3reflect(vec3 v, vec3 n) { return v3sub(v, v3scale(n, 2.0f * v3dot(v, n))); }
+static inline vec2 v2reflect(vec2 v, vec2 n) { return v2sub(v, v2scale(n, 2.0f * v2dot(v, n))); }
+// the part of v along `onto` (which need not be unit length; zero gives zero)
+static inline vec3 v3project(vec3 v, vec3 onto) {
+    float d = v3dot(onto, onto);
+    return d > 1e-12f ? v3scale(onto, v3dot(v, onto) / d) : v3(0.0f, 0.0f, 0.0f);
+}
+static inline vec2 v2project(vec2 v, vec2 onto) {
+    float d = v2dot(onto, onto);
+    return d > 1e-12f ? v2scale(onto, v2dot(v, onto) / d) : v2(0.0f, 0.0f);
+}
+// the part of v across `onto`: what is left of a velocity after removing the
+// part going into a wall
+static inline vec3 v3reject(vec3 v, vec3 onto) { return v3sub(v, v3project(v, onto)); }
+static inline vec2 v2reject(vec2 v, vec2 onto) { return v2sub(v, v2project(v, onto)); }
+static inline bool v3approx_equal(vec3 a, vec3 b, float eps = 1e-5f) {
+    return approx_equalf(a.x, b.x, eps) && approx_equalf(a.y, b.y, eps) && approx_equalf(a.z, b.z, eps);
+}
+
+// ---------------- more quaternion conversions ----------------
+
+// the rotation in a matrix, with any scale divided out
+static inline quat quat_from_mat4(const mat4& m) {
+    vec3 t, s;
+    quat q;
+    mat4_decompose(m, &t, &q, &s);
+    return q;
+}
+
+// The inverse of quat_from_euler, in the same order (yaw about +Y, then pitch
+// about +X, then roll about +Z), radians. Pitch comes back in -pi/2..pi/2.
+// Looking straight up or down, yaw and roll turn about the same axis and
+// cannot be told apart: roll is reported as 0 and the whole turn as yaw.
+static inline void quat_to_euler(quat q, float* pitch, float* yaw, float* roll) {
+    mat4 m = mat4_from_quat(quat_norm(q));
+    // R = Ry * Rx * Rz; with M[row][col] = m.data[col * 4 + row]:
+    //   M12 = -sin(pitch), M02 / M22 give yaw, M10 / M11 give roll
+    float sp = clampf(-m.data[9], -1.0f, 1.0f);
+    *pitch = asinf(sp);
+    if (fabsf(sp) < 0.99999f) {
+        *yaw  = atan2f(m.data[8], m.data[10]);
+        *roll = atan2f(m.data[1], m.data[5]);
+    } else {
+        *yaw  = atan2f(-m.data[2], m.data[0]);
+        *roll = 0.0f;
+    }
+}
+
+// the axis (unit) and angle (radians, 0..pi) of a rotation; the identity gives axis +X, angle 0
+static inline void quat_to_axis_angle(quat q, vec3* axis, float* radians) {
+    q = quat_norm(q);
+    if (q.w < 0.0f) { q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w; }   // the short way round
+    float s = sqrtf(maxf(1.0f - q.w * q.w, 0.0f));
+    *radians = 2.0f * acosf(clampf(q.w, -1.0f, 1.0f));
+    *axis = s > 1e-6f ? v3(q.x / s, q.y / s, q.z / s) : v3(1.0f, 0.0f, 0.0f);
+}
+
+// ---------------- 3x3 matrices ----------------
+//
+// Rotation and scale without translation: transforming normals, oriented
+// box axes, inertia. Column-major like mat4: data[col * 3 + row].
+
+struct mat3 { float data[9]; };
+
+static inline mat3 mat3_identity() {
+    mat3 m = {};
+    m.data[0] = m.data[4] = m.data[8] = 1.0f;
+    return m;
+}
+// from three columns, e.g. a basis: right, up, back
+static inline mat3 mat3_from_cols(vec3 x, vec3 y, vec3 z) {
+    mat3 m = { { x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z } };
+    return m;
+}
+static inline vec3 mat3_col(const mat3& m, int i) { return v3(m.data[i * 3], m.data[i * 3 + 1], m.data[i * 3 + 2]); }
+static inline mat3 mat3_mul(const mat3& a, const mat3& b) {
+    mat3 r;
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++)
+            r.data[c * 3 + row] = a.data[row] * b.data[c * 3] + a.data[3 + row] * b.data[c * 3 + 1]
+                                + a.data[6 + row] * b.data[c * 3 + 2];
+    return r;
+}
+static inline vec3 mat3_mul_vec3(const mat3& m, vec3 v) {
+    return v3(m.data[0] * v.x + m.data[3] * v.y + m.data[6] * v.z,
+              m.data[1] * v.x + m.data[4] * v.y + m.data[7] * v.z,
+              m.data[2] * v.x + m.data[5] * v.y + m.data[8] * v.z);
+}
+static inline mat3 mat3_transpose(const mat3& m) {
+    mat3 r;
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++) r.data[row * 3 + c] = m.data[c * 3 + row];
+    return r;
+}
+static inline float mat3_determinant(const mat3& m) {
+    return v3dot(mat3_col(m, 0), v3cross(mat3_col(m, 1), mat3_col(m, 2)));
+}
+// the identity when the matrix cannot be inverted (a zero scale squashed it flat)
+static inline mat3 mat3_inverse(const mat3& m) {
+    vec3 a = mat3_col(m, 0), b = mat3_col(m, 1), c = mat3_col(m, 2);
+    vec3 r0 = v3cross(b, c), r1 = v3cross(c, a), r2 = v3cross(a, b);
+    float det = v3dot(a, r0);
+    if (fabsf(det) < 1e-12f) return mat3_identity();
+    float k = 1.0f / det;
+    // the rows of the inverse are the cross products above
+    mat3 r = { { r0.x * k, r1.x * k, r2.x * k, r0.y * k, r1.y * k, r2.y * k, r0.z * k, r1.z * k, r2.z * k } };
+    return r;
+}
+static inline mat3 mat3_scale(float x, float y, float z) {
+    mat3 m = {};
+    m.data[0] = x; m.data[4] = y; m.data[8] = z;
+    return m;
+}
+// the rotation and scale part of a mat4 (its upper-left 3x3)
+static inline mat3 mat3_from_mat4(const mat4& m) {
+    mat3 r = { { m.data[0], m.data[1], m.data[2], m.data[4], m.data[5], m.data[6], m.data[8], m.data[9], m.data[10] } };
+    return r;
+}
+static inline mat4 mat4_from_mat3(const mat3& m) {
+    mat4 r = mat4_identity();
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++) r.data[c * 4 + row] = m.data[c * 3 + row];
+    return r;
+}
+static inline mat3 mat3_from_quat(quat q) { return mat3_from_mat4(mat4_from_quat(q)); }
+static inline mat3 mat3_rotate(vec3 axis, float radians) { return mat3_from_quat(quat_from_axis_angle(axis, radians)); }
+// What transforms normals correctly through `model` even when it scales
+// unevenly (a squashed sphere): the inverse transpose of its 3x3 part.
+static inline mat3 mat3_normal_matrix(const mat4& model) { return mat3_transpose(mat3_inverse(mat3_from_mat4(model))); }
+
+// ---------------- colour ----------------
+//
+// pix_color, and every colour you pick in an image editor, is sRGB: its steps
+// are spaced for the eye, not for light. Lighting and blending maths wants
+// linear values, where twice the number is twice the light. These convert
+// both ways; HSV and HSL are friendlier ways to pick or animate a colour.
+
+static inline float pix_srgb_to_linear(float c) {
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+static inline float pix_linear_to_srgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+// rgb in linear light 0..1, alpha unchanged (alpha is never gamma encoded)
+static inline vec4 pix_color_to_linear(pix_color c) {
+    return v4(pix_srgb_to_linear(c.r / 255.0f), pix_srgb_to_linear(c.g / 255.0f),
+              pix_srgb_to_linear(c.b / 255.0f), c.a / 255.0f);
+}
+static inline pix_color pix_color_from_linear(vec4 c) {
+    return pix_rgba((int)(saturatef(pix_linear_to_srgb(c.x)) * 255.0f + 0.5f),
+                    (int)(saturatef(pix_linear_to_srgb(c.y)) * 255.0f + 0.5f),
+                    (int)(saturatef(pix_linear_to_srgb(c.z)) * 255.0f + 0.5f),
+                    (int)(saturatef(c.w) * 255.0f + 0.5f));
+}
+
+// Hue in degrees (0 red, 120 green, 240 blue, wrapping), saturation and value
+// 0..1. Sweeping the hue walks the rainbow; value 0 is black.
+static inline pix_color pix_hsv(float hue, float saturation, float value, float alpha = 1.0f) {
+    float h = wrapf(hue, 0.0f, 360.0f) / 60.0f;
+    float s = saturatef(saturation), v = saturatef(value);
+    float c = v * s, x = c * (1.0f - fabsf(fmodf(h, 2.0f) - 1.0f)), m = v - c;
+    float r = 0, g = 0, b = 0;
+    switch ((int)h) {
+        case 0:  r = c; g = x; break;
+        case 1:  r = x; g = c; break;
+        case 2:  g = c; b = x; break;
+        case 3:  g = x; b = c; break;
+        case 4:  r = x; b = c; break;
+        default: r = c; b = x; break;
+    }
+    return pix_rgba((int)((r + m) * 255.0f + 0.5f), (int)((g + m) * 255.0f + 0.5f),
+                    (int)((b + m) * 255.0f + 0.5f), (int)(saturatef(alpha) * 255.0f + 0.5f));
+}
+// x hue in degrees, y saturation, z value, w alpha
+static inline vec4 pix_color_to_hsv(pix_color c) {
+    float r = c.r / 255.0f, g = c.g / 255.0f, b = c.b / 255.0f;
+    float mx = maxf(r, maxf(g, b)), mn = minf(r, minf(g, b)), d = mx - mn;
+    float h = 0.0f;
+    if (d > 0.0f) {
+        if (mx == r)      h = 60.0f * fmodf((g - b) / d, 6.0f);
+        else if (mx == g) h = 60.0f * ((b - r) / d + 2.0f);
+        else              h = 60.0f * ((r - g) / d + 4.0f);
+        if (h < 0.0f) h += 360.0f;
+    }
+    return v4(h, mx > 0.0f ? d / mx : 0.0f, mx, c.a / 255.0f);
+}
+// Hue in degrees, saturation and lightness 0..1. Lightness 0.5 is the pure
+// colour, 0 black, 1 white - easier than HSV for "a lighter shade of this".
+static inline pix_color pix_hsl(float hue, float saturation, float lightness, float alpha = 1.0f) {
+    float l = saturatef(lightness), s = saturatef(saturation);
+    float v = l + s * minf(l, 1.0f - l);
+    return pix_hsv(hue, v > 0.0f ? 2.0f * (1.0f - l / v) : 0.0f, v, alpha);
+}
+// x hue in degrees, y saturation, z lightness, w alpha
+static inline vec4 pix_color_to_hsl(pix_color c) {
+    vec4 hsv = pix_color_to_hsv(c);
+    float l = hsv.z * (1.0f - hsv.y * 0.5f);
+    float m = minf(l, 1.0f - l);
+    return v4(hsv.x, m > 0.0f ? (hsv.z - l) / m : 0.0f, l, hsv.w);
+}
+
+// ---------------- curves ----------------
+//
+// Each works on float, vec2 and vec3, with t running 0..1.
+
+// Cubic Hermite: from p0 to p1, leaving p0 along tangent m0 and arriving at p1
+// along m1. The building block of smooth keyframe animation.
+static inline float hermite(float p0, float m0, float p1, float m1, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * p0 + (t3 - 2.0f * t2 + t) * m0
+         + (-2.0f * t3 + 3.0f * t2) * p1 + (t3 - t2) * m1;
+}
+// Catmull-Rom: a smooth curve through p1 (t = 0) and p2 (t = 1), shaped by the
+// points either side. Step along a list of points four at a time and the path
+// passes through every one of them - camera rails, patrol routes.
+static inline float catmull_rom(float p0, float p1, float p2, float p3, float t) {
+    return hermite(p1, 0.5f * (p2 - p0), p2, 0.5f * (p3 - p1), t);
+}
+// Bezier: starts at the first point, ends at the last, pulled toward the ones
+// between without passing through them - the curves of drawing programs.
+static inline float bezier_quadratic(float p0, float p1, float p2, float t) {
+    float u = 1.0f - t;
+    return u * u * p0 + 2.0f * u * t * p1 + t * t * p2;
+}
+static inline float bezier_cubic(float p0, float p1, float p2, float p3, float t) {
+    float u = 1.0f - t;
+    return u * u * u * p0 + 3.0f * u * u * t * p1 + 3.0f * u * t * t * p2 + t * t * t * p3;
+}
+// the direction a cubic Bezier is heading at t (not normalised): to face along the path
+static inline float bezier_cubic_tangent(float p0, float p1, float p2, float p3, float t) {
+    float u = 1.0f - t;
+    return 3.0f * u * u * (p1 - p0) + 6.0f * u * t * (p2 - p1) + 3.0f * t * t * (p3 - p2);
+}
+
+// the vec2 / vec3 versions apply the float one to each component
+#define PIX__CURVE3(name)                                                                     \
+    static inline vec2 name(vec2 a, vec2 b, vec2 c, float t) {                                \
+        return v2(name(a.x, b.x, c.x, t), name(a.y, b.y, c.y, t)); }                          \
+    static inline vec3 name(vec3 a, vec3 b, vec3 c, float t) {                                \
+        return v3(name(a.x, b.x, c.x, t), name(a.y, b.y, c.y, t), name(a.z, b.z, c.z, t)); }
+#define PIX__CURVE4(name)                                                                     \
+    static inline vec2 name(vec2 a, vec2 b, vec2 c, vec2 d, float t) {                        \
+        return v2(name(a.x, b.x, c.x, d.x, t), name(a.y, b.y, c.y, d.y, t)); }                \
+    static inline vec3 name(vec3 a, vec3 b, vec3 c, vec3 d, float t) {                        \
+        return v3(name(a.x, b.x, c.x, d.x, t), name(a.y, b.y, c.y, d.y, t),                   \
+                  name(a.z, b.z, c.z, d.z, t)); }
+PIX__CURVE4(hermite)
+PIX__CURVE4(catmull_rom)
+PIX__CURVE3(bezier_quadratic)
+PIX__CURVE4(bezier_cubic)
+PIX__CURVE4(bezier_cubic_tangent)
+#undef PIX__CURVE3
+#undef PIX__CURVE4
+
+// ---------------- easing ----------------
+//
+// Shapes for animating a value over time: feed in t from 0 to 1, get back a
+// reshaped 0 to 1 to lerp with. "in" starts slow, "out" ends slow, "in_out"
+// does both. back overshoots a little, elastic springs, bounce bounces.
+//   float t = ease_out_back(clampf(timer / duration, 0, 1));
+//   button_scale = lerpf(0.5f, 1.0f, t);
+
+static inline float ease_in_quad(float t)      { return t * t; }
+static inline float ease_out_quad(float t)     { return t * (2.0f - t); }
+static inline float ease_in_out_quad(float t)  { return t < 0.5f ? 2.0f * t * t : 1.0f - 2.0f * (1.0f - t) * (1.0f - t); }
+static inline float ease_in_cubic(float t)     { return t * t * t; }
+static inline float ease_out_cubic(float t)    { float u = 1.0f - t; return 1.0f - u * u * u; }
+static inline float ease_in_out_cubic(float t) {
+    float u = 1.0f - t;
+    return t < 0.5f ? 4.0f * t * t * t : 1.0f - 4.0f * u * u * u;
+}
+static inline float ease_in_quart(float t)     { return t * t * t * t; }
+static inline float ease_out_quart(float t)    { float u = 1.0f - t; return 1.0f - u * u * u * u; }
+static inline float ease_in_out_quart(float t) {
+    float u = 1.0f - t;
+    return t < 0.5f ? 8.0f * t * t * t * t : 1.0f - 8.0f * u * u * u * u;
+}
+static inline float ease_in_sine(float t)      { return 1.0f - cosf(t * PIX_PI * 0.5f); }
+static inline float ease_out_sine(float t)     { return sinf(t * PIX_PI * 0.5f); }
+static inline float ease_in_out_sine(float t)  { return 0.5f - 0.5f * cosf(t * PIX_PI); }
+static inline float ease_in_expo(float t)      { return t <= 0.0f ? 0.0f : powf(2.0f, 10.0f * t - 10.0f); }
+static inline float ease_out_expo(float t)     { return t >= 1.0f ? 1.0f : 1.0f - powf(2.0f, -10.0f * t); }
+static inline float ease_in_out_expo(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t < 0.5f ? 0.5f * powf(2.0f, 20.0f * t - 10.0f) : 1.0f - 0.5f * powf(2.0f, 10.0f - 20.0f * t);
+}
+static inline float ease_in_circ(float t)      { return 1.0f - sqrtf(maxf(1.0f - t * t, 0.0f)); }
+static inline float ease_out_circ(float t)     { float u = t - 1.0f; return sqrtf(maxf(1.0f - u * u, 0.0f)); }
+static inline float ease_in_out_circ(float t) {
+    return t < 0.5f ? 0.5f * ease_in_circ(2.0f * t) : 0.5f + 0.5f * ease_out_circ(2.0f * t - 1.0f);
+}
+static inline float ease_in_back(float t)      { const float c = 1.70158f; return t * t * ((c + 1.0f) * t - c); }
+static inline float ease_out_back(float t)     { return 1.0f - ease_in_back(1.0f - t); }
+static inline float ease_in_out_back(float t) {
+    const float c = 1.70158f * 1.525f;
+    float u = 2.0f * t;
+    if (t < 0.5f) return 0.5f * u * u * ((c + 1.0f) * u - c);
+    u -= 2.0f;
+    return 0.5f * (u * u * ((c + 1.0f) * u + c) + 2.0f);
+}
+static inline float ease_in_elastic(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return -powf(2.0f, 10.0f * t - 10.0f) * sinf((10.0f * t - 10.75f) * (PIX_TAU / 3.0f));
+}
+static inline float ease_out_elastic(float t)  { return 1.0f - ease_in_elastic(1.0f - t); }
+static inline float ease_in_out_elastic(float t) {
+    return t < 0.5f ? 0.5f * ease_in_elastic(2.0f * t) : 0.5f + 0.5f * ease_out_elastic(2.0f * t - 1.0f);
+}
+static inline float ease_out_bounce(float t) {
+    const float n = 7.5625f, d = 2.75f;
+    if (t < 1.0f / d)   return n * t * t;
+    if (t < 2.0f / d)   { t -= 1.5f / d;   return n * t * t + 0.75f; }
+    if (t < 2.5f / d)   { t -= 2.25f / d;  return n * t * t + 0.9375f; }
+    t -= 2.625f / d;
+    return n * t * t + 0.984375f;
+}
+static inline float ease_in_bounce(float t)    { return 1.0f - ease_out_bounce(1.0f - t); }
+static inline float ease_in_out_bounce(float t) {
+    return t < 0.5f ? 0.5f * ease_in_bounce(2.0f * t) : 0.5f + 0.5f * ease_out_bounce(2.0f * t - 1.0f);
+}
+
+// ---------------- trajectories ----------------
+
+// Where something thrown from p0 with velocity v0 is after t seconds, with
+// constant acceleration `gravity` (e.g. (0, -9.8, 0)).
+static inline vec3 ballistic_position(vec3 p0, vec3 v0, vec3 gravity, float t) {
+    return v3add(v3add(p0, v3scale(v0, t)), v3scale(gravity, 0.5f * t * t));
+}
+// The launch velocity, at `speed`, that lands a projectile thrown from `from`
+// on `to`, with gravity of strength `gravity` (> 0) pulling down -Y. Two arcs
+// reach any target in range: `high` picks the lob, otherwise the flat shot.
+// False when the target is out of reach at that speed.
+static inline bool ballistic_launch(vec3 from, vec3 to, float speed, float gravity, bool high, vec3* out_velocity) {
+    vec3 d = v3sub(to, from);
+    float h = d.y;
+    vec2 flat = v2(d.x, d.z);
+    float x = v2len(flat), v2s = speed * speed;
+    if (gravity <= 0.0f || speed <= 0.0f) return false;
+    if (x < 1e-6f) {                                   // straight up or down
+        if (h > 0.0f && v2s < 2.0f * gravity * h) return false;
+        *out_velocity = v3(0.0f, h >= 0.0f ? speed : -speed, 0.0f);
+        return true;
+    }
+    float disc = v2s * v2s - gravity * (gravity * x * x + 2.0f * h * v2s);
+    if (disc < 0.0f) return false;
+    float root = sqrtf(disc);
+    float tan_a = (v2s + (high ? root : -root)) / (gravity * x);
+    float cos_a = 1.0f / sqrtf(1.0f + tan_a * tan_a), sin_a = tan_a * cos_a;
+    vec2 dir = v2scale(flat, 1.0f / x);
+    *out_velocity = v3(dir.x * cos_a * speed, sin_a * speed, dir.y * cos_a * speed);
+    return true;
+}
+
+// ---------------- fast approximations ----------------
+//
+// Cheaper stand-ins for the C library functions, for code that runs millions
+// of times a frame (particles, noise, per-vertex work) and can trade a little
+// accuracy for speed. The error bound on each is checked by the test suite
+// (tests/build_check.cpp) over the range given.
+//
+// Only the ones that measurably beat the C library are here (MSVC /O2, x64:
+// fast_inv_sqrt 2x, fast_rsqrt 1.2x, fast_sin/cos 2x, fast_atan2 2.7x).
+// sqrtf, 1/x, exp2f, log2f and powf are already as fast or faster than any
+// polynomial stand-in, so use them as they are.
+
+static inline uint32_t pix__float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline float pix__bits_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+// The Quake III inverse square root: the 0x5f3759df bit trick for a first
+// guess, then one Newton-Raphson step. x > 0. Relative error under 0.18%.
+// Kept for what it is; fast_rsqrt below is both faster and closer on any CPU
+// with SSE.
+static inline float fast_inv_sqrt(float x) {
+    float y = pix__bits_float(0x5f3759dfu - (pix__float_bits(x) >> 1));
+    return y * (1.5f - 0.5f * x * y * y);
+}
+// 1 / sqrt(x), x > 0: the CPU's reciprocal square root estimate refined by one
+// Newton step. Relative error under 5e-7 with SSE (fast_inv_sqrt without).
+static inline float fast_rsqrt(float x) {
+#if PIX_MATH_SSE
+    float y = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+    return y * (1.5f - 0.5f * x * y * y);
+#else
+    return fast_inv_sqrt(x);
+#endif
+}
+// normalise through fast_rsqrt; zero stays zero
+static inline vec3 v3norm_fast(vec3 a) {
+    float d = v3dot(a, a);
+    return d > 1e-20f ? v3scale(a, fast_rsqrt(d)) : v3(0.0f, 0.0f, 0.0f);
+}
+static inline vec2 v2norm_fast(vec2 a) {
+    float d = v2dot(a, a);
+    return d > 1e-20f ? v2scale(a, fast_rsqrt(d)) : v2(0.0f, 0.0f);
+}
+
+// Sine and cosine of any angle (radians): folded into -pi/2..pi/2 and
+// evaluated as a 7th-order minimax polynomial. Absolute error under 1e-6 for
+// |x| < 2 pi; larger angles lose float precision in the folding itself (under
+// 1e-4 at |x| < 1000), so keep angles wrapped if you need the accuracy.
+static inline float fast_sin(float x) {
+    x -= PIX_TAU * floorf(x * (1.0f / PIX_TAU) + 0.5f);        // -pi..pi
+    if (x > PIX_PI * 0.5f)       x = PIX_PI - x;               // sin is symmetric about pi/2
+    else if (x < -PIX_PI * 0.5f) x = -PIX_PI - x;
+    float x2 = x * x;
+    // minimax coefficients (Lawson fit on 0..pi/2), not Taylor: the error is
+    // spread evenly instead of piling up at the ends
+    return x * (0.9999966159f + x2 * (-0.1666482836f + x2 * (0.008306324991f + x2 * -0.0001836364733f)));
+}
+static inline float fast_cos(float x) { return fast_sin(x + PIX_PI * 0.5f); }
+
+// atan on 0..1 as an 11th-order odd polynomial; the others fold onto it
+static inline float pix__atan01(float z) {
+    float z2 = z * z;
+    return z * (0.99997726f + z2 * (-0.33262347f + z2 * (0.19354346f + z2 * (-0.11643287f
+           + z2 * (0.05265332f + z2 * -0.01172120f)))));
+}
+// Absolute error under 2.5e-6 radians, any input.
+static inline float fast_atan(float x) {
+    float a = fabsf(x);
+    float r = a > 1.0f ? PIX_PI * 0.5f - pix__atan01(1.0f / a) : pix__atan01(a);
+    return x < 0.0f ? -r : r;
+}
+// Same quadrants and range as atan2f (-pi..pi); 0 for (0, 0). Absolute error under 2.5e-6 radians.
+static inline float fast_atan2(float y, float x) {
+    float ax = fabsf(x), ay = fabsf(y);
+    if (ax == 0.0f && ay == 0.0f) return 0.0f;
+    float r = ay > ax ? PIX_PI * 0.5f - pix__atan01(ax / ay) : pix__atan01(ay / ax);
+    if (x < 0.0f) r = PIX_PI - r;
+    return y < 0.0f ? -r : r;
+}
+
 // ---------------- operators ----------------
 //
 // Plain arithmetic on the plain structs above, so game code can write
@@ -560,6 +1025,8 @@ static inline vec3& operator-=(vec3& a, vec3 b) { a = a - b; return a; }
 static inline vec3& operator*=(vec3& a, float s) { a = a * s; return a; }
 
 static inline mat4  operator*(const mat4& a, const mat4& b) { return mat4_mul(a, b); }
+static inline mat3  operator*(const mat3& a, const mat3& b) { return mat3_mul(a, b); }
+static inline vec3  operator*(const mat3& m, vec3 v)        { return mat3_mul_vec3(m, v); }
 static inline quat  operator*(quat a, quat b)   { return quat_mul(a, b); }
 #endif
 

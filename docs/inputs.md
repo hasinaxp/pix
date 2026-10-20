@@ -117,8 +117,16 @@ if (pix_key_pressed(KEY_ESC)) pix_set_mouse_locked(false);
 ### Clicking on things in a 2D camera view
 
 `pix_mouse_position()` is in screen pixels. If you draw your world through a
-2D camera, convert the mouse into world coordinates first. The
-[2D rendering page](2d-rendering.md#screen-and-world-coordinates) shows how.
+2D camera, ask for the world point under the mouse instead:
+
+```cpp
+vec2 aim = pix_mouse_world_2d(cam);
+if (pix_mouse_pressed(PIX_MOUSE_LEFT)) place_tower(aim);
+```
+
+With [`pix_set_resolution`](2d-rendering.md#fixed-resolution-and-pixel-art),
+the mouse position and delta are already in the game's pixels. The black bars
+lie outside 0..`pix_width()`.
 
 For 3D, `pix_screen_to_ray` turns the mouse position into a ray you can test
 against your objects. See [3D rendering](3d-rendering.md#picking-what-is-under-the-mouse).
@@ -234,7 +242,8 @@ The app-layer functions are thin wrappers over the window's state.
 | `bool pix_key_pressed(int key)` | went down this frame |
 | `bool pix_key_released(int key)` | went up this frame |
 | `bool pix_mouse_down/pressed/released(int button)` | `PIX_MOUSE_LEFT`, `_RIGHT`, `_MIDDLE` |
-| `vec2 pix_mouse_position()` | window pixels, top-left origin |
+| `vec2 pix_mouse_position()` | drawing-area pixels, top-left origin |
+| `vec2 pix_mouse_world_2d(camera)` | the world point under the mouse |
 | `vec2 pix_mouse_delta()` | movement this frame |
 | `int pix_mouse_wheel()` | notches this frame |
 | `void pix_set_mouse_locked(bool)` | hide and centre the cursor for mouse look |

@@ -94,9 +94,8 @@ struct pix_material_uniform {
 };
 
 // material.blend
-#define PIX_BLEND_OPAQUE   0
-#define PIX_BLEND_ALPHA    1   // sorted back to front, classic transparency
-#define PIX_BLEND_ADDITIVE 2   // glows, fire, holograms
+// (PIX_BLEND_* live in dtype.hpp, shared with 2D; blended materials are
+// sorted back to front)
 
 struct material {
     idx shader;          // 0 = the built-in PBR surface; else see load_surface_shader
@@ -745,6 +744,12 @@ PIXDEF void pix_render_view(pix_renderer& renderer, const pix_view& view);
 // the window). Bloom, effects and FXAA run when the source is screen sized;
 // other sizes get the tonemap and grade.
 PIXDEF void pix_post_process(pix_renderer& renderer, const framebuffer& source, const framebuffer* dest);
+// The enabled post effects alone, run over whatever is already drawn in
+// `target` (null = the window) and written back into it: how a 2D frame,
+// which never passes through the tonemap, gets the same screen effects.
+// `target` must be the renderer's size. There is no depth, so depth-driven
+// effects (outline, depth blur) see a flat scene.
+PIXDEF void pix_apply_effects(pix_renderer& renderer, const framebuffer* target);
 // A fullscreen pass with your own shader (from pix_load_fullscreen_shader):
 // `textures` bound to uTex0..uTex3, uParams = params, uTexel = one dest pixel.
 PIXDEF void pix_fullscreen_pass(pix_renderer& renderer, idx program, const idx* textures, int texture_count,
@@ -2462,9 +2467,11 @@ static void pix__bind_material(pix_renderer& r, pix__pass_state& st, idx materia
         // refractive surfaces composite the background themselves: no blending
         int mode = m.refraction > 0.0f ? PIX_BLEND_OPAQUE : m.blend;
         if (st.blend != mode) {
-            if (mode == PIX_BLEND_ADDITIVE)    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            else if (mode == PIX_BLEND_ALPHA)  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            else                               glBlendFunc(GL_ONE, GL_ZERO);
+            if (mode == PIX_BLEND_ADDITIVE)           glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            else if (mode == PIX_BLEND_ALPHA)         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            else if (mode == PIX_BLEND_MULTIPLY)      glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA);
+            else if (mode == PIX_BLEND_PREMULTIPLIED) glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            else                                      glBlendFunc(GL_ONE, GL_ZERO);
             st.blend = mode;
         }
     }
@@ -3176,6 +3183,42 @@ void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer
         pix_draw_fullscreen();
     }
     pix__gpu_end(r, PIX_GPU_POST);
+}
+
+void pix_apply_effects(pix_renderer& r, const framebuffer* target) {
+    pix__sync_settings(r);
+    int effects = pix__enabled_effects(r);
+    if (!effects || !r.ldr_a.fbo) return;
+    // copy the frame so far into the first LDR target, then ping-pong the
+    // chain through the pair, the last effect writing back into `target`
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target ? target->fbo : 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r.ldr_a.fbo);
+    glBlitFramebuffer(0, 0, r.width, r.height, 0, 0, r.width, r.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    framebuffer* ping[2] = { &r.ldr_a, &r.ldr_b };
+    int at = 0, stage = 0;
+    for (int i = 0; i < r.post_effect_count; i++) {
+        const pix_post_effect& e = r.post_effects[i];
+        if (!e.enabled || !e.program) continue;
+        if (++stage == effects) pix__bind_dest(r, target);
+        else                    pix_bind_framebuffer(*ping[at ^ 1]);
+        glUseProgram(e.program);
+        glUniform1i(e.u_scene, 0);
+        glUniform1i(e.u_depth, 1);
+        glUniform2f(e.u_texel, 1.0f / (float)r.width, 1.0f / (float)r.height);
+        glUniform4f(e.u_params, e.params.x, e.params.y, e.params.z, e.params.w);
+        glUniform2f(e.u_near_far, 0.1f, 1000.0f);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, r.white_texture);      // no depth: everything at the far plane
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, ping[at]->color);
+        pix_draw_fullscreen();
+        at ^= 1;
+    }
 }
 
 // ---------------- stage: your own fullscreen pass ----------------

@@ -20,7 +20,7 @@
 //   core/profile.hpp        CPU section profiler
 //   core/colliders.hpp      2D/3D shape tests and contacts
 //   core/physics.hpp        character-scale physics world with broadphase
-//   loader/*                PNG, OBJ, glTF, WAV decoders and the asset tables
+//   loader/*                PNG, OBJ, glTF, WAV decoders, JSON reader, asset tables
 //   core/texture.hpp        textures from files
 //   core/font.hpp           TrueType -> SDF atlas
 //   core/framebuffer.hpp    render targets
@@ -32,7 +32,9 @@
 //   core/renderer.hpp       instanced PBR 3D renderer: shadows, bloom, FXAA
 //   core/sprite.hpp         retained sprite batches
 //   core/text.hpp           retained text
-//   core/draw2d.hpp         immediate 2D: shapes, textures, SDF text
+//   core/draw2d.hpp         immediate 2D: shapes, textures, SDF text, cameras, shake
+//   core/atlas.hpp          sprite atlases, sprite animation, atlas packing
+//   core/tilemap.hpp        tilemaps, Tiled loading, autotiling, parallax layers
 //   core/platform_audio.hpp + core/sound.hpp   mixer and playback
 //   core/app.hpp            pix_init / pix_frame / pix_draw_* - start here
 // No guard of its own on purpose: every module carries an API guard and a
@@ -335,6 +337,14 @@ static const pix_color PIX_YELLOW     = { 253, 219,   0, 255 };
 static const pix_color PIX_ORANGE     = { 255, 161,   0, 255 };
 static const pix_color PIX_PURPLE     = { 160,  90, 220, 255 };
 static const pix_color PIX_SKYBLUE    = { 102, 191, 255, 255 };
+
+// How a colour combines with what is already drawn - for 2D (pix_begin_blend)
+// and for 3D materials (material.blend).
+#define PIX_BLEND_OPAQUE        0   // replaces (3D materials; 2D treats it as ALPHA)
+#define PIX_BLEND_ALPHA         1   // classic transparency, by the colour's alpha
+#define PIX_BLEND_ADDITIVE      2   // adds light: glows, fire, lasers, sparks
+#define PIX_BLEND_MULTIPLY      3   // darkens: shadows, tinted glass, night overlays
+#define PIX_BLEND_PREMULTIPLIED 4   // colour already multiplied by its alpha (canvases drawn back)
 
 // ---------------- logging ----------------
 //
@@ -884,6 +894,471 @@ static inline float mat4_max_scale(const mat4& m) {
     return sqrtf(s > sz ? s : sz);
 }
 
+// ---------------- more scalar helpers ----------------
+
+static inline float saturatef(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
+// -1, 0 or +1
+static inline float signf(float x) { return x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f); }
+// where `x` sits between a and b as 0..1 (unclamped): the inverse of lerpf
+static inline float inverse_lerpf(float a, float b, float x) { return b != a ? (x - a) / (b - a) : 0.0f; }
+// maps x from the range a0..a1 onto b0..b1 (unclamped), e.g. a health value onto a bar width
+static inline float remapf(float x, float a0, float a1, float b0, float b1) {
+    return lerpf(b0, b1, inverse_lerpf(a0, a1, x));
+}
+// the part after the decimal point, always 0..1, also for negatives: fractf(-0.25f) == 0.75f
+static inline float fractf(float x) { return x - floorf(x); }
+// wraps x into lo..hi (hi excluded): looping timers, angles, tiled worlds
+static inline float wrapf(float x, float lo, float hi) {
+    float w = hi - lo;
+    return w > 0.0f ? x - w * floorf((x - lo) / w) : lo;
+}
+// equal within `eps` near zero, and within a relative `eps` for large values,
+// where a fixed tolerance would be too strict
+static inline bool approx_equalf(float a, float b, float eps = 1e-5f) {
+    float d = fabsf(a - b);
+    if (d <= eps) return true;
+    float m = fabsf(a) > fabsf(b) ? fabsf(a) : fabsf(b);
+    return d <= eps * m;
+}
+
+// ---------------- more vector helpers ----------------
+
+// v bounced off a surface with unit normal n (a ball off a wall, a ray off a mirror)
+static inline vec3 v3reflect(vec3 v, vec3 n) { return v3sub(v, v3scale(n, 2.0f * v3dot(v, n))); }
+static inline vec2 v2reflect(vec2 v, vec2 n) { return v2sub(v, v2scale(n, 2.0f * v2dot(v, n))); }
+// the part of v along `onto` (which need not be unit length; zero gives zero)
+static inline vec3 v3project(vec3 v, vec3 onto) {
+    float d = v3dot(onto, onto);
+    return d > 1e-12f ? v3scale(onto, v3dot(v, onto) / d) : v3(0.0f, 0.0f, 0.0f);
+}
+static inline vec2 v2project(vec2 v, vec2 onto) {
+    float d = v2dot(onto, onto);
+    return d > 1e-12f ? v2scale(onto, v2dot(v, onto) / d) : v2(0.0f, 0.0f);
+}
+// the part of v across `onto`: what is left of a velocity after removing the
+// part going into a wall
+static inline vec3 v3reject(vec3 v, vec3 onto) { return v3sub(v, v3project(v, onto)); }
+static inline vec2 v2reject(vec2 v, vec2 onto) { return v2sub(v, v2project(v, onto)); }
+static inline bool v3approx_equal(vec3 a, vec3 b, float eps = 1e-5f) {
+    return approx_equalf(a.x, b.x, eps) && approx_equalf(a.y, b.y, eps) && approx_equalf(a.z, b.z, eps);
+}
+
+// ---------------- more quaternion conversions ----------------
+
+// the rotation in a matrix, with any scale divided out
+static inline quat quat_from_mat4(const mat4& m) {
+    vec3 t, s;
+    quat q;
+    mat4_decompose(m, &t, &q, &s);
+    return q;
+}
+
+// The inverse of quat_from_euler, in the same order (yaw about +Y, then pitch
+// about +X, then roll about +Z), radians. Pitch comes back in -pi/2..pi/2.
+// Looking straight up or down, yaw and roll turn about the same axis and
+// cannot be told apart: roll is reported as 0 and the whole turn as yaw.
+static inline void quat_to_euler(quat q, float* pitch, float* yaw, float* roll) {
+    mat4 m = mat4_from_quat(quat_norm(q));
+    // R = Ry * Rx * Rz; with M[row][col] = m.data[col * 4 + row]:
+    //   M12 = -sin(pitch), M02 / M22 give yaw, M10 / M11 give roll
+    float sp = clampf(-m.data[9], -1.0f, 1.0f);
+    *pitch = asinf(sp);
+    if (fabsf(sp) < 0.99999f) {
+        *yaw  = atan2f(m.data[8], m.data[10]);
+        *roll = atan2f(m.data[1], m.data[5]);
+    } else {
+        *yaw  = atan2f(-m.data[2], m.data[0]);
+        *roll = 0.0f;
+    }
+}
+
+// the axis (unit) and angle (radians, 0..pi) of a rotation; the identity gives axis +X, angle 0
+static inline void quat_to_axis_angle(quat q, vec3* axis, float* radians) {
+    q = quat_norm(q);
+    if (q.w < 0.0f) { q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w; }   // the short way round
+    float s = sqrtf(maxf(1.0f - q.w * q.w, 0.0f));
+    *radians = 2.0f * acosf(clampf(q.w, -1.0f, 1.0f));
+    *axis = s > 1e-6f ? v3(q.x / s, q.y / s, q.z / s) : v3(1.0f, 0.0f, 0.0f);
+}
+
+// ---------------- 3x3 matrices ----------------
+//
+// Rotation and scale without translation: transforming normals, oriented
+// box axes, inertia. Column-major like mat4: data[col * 3 + row].
+
+struct mat3 { float data[9]; };
+
+static inline mat3 mat3_identity() {
+    mat3 m = {};
+    m.data[0] = m.data[4] = m.data[8] = 1.0f;
+    return m;
+}
+// from three columns, e.g. a basis: right, up, back
+static inline mat3 mat3_from_cols(vec3 x, vec3 y, vec3 z) {
+    mat3 m = { { x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z } };
+    return m;
+}
+static inline vec3 mat3_col(const mat3& m, int i) { return v3(m.data[i * 3], m.data[i * 3 + 1], m.data[i * 3 + 2]); }
+static inline mat3 mat3_mul(const mat3& a, const mat3& b) {
+    mat3 r;
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++)
+            r.data[c * 3 + row] = a.data[row] * b.data[c * 3] + a.data[3 + row] * b.data[c * 3 + 1]
+                                + a.data[6 + row] * b.data[c * 3 + 2];
+    return r;
+}
+static inline vec3 mat3_mul_vec3(const mat3& m, vec3 v) {
+    return v3(m.data[0] * v.x + m.data[3] * v.y + m.data[6] * v.z,
+              m.data[1] * v.x + m.data[4] * v.y + m.data[7] * v.z,
+              m.data[2] * v.x + m.data[5] * v.y + m.data[8] * v.z);
+}
+static inline mat3 mat3_transpose(const mat3& m) {
+    mat3 r;
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++) r.data[row * 3 + c] = m.data[c * 3 + row];
+    return r;
+}
+static inline float mat3_determinant(const mat3& m) {
+    return v3dot(mat3_col(m, 0), v3cross(mat3_col(m, 1), mat3_col(m, 2)));
+}
+// the identity when the matrix cannot be inverted (a zero scale squashed it flat)
+static inline mat3 mat3_inverse(const mat3& m) {
+    vec3 a = mat3_col(m, 0), b = mat3_col(m, 1), c = mat3_col(m, 2);
+    vec3 r0 = v3cross(b, c), r1 = v3cross(c, a), r2 = v3cross(a, b);
+    float det = v3dot(a, r0);
+    if (fabsf(det) < 1e-12f) return mat3_identity();
+    float k = 1.0f / det;
+    // the rows of the inverse are the cross products above
+    mat3 r = { { r0.x * k, r1.x * k, r2.x * k, r0.y * k, r1.y * k, r2.y * k, r0.z * k, r1.z * k, r2.z * k } };
+    return r;
+}
+static inline mat3 mat3_scale(float x, float y, float z) {
+    mat3 m = {};
+    m.data[0] = x; m.data[4] = y; m.data[8] = z;
+    return m;
+}
+// the rotation and scale part of a mat4 (its upper-left 3x3)
+static inline mat3 mat3_from_mat4(const mat4& m) {
+    mat3 r = { { m.data[0], m.data[1], m.data[2], m.data[4], m.data[5], m.data[6], m.data[8], m.data[9], m.data[10] } };
+    return r;
+}
+static inline mat4 mat4_from_mat3(const mat3& m) {
+    mat4 r = mat4_identity();
+    for (int c = 0; c < 3; c++)
+        for (int row = 0; row < 3; row++) r.data[c * 4 + row] = m.data[c * 3 + row];
+    return r;
+}
+static inline mat3 mat3_from_quat(quat q) { return mat3_from_mat4(mat4_from_quat(q)); }
+static inline mat3 mat3_rotate(vec3 axis, float radians) { return mat3_from_quat(quat_from_axis_angle(axis, radians)); }
+// What transforms normals correctly through `model` even when it scales
+// unevenly (a squashed sphere): the inverse transpose of its 3x3 part.
+static inline mat3 mat3_normal_matrix(const mat4& model) { return mat3_transpose(mat3_inverse(mat3_from_mat4(model))); }
+
+// ---------------- colour ----------------
+//
+// pix_color, and every colour you pick in an image editor, is sRGB: its steps
+// are spaced for the eye, not for light. Lighting and blending maths wants
+// linear values, where twice the number is twice the light. These convert
+// both ways; HSV and HSL are friendlier ways to pick or animate a colour.
+
+static inline float pix_srgb_to_linear(float c) {
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+static inline float pix_linear_to_srgb(float c) {
+    if (c <= 0.0f) return 0.0f;
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1.0f / 2.4f) - 0.055f;
+}
+// rgb in linear light 0..1, alpha unchanged (alpha is never gamma encoded)
+static inline vec4 pix_color_to_linear(pix_color c) {
+    return v4(pix_srgb_to_linear(c.r / 255.0f), pix_srgb_to_linear(c.g / 255.0f),
+              pix_srgb_to_linear(c.b / 255.0f), c.a / 255.0f);
+}
+static inline pix_color pix_color_from_linear(vec4 c) {
+    return pix_rgba((int)(saturatef(pix_linear_to_srgb(c.x)) * 255.0f + 0.5f),
+                    (int)(saturatef(pix_linear_to_srgb(c.y)) * 255.0f + 0.5f),
+                    (int)(saturatef(pix_linear_to_srgb(c.z)) * 255.0f + 0.5f),
+                    (int)(saturatef(c.w) * 255.0f + 0.5f));
+}
+
+// Hue in degrees (0 red, 120 green, 240 blue, wrapping), saturation and value
+// 0..1. Sweeping the hue walks the rainbow; value 0 is black.
+static inline pix_color pix_hsv(float hue, float saturation, float value, float alpha = 1.0f) {
+    float h = wrapf(hue, 0.0f, 360.0f) / 60.0f;
+    float s = saturatef(saturation), v = saturatef(value);
+    float c = v * s, x = c * (1.0f - fabsf(fmodf(h, 2.0f) - 1.0f)), m = v - c;
+    float r = 0, g = 0, b = 0;
+    switch ((int)h) {
+        case 0:  r = c; g = x; break;
+        case 1:  r = x; g = c; break;
+        case 2:  g = c; b = x; break;
+        case 3:  g = x; b = c; break;
+        case 4:  r = x; b = c; break;
+        default: r = c; b = x; break;
+    }
+    return pix_rgba((int)((r + m) * 255.0f + 0.5f), (int)((g + m) * 255.0f + 0.5f),
+                    (int)((b + m) * 255.0f + 0.5f), (int)(saturatef(alpha) * 255.0f + 0.5f));
+}
+// x hue in degrees, y saturation, z value, w alpha
+static inline vec4 pix_color_to_hsv(pix_color c) {
+    float r = c.r / 255.0f, g = c.g / 255.0f, b = c.b / 255.0f;
+    float mx = maxf(r, maxf(g, b)), mn = minf(r, minf(g, b)), d = mx - mn;
+    float h = 0.0f;
+    if (d > 0.0f) {
+        if (mx == r)      h = 60.0f * fmodf((g - b) / d, 6.0f);
+        else if (mx == g) h = 60.0f * ((b - r) / d + 2.0f);
+        else              h = 60.0f * ((r - g) / d + 4.0f);
+        if (h < 0.0f) h += 360.0f;
+    }
+    return v4(h, mx > 0.0f ? d / mx : 0.0f, mx, c.a / 255.0f);
+}
+// Hue in degrees, saturation and lightness 0..1. Lightness 0.5 is the pure
+// colour, 0 black, 1 white - easier than HSV for "a lighter shade of this".
+static inline pix_color pix_hsl(float hue, float saturation, float lightness, float alpha = 1.0f) {
+    float l = saturatef(lightness), s = saturatef(saturation);
+    float v = l + s * minf(l, 1.0f - l);
+    return pix_hsv(hue, v > 0.0f ? 2.0f * (1.0f - l / v) : 0.0f, v, alpha);
+}
+// x hue in degrees, y saturation, z lightness, w alpha
+static inline vec4 pix_color_to_hsl(pix_color c) {
+    vec4 hsv = pix_color_to_hsv(c);
+    float l = hsv.z * (1.0f - hsv.y * 0.5f);
+    float m = minf(l, 1.0f - l);
+    return v4(hsv.x, m > 0.0f ? (hsv.z - l) / m : 0.0f, l, hsv.w);
+}
+
+// ---------------- curves ----------------
+//
+// Each works on float, vec2 and vec3, with t running 0..1.
+
+// Cubic Hermite: from p0 to p1, leaving p0 along tangent m0 and arriving at p1
+// along m1. The building block of smooth keyframe animation.
+static inline float hermite(float p0, float m0, float p1, float m1, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * p0 + (t3 - 2.0f * t2 + t) * m0
+         + (-2.0f * t3 + 3.0f * t2) * p1 + (t3 - t2) * m1;
+}
+// Catmull-Rom: a smooth curve through p1 (t = 0) and p2 (t = 1), shaped by the
+// points either side. Step along a list of points four at a time and the path
+// passes through every one of them - camera rails, patrol routes.
+static inline float catmull_rom(float p0, float p1, float p2, float p3, float t) {
+    return hermite(p1, 0.5f * (p2 - p0), p2, 0.5f * (p3 - p1), t);
+}
+// Bezier: starts at the first point, ends at the last, pulled toward the ones
+// between without passing through them - the curves of drawing programs.
+static inline float bezier_quadratic(float p0, float p1, float p2, float t) {
+    float u = 1.0f - t;
+    return u * u * p0 + 2.0f * u * t * p1 + t * t * p2;
+}
+static inline float bezier_cubic(float p0, float p1, float p2, float p3, float t) {
+    float u = 1.0f - t;
+    return u * u * u * p0 + 3.0f * u * u * t * p1 + 3.0f * u * t * t * p2 + t * t * t * p3;
+}
+// the direction a cubic Bezier is heading at t (not normalised): to face along the path
+static inline float bezier_cubic_tangent(float p0, float p1, float p2, float p3, float t) {
+    float u = 1.0f - t;
+    return 3.0f * u * u * (p1 - p0) + 6.0f * u * t * (p2 - p1) + 3.0f * t * t * (p3 - p2);
+}
+
+// the vec2 / vec3 versions apply the float one to each component
+#define PIX__CURVE3(name)                                                                     \
+    static inline vec2 name(vec2 a, vec2 b, vec2 c, float t) {                                \
+        return v2(name(a.x, b.x, c.x, t), name(a.y, b.y, c.y, t)); }                          \
+    static inline vec3 name(vec3 a, vec3 b, vec3 c, float t) {                                \
+        return v3(name(a.x, b.x, c.x, t), name(a.y, b.y, c.y, t), name(a.z, b.z, c.z, t)); }
+#define PIX__CURVE4(name)                                                                     \
+    static inline vec2 name(vec2 a, vec2 b, vec2 c, vec2 d, float t) {                        \
+        return v2(name(a.x, b.x, c.x, d.x, t), name(a.y, b.y, c.y, d.y, t)); }                \
+    static inline vec3 name(vec3 a, vec3 b, vec3 c, vec3 d, float t) {                        \
+        return v3(name(a.x, b.x, c.x, d.x, t), name(a.y, b.y, c.y, d.y, t),                   \
+                  name(a.z, b.z, c.z, d.z, t)); }
+PIX__CURVE4(hermite)
+PIX__CURVE4(catmull_rom)
+PIX__CURVE3(bezier_quadratic)
+PIX__CURVE4(bezier_cubic)
+PIX__CURVE4(bezier_cubic_tangent)
+#undef PIX__CURVE3
+#undef PIX__CURVE4
+
+// ---------------- easing ----------------
+//
+// Shapes for animating a value over time: feed in t from 0 to 1, get back a
+// reshaped 0 to 1 to lerp with. "in" starts slow, "out" ends slow, "in_out"
+// does both. back overshoots a little, elastic springs, bounce bounces.
+//   float t = ease_out_back(clampf(timer / duration, 0, 1));
+//   button_scale = lerpf(0.5f, 1.0f, t);
+
+static inline float ease_in_quad(float t)      { return t * t; }
+static inline float ease_out_quad(float t)     { return t * (2.0f - t); }
+static inline float ease_in_out_quad(float t)  { return t < 0.5f ? 2.0f * t * t : 1.0f - 2.0f * (1.0f - t) * (1.0f - t); }
+static inline float ease_in_cubic(float t)     { return t * t * t; }
+static inline float ease_out_cubic(float t)    { float u = 1.0f - t; return 1.0f - u * u * u; }
+static inline float ease_in_out_cubic(float t) {
+    float u = 1.0f - t;
+    return t < 0.5f ? 4.0f * t * t * t : 1.0f - 4.0f * u * u * u;
+}
+static inline float ease_in_quart(float t)     { return t * t * t * t; }
+static inline float ease_out_quart(float t)    { float u = 1.0f - t; return 1.0f - u * u * u * u; }
+static inline float ease_in_out_quart(float t) {
+    float u = 1.0f - t;
+    return t < 0.5f ? 8.0f * t * t * t * t : 1.0f - 8.0f * u * u * u * u;
+}
+static inline float ease_in_sine(float t)      { return 1.0f - cosf(t * PIX_PI * 0.5f); }
+static inline float ease_out_sine(float t)     { return sinf(t * PIX_PI * 0.5f); }
+static inline float ease_in_out_sine(float t)  { return 0.5f - 0.5f * cosf(t * PIX_PI); }
+static inline float ease_in_expo(float t)      { return t <= 0.0f ? 0.0f : powf(2.0f, 10.0f * t - 10.0f); }
+static inline float ease_out_expo(float t)     { return t >= 1.0f ? 1.0f : 1.0f - powf(2.0f, -10.0f * t); }
+static inline float ease_in_out_expo(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t < 0.5f ? 0.5f * powf(2.0f, 20.0f * t - 10.0f) : 1.0f - 0.5f * powf(2.0f, 10.0f - 20.0f * t);
+}
+static inline float ease_in_circ(float t)      { return 1.0f - sqrtf(maxf(1.0f - t * t, 0.0f)); }
+static inline float ease_out_circ(float t)     { float u = t - 1.0f; return sqrtf(maxf(1.0f - u * u, 0.0f)); }
+static inline float ease_in_out_circ(float t) {
+    return t < 0.5f ? 0.5f * ease_in_circ(2.0f * t) : 0.5f + 0.5f * ease_out_circ(2.0f * t - 1.0f);
+}
+static inline float ease_in_back(float t)      { const float c = 1.70158f; return t * t * ((c + 1.0f) * t - c); }
+static inline float ease_out_back(float t)     { return 1.0f - ease_in_back(1.0f - t); }
+static inline float ease_in_out_back(float t) {
+    const float c = 1.70158f * 1.525f;
+    float u = 2.0f * t;
+    if (t < 0.5f) return 0.5f * u * u * ((c + 1.0f) * u - c);
+    u -= 2.0f;
+    return 0.5f * (u * u * ((c + 1.0f) * u + c) + 2.0f);
+}
+static inline float ease_in_elastic(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return -powf(2.0f, 10.0f * t - 10.0f) * sinf((10.0f * t - 10.75f) * (PIX_TAU / 3.0f));
+}
+static inline float ease_out_elastic(float t)  { return 1.0f - ease_in_elastic(1.0f - t); }
+static inline float ease_in_out_elastic(float t) {
+    return t < 0.5f ? 0.5f * ease_in_elastic(2.0f * t) : 0.5f + 0.5f * ease_out_elastic(2.0f * t - 1.0f);
+}
+static inline float ease_out_bounce(float t) {
+    const float n = 7.5625f, d = 2.75f;
+    if (t < 1.0f / d)   return n * t * t;
+    if (t < 2.0f / d)   { t -= 1.5f / d;   return n * t * t + 0.75f; }
+    if (t < 2.5f / d)   { t -= 2.25f / d;  return n * t * t + 0.9375f; }
+    t -= 2.625f / d;
+    return n * t * t + 0.984375f;
+}
+static inline float ease_in_bounce(float t)    { return 1.0f - ease_out_bounce(1.0f - t); }
+static inline float ease_in_out_bounce(float t) {
+    return t < 0.5f ? 0.5f * ease_in_bounce(2.0f * t) : 0.5f + 0.5f * ease_out_bounce(2.0f * t - 1.0f);
+}
+
+// ---------------- trajectories ----------------
+
+// Where something thrown from p0 with velocity v0 is after t seconds, with
+// constant acceleration `gravity` (e.g. (0, -9.8, 0)).
+static inline vec3 ballistic_position(vec3 p0, vec3 v0, vec3 gravity, float t) {
+    return v3add(v3add(p0, v3scale(v0, t)), v3scale(gravity, 0.5f * t * t));
+}
+// The launch velocity, at `speed`, that lands a projectile thrown from `from`
+// on `to`, with gravity of strength `gravity` (> 0) pulling down -Y. Two arcs
+// reach any target in range: `high` picks the lob, otherwise the flat shot.
+// False when the target is out of reach at that speed.
+static inline bool ballistic_launch(vec3 from, vec3 to, float speed, float gravity, bool high, vec3* out_velocity) {
+    vec3 d = v3sub(to, from);
+    float h = d.y;
+    vec2 flat = v2(d.x, d.z);
+    float x = v2len(flat), v2s = speed * speed;
+    if (gravity <= 0.0f || speed <= 0.0f) return false;
+    if (x < 1e-6f) {                                   // straight up or down
+        if (h > 0.0f && v2s < 2.0f * gravity * h) return false;
+        *out_velocity = v3(0.0f, h >= 0.0f ? speed : -speed, 0.0f);
+        return true;
+    }
+    float disc = v2s * v2s - gravity * (gravity * x * x + 2.0f * h * v2s);
+    if (disc < 0.0f) return false;
+    float root = sqrtf(disc);
+    float tan_a = (v2s + (high ? root : -root)) / (gravity * x);
+    float cos_a = 1.0f / sqrtf(1.0f + tan_a * tan_a), sin_a = tan_a * cos_a;
+    vec2 dir = v2scale(flat, 1.0f / x);
+    *out_velocity = v3(dir.x * cos_a * speed, sin_a * speed, dir.y * cos_a * speed);
+    return true;
+}
+
+// ---------------- fast approximations ----------------
+//
+// Cheaper stand-ins for the C library functions, for code that runs millions
+// of times a frame (particles, noise, per-vertex work) and can trade a little
+// accuracy for speed. The error bound on each is checked by the test suite
+// (tests/build_check.cpp) over the range given.
+//
+// Only the ones that measurably beat the C library are here (MSVC /O2, x64:
+// fast_inv_sqrt 2x, fast_rsqrt 1.2x, fast_sin/cos 2x, fast_atan2 2.7x).
+// sqrtf, 1/x, exp2f, log2f and powf are already as fast or faster than any
+// polynomial stand-in, so use them as they are.
+
+static inline uint32_t pix__float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline float pix__bits_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+// The Quake III inverse square root: the 0x5f3759df bit trick for a first
+// guess, then one Newton-Raphson step. x > 0. Relative error under 0.18%.
+// Kept for what it is; fast_rsqrt below is both faster and closer on any CPU
+// with SSE.
+static inline float fast_inv_sqrt(float x) {
+    float y = pix__bits_float(0x5f3759dfu - (pix__float_bits(x) >> 1));
+    return y * (1.5f - 0.5f * x * y * y);
+}
+// 1 / sqrt(x), x > 0: the CPU's reciprocal square root estimate refined by one
+// Newton step. Relative error under 5e-7 with SSE (fast_inv_sqrt without).
+static inline float fast_rsqrt(float x) {
+#if PIX_MATH_SSE
+    float y = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+    return y * (1.5f - 0.5f * x * y * y);
+#else
+    return fast_inv_sqrt(x);
+#endif
+}
+// normalise through fast_rsqrt; zero stays zero
+static inline vec3 v3norm_fast(vec3 a) {
+    float d = v3dot(a, a);
+    return d > 1e-20f ? v3scale(a, fast_rsqrt(d)) : v3(0.0f, 0.0f, 0.0f);
+}
+static inline vec2 v2norm_fast(vec2 a) {
+    float d = v2dot(a, a);
+    return d > 1e-20f ? v2scale(a, fast_rsqrt(d)) : v2(0.0f, 0.0f);
+}
+
+// Sine and cosine of any angle (radians): folded into -pi/2..pi/2 and
+// evaluated as a 7th-order minimax polynomial. Absolute error under 1e-6 for
+// |x| < 2 pi; larger angles lose float precision in the folding itself (under
+// 1e-4 at |x| < 1000), so keep angles wrapped if you need the accuracy.
+static inline float fast_sin(float x) {
+    x -= PIX_TAU * floorf(x * (1.0f / PIX_TAU) + 0.5f);        // -pi..pi
+    if (x > PIX_PI * 0.5f)       x = PIX_PI - x;               // sin is symmetric about pi/2
+    else if (x < -PIX_PI * 0.5f) x = -PIX_PI - x;
+    float x2 = x * x;
+    // minimax coefficients (Lawson fit on 0..pi/2), not Taylor: the error is
+    // spread evenly instead of piling up at the ends
+    return x * (0.9999966159f + x2 * (-0.1666482836f + x2 * (0.008306324991f + x2 * -0.0001836364733f)));
+}
+static inline float fast_cos(float x) { return fast_sin(x + PIX_PI * 0.5f); }
+
+// atan on 0..1 as an 11th-order odd polynomial; the others fold onto it
+static inline float pix__atan01(float z) {
+    float z2 = z * z;
+    return z * (0.99997726f + z2 * (-0.33262347f + z2 * (0.19354346f + z2 * (-0.11643287f
+           + z2 * (0.05265332f + z2 * -0.01172120f)))));
+}
+// Absolute error under 2.5e-6 radians, any input.
+static inline float fast_atan(float x) {
+    float a = fabsf(x);
+    float r = a > 1.0f ? PIX_PI * 0.5f - pix__atan01(1.0f / a) : pix__atan01(a);
+    return x < 0.0f ? -r : r;
+}
+// Same quadrants and range as atan2f (-pi..pi); 0 for (0, 0). Absolute error under 2.5e-6 radians.
+static inline float fast_atan2(float y, float x) {
+    float ax = fabsf(x), ay = fabsf(y);
+    if (ax == 0.0f && ay == 0.0f) return 0.0f;
+    float r = ay > ax ? PIX_PI * 0.5f - pix__atan01(ax / ay) : pix__atan01(ay / ax);
+    if (x < 0.0f) r = PIX_PI - r;
+    return y < 0.0f ? -r : r;
+}
+
 // ---------------- operators ----------------
 //
 // Plain arithmetic on the plain structs above, so game code can write
@@ -912,6 +1387,8 @@ static inline vec3& operator-=(vec3& a, vec3 b) { a = a - b; return a; }
 static inline vec3& operator*=(vec3& a, float s) { a = a * s; return a; }
 
 static inline mat4  operator*(const mat4& a, const mat4& b) { return mat4_mul(a, b); }
+static inline mat3  operator*(const mat3& a, const mat3& b) { return mat3_mul(a, b); }
+static inline vec3  operator*(const mat3& m, vec3 v)        { return mat3_mul_vec3(m, v); }
 static inline quat  operator*(quat a, quat b)   { return quat_mul(a, b); }
 #endif
 
@@ -1347,6 +1824,7 @@ typedef void  (APIENTRY* PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfl
 typedef void  (APIENTRY* PFN_glUniform4fv)(GLint, GLsizei, const GLfloat*);
 typedef void  (APIENTRY* PFN_glUniform1f)(GLint, GLfloat);
 typedef void  (APIENTRY* PFN_glDrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
+typedef void  (APIENTRY* PFN_glDrawArraysInstancedBaseInstance)(GLenum, GLint, GLsizei, GLsizei, GLuint);
 typedef void  (APIENTRY* PFN_glGenFramebuffers)(GLsizei, GLuint*);
 typedef void  (APIENTRY* PFN_glBindFramebuffer)(GLenum, GLuint);
 typedef void  (APIENTRY* PFN_glDeleteFramebuffers)(GLsizei, const GLuint*);
@@ -1400,7 +1878,7 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glBufferData) E(glBufferSubData) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
     E(glEnableVertexAttribArray) E(glDisableVertexAttribArray) E(glVertexAttrib4f) \
     E(glVertexAttribDivisor) E(glDrawElementsInstanced) E(glDrawElementsInstancedBaseVertex) \
-    E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) \
+    E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) E(glDrawArraysInstancedBaseInstance) \
     E(glActiveTexture) E(glGenerateMipmap) E(glGetUniformLocation) \
     E(glUniformMatrix4fv) E(glUniform3f) E(glUniform1i) E(glUniform2f) E(glUniform4f) E(glUniform1f) \
     E(glUniform4fv) \
@@ -2320,6 +2798,212 @@ static inline bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float
     return hit;
 }
 
+// ---------------- oriented boxes ----------------
+//
+// A box turned to any orientation: a crate knocked over, a car on a slope, a
+// trigger volume along a rotated corridor. Same contract as the shapes above:
+// overlaps report the minimum translation, normal from the first shape toward
+// the second.
+
+struct obb {
+    vec3 centre;
+    vec3 half;   // half size along the box's own axes
+    mat3 axes;   // columns: the box's local x, y, z in world space, unit length
+};
+
+static inline obb obb_make(vec3 centre, vec3 half, quat rotation) {
+    obb b;
+    b.centre = centre;
+    b.half = half;
+    b.axes = mat3_from_quat(quat_norm(rotation));
+    return b;
+}
+
+// A model-space box (a mesh's bounds) carried through its transform; scale
+// ends up in `half`, so the axes stay unit length.
+static inline obb obb_from_aabb(const aabb& local, const mat4& transform) {
+    obb b;
+    b.centre = mat4_mul_point(transform, aabb_centre(local));
+    vec3 h = aabb_half(local);
+    vec3 cx = v3(transform.data[0], transform.data[1], transform.data[2]);
+    vec3 cy = v3(transform.data[4], transform.data[5], transform.data[6]);
+    vec3 cz = v3(transform.data[8], transform.data[9], transform.data[10]);
+    float sx = v3len(cx), sy = v3len(cy), sz = v3len(cz);
+    b.half = v3(h.x * sx, h.y * sy, h.z * sz);
+    b.axes = mat3_from_cols(sx > 0.0f ? v3scale(cx, 1.0f / sx) : v3(1, 0, 0),
+                            sy > 0.0f ? v3scale(cy, 1.0f / sy) : v3(0, 1, 0),
+                            sz > 0.0f ? v3scale(cz, 1.0f / sz) : v3(0, 0, 1));
+    return b;
+}
+
+// a world point in the box's own frame (centre at the origin, axes x, y, z)
+static inline vec3 obb_to_local(const obb& b, vec3 p) {
+    vec3 d = v3sub(p, b.centre);
+    return v3(v3dot(d, mat3_col(b.axes, 0)), v3dot(d, mat3_col(b.axes, 1)), v3dot(d, mat3_col(b.axes, 2)));
+}
+
+// the axis aligned box around it, for broadphase grids and culling
+static inline aabb obb_bounds(const obb& b) {
+    // each world axis reaches as far as the three box axes lean along it
+    vec3 e;
+    float* ep = &e.x;
+    for (int k = 0; k < 3; k++)
+        ep[k] = fabsf(b.axes.data[0 + k]) * b.half.x + fabsf(b.axes.data[3 + k]) * b.half.y
+              + fabsf(b.axes.data[6 + k]) * b.half.z;
+    return aabb_from_centre(b.centre, e);
+}
+
+static inline vec3 closest_point_obb(const obb& b, vec3 p) {
+    vec3 l = obb_to_local(b, p);
+    l = v3(clampf(l.x, -b.half.x, b.half.x), clampf(l.y, -b.half.y, b.half.y), clampf(l.z, -b.half.z, b.half.z));
+    return v3add(b.centre, mat3_mul_vec3(b.axes, l));
+}
+
+// Solved in the box's frame, where it is an AABB, then turned back.
+static inline bool collide_sphere_obb(const sphere& s, const obb& b, contact3* out) {
+    sphere local = sphere_make(obb_to_local(b, s.centre), s.radius);
+    if (!collide_sphere_aabb(local, aabb_from_centre(v3(0, 0, 0), b.half), out)) return false;
+    out->normal = mat3_mul_vec3(b.axes, out->normal);
+    return true;
+}
+
+// how far the box reaches along a unit axis from its centre
+static inline float obb__reach(const obb& b, vec3 axis) {
+    return b.half.x * fabsf(v3dot(mat3_col(b.axes, 0), axis))
+         + b.half.y * fabsf(v3dot(mat3_col(b.axes, 1), axis))
+         + b.half.z * fabsf(v3dot(mat3_col(b.axes, 2), axis));
+}
+
+// Separating axis test over the 15 axes that can separate two boxes: each
+// box's three face normals and the nine edge-edge cross products. The axis
+// with the least overlap is the cheapest way out.
+static inline bool collide_obb_obb(const obb& a, const obb& b, contact3* out) {
+    vec3 axes[15];
+    int n = 0;
+    for (int i = 0; i < 3; i++) axes[n++] = mat3_col(a.axes, i);
+    for (int i = 0; i < 3; i++) axes[n++] = mat3_col(b.axes, i);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            vec3 c = v3cross(mat3_col(a.axes, i), mat3_col(b.axes, j));
+            float l2 = v3dot(c, c);
+            if (l2 > 1e-6f) axes[n++] = v3scale(c, 1.0f / sqrtf(l2));   // parallel edges add nothing
+        }
+    vec3 d = v3sub(b.centre, a.centre);
+    float best = 1e30f;
+    vec3 best_axis = v3(0, 1, 0);
+    for (int k = 0; k < n; k++) {
+        float dist = v3dot(d, axes[k]);
+        float overlap = obb__reach(a, axes[k]) + obb__reach(b, axes[k]) - fabsf(dist);
+        if (overlap < 0.0f) return false;
+        // face axes win near-ties: an edge axis only takes over when it is
+        // clearly better, so resting boxes do not flicker between normals
+        bool better = k < 6 ? overlap < best : overlap < best * 0.95f - 1e-4f;
+        if (better) { best = overlap; best_axis = dist < 0.0f ? v3neg(axes[k]) : axes[k]; }
+    }
+    out->normal = best_axis;
+    out->depth = best;
+    return true;
+}
+
+// `dir` normalised, like the other ray tests; 0 when the ray starts inside
+static inline bool ray_vs_obb(vec3 origin, vec3 dir, const obb& b, float max_distance, float* out_t) {
+    vec3 o = obb_to_local(b, origin);
+    vec3 ld = v3(v3dot(dir, mat3_col(b.axes, 0)), v3dot(dir, mat3_col(b.axes, 1)), v3dot(dir, mat3_col(b.axes, 2)));
+    vec3 inv = v3(ld.x != 0.0f ? 1.0f / ld.x : 1e30f, ld.y != 0.0f ? 1.0f / ld.y : 1e30f,
+                  ld.z != 0.0f ? 1.0f / ld.z : 1e30f);
+    return ray_vs_aabb(o, inv, aabb_from_centre(v3(0, 0, 0), b.half), max_distance, out_t);
+}
+
+// ---------------- triangles ----------------
+//
+// For picking against real mesh geometry, standing on sloped terrain, and
+// interpolating anything stored per vertex.
+
+// unit normal of a triangle wound counter-clockwise when seen from its front
+static inline vec3 triangle_normal(vec3 a, vec3 b, vec3 c) { return v3norm(v3cross(v3sub(b, a), v3sub(c, a))); }
+
+// Barycentric weights (u, v, w) of p for triangle abc: p = a*u + b*v + c*w
+// with u + v + w = 1, p taken onto the triangle's plane. All three in 0..1
+// means p is inside. Interpolate uvs, normals or colours with them:
+//   uv = a_uv * w.x + b_uv * w.y + c_uv * w.z
+// A degenerate (zero area) triangle gives (1, 0, 0).
+static inline vec3 barycentric(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 e0 = v3sub(b, a), e1 = v3sub(c, a), e2 = v3sub(p, a);
+    float d00 = v3dot(e0, e0), d01 = v3dot(e0, e1), d11 = v3dot(e1, e1);
+    float d20 = v3dot(e2, e0), d21 = v3dot(e2, e1);
+    float denom = d00 * d11 - d01 * d01;
+    if (fabsf(denom) < 1e-20f) return v3(1.0f, 0.0f, 0.0f);
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    return v3(1.0f - v - w, v, w);
+}
+
+// The point of triangle abc nearest p: inside it, on an edge, or a corner
+// (Ericson, Real-Time Collision Detection 5.1.5).
+static inline vec3 closest_point_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 ab = v3sub(b, a), ac = v3sub(c, a), ap = v3sub(p, a);
+    float d1 = v3dot(ab, ap), d2 = v3dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;                              // corner a
+    vec3 bp = v3sub(p, b);
+    float d3 = v3dot(ab, bp), d4 = v3dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;                                // corner b
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)                          // edge ab
+        return v3add(a, v3scale(ab, d1 / (d1 - d3)));
+    vec3 cp = v3sub(p, c);
+    float d5 = v3dot(ab, cp), d6 = v3dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;                                // corner c
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)                          // edge ac
+        return v3add(a, v3scale(ac, d2 / (d2 - d6)));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)            // edge bc
+        return v3add(b, v3scale(v3sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+    float k = 1.0f / (va + vb + vc);                                     // inside the face
+    return v3add(a, v3add(v3scale(ab, vb * k), v3scale(ac, vc * k)));
+}
+
+// normal from the sphere toward the triangle, like collide_sphere_aabb
+static inline bool collide_sphere_triangle(const sphere& s, vec3 a, vec3 b, vec3 c, contact3* out) {
+    vec3 q = closest_point_triangle(s.centre, a, b, c);
+    vec3 d = v3sub(q, s.centre);
+    float d2 = v3dot(d, d);
+    if (d2 > s.radius * s.radius) return false;
+    if (d2 > 1e-12f) {
+        float len = sqrtf(d2);
+        out->normal = v3scale(d, 1.0f / len);
+        out->depth = s.radius - len;
+    } else {                                    // centre on the surface: push out the front
+        out->normal = v3neg(triangle_normal(a, b, c));
+        out->depth = s.radius;
+    }
+    return true;
+}
+
+// Moller-Trumbore. `dir` normalised. The front face is the side the
+// triangle's corners run counter-clockwise from; one-sided tests skip rays
+// that come from behind. `out_bary`, if given, receives the hit's barycentric
+// weights for interpolating per-vertex data (uv under the mouse, say).
+static inline bool ray_vs_triangle(vec3 origin, vec3 dir, vec3 a, vec3 b, vec3 c, float max_distance,
+                                   bool two_sided, float* out_t, vec3* out_bary = nullptr) {
+    vec3 e1 = v3sub(b, a), e2 = v3sub(c, a);
+    vec3 pv = v3cross(dir, e2);
+    float det = v3dot(e1, pv);                  // > 0 when the ray meets the front
+    if (two_sided ? fabsf(det) < 1e-12f : det < 1e-12f) return false;
+    float inv = 1.0f / det;
+    vec3 tv = v3sub(origin, a);
+    float u = v3dot(tv, pv) * inv;
+    if (u < 0.0f || u > 1.0f) return false;
+    vec3 qv = v3cross(tv, e1);
+    float v = v3dot(dir, qv) * inv;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = v3dot(e2, qv) * inv;
+    if (t < 0.0f || t > max_distance) return false;
+    if (out_t) *out_t = t;
+    if (out_bary) *out_bary = v3(1.0f - u - v, u, v);
+    return true;
+}
+
 #endif // PIX_COLLIDERS_HPP
 
 // ---- core/physics.hpp ------------------------------------------------------
@@ -2787,6 +3471,225 @@ PIXDEF int  obj_find_group(const mesh_file_data& src, const char* name);
 
 
 
+// ---- loader/json.hpp -------------------------------------------------------
+// pix - a small JSON reader: tokenises a document in one pass into a flat
+// array of tokens, then answers lookups by walking it. No allocation of its
+// own and no copies of the text - strings and numbers are read in place.
+//
+//   size_t size;
+//   char* text = (char*)pix_read_file("level.json", &size);
+//   js_doc doc;
+//   int root = js_parse(doc, text, size);              // tokens on the heap; js_free when done
+//   int enemies = js_get(doc, root, "enemies");
+//   for (int i = 0; i < js_len(doc, enemies); i++) {
+//       int e = js_at(doc, enemies, i);
+//       float x = js_float(doc, js_get(doc, e, "x"), 0.0f);
+//   }
+//   js_free(doc);
+//   pix_free(text);
+//
+// Every lookup takes a token index and returns one, -1 for "not there"; a -1
+// passed on is harmless, so chains need no checks until the end. js_get and
+// js_at walk siblings, so loop over an array with js_at only for short ones -
+// for long arrays step with js_next, which is O(1).
+//
+// Used by the glTF loader and the sprite atlas loader. No third-party code.
+#ifndef PIX_JSON_HPP
+#define PIX_JSON_HPP
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum { JS_OBJ = 1, JS_ARR, JS_STR, JS_NUM, JS_BOOL, JS_NULL };
+
+struct js_tok {
+    uint8_t type;
+    int32_t start;  // for strings, the first char inside the quotes
+    int32_t end;    // exclusive
+    int32_t count;  // OBJ: member pairs, ARR: elements
+    int32_t next;   // token index just past this whole subtree
+};
+
+struct js_doc {
+    const char* text;  // NUL terminated
+    js_tok* toks;
+    int count;
+    int cap;
+    bool owns;         // toks came from js_parse and js_free releases them
+};
+
+static inline void js__ws(const char* s, int* p) {
+    while (s[*p] == ' ' || s[*p] == '\t' || s[*p] == '\n' || s[*p] == '\r') (*p)++;
+}
+
+static inline int js__push(js_doc* d, uint8_t type, int start) {
+    if (d->count >= d->cap) return -1;
+    int i = d->count++;
+    js_tok* t = &d->toks[i];
+    t->type = type; t->start = start; t->end = start; t->count = 0; t->next = 0;
+    return i;
+}
+
+// recursive descent; tokens land in document order so `next` can be filled on the way out
+static inline int js__value(js_doc* d, int* p) {
+    const char* s = d->text;
+    js__ws(s, p);
+    char c = s[*p];
+    int me;
+
+    if (c == '{') {
+        me = js__push(d, JS_OBJ, *p);
+        if (me < 0) return -1;
+        (*p)++;
+        js__ws(s, p);
+        if (s[*p] == '}') (*p)++;
+        else for (;;) {
+            js__ws(s, p);
+            if (s[*p] != '"' || js__value(d, p) < 0) return -1; // key
+            js__ws(s, p);
+            if (s[*p] != ':') return -1;
+            (*p)++;
+            if (js__value(d, p) < 0) return -1;                 // value
+            d->toks[me].count++;
+            js__ws(s, p);
+            if (s[*p] == ',') { (*p)++; continue; }
+            if (s[*p] == '}') { (*p)++; break; }
+            return -1;
+        }
+    } else if (c == '[') {
+        me = js__push(d, JS_ARR, *p);
+        if (me < 0) return -1;
+        (*p)++;
+        js__ws(s, p);
+        if (s[*p] == ']') (*p)++;
+        else for (;;) {
+            if (js__value(d, p) < 0) return -1;
+            d->toks[me].count++;
+            js__ws(s, p);
+            if (s[*p] == ',') { (*p)++; continue; }
+            if (s[*p] == ']') { (*p)++; break; }
+            return -1;
+        }
+    } else if (c == '"') {
+        (*p)++;
+        int st = *p;
+        while (s[*p] && s[*p] != '"') { if (s[*p] == '\\') (*p)++; (*p)++; }
+        me = js__push(d, JS_STR, st);
+        if (me < 0) return -1;
+        d->toks[me].end = *p;
+        if (s[*p] == '"') (*p)++;
+    } else if (c == 't' || c == 'f' || c == 'n') {
+        int st = *p;
+        while (s[*p] >= 'a' && s[*p] <= 'z') (*p)++;
+        me = js__push(d, c == 'n' ? JS_NULL : JS_BOOL, st);
+        if (me < 0) return -1;
+        d->toks[me].end = *p;
+    } else {
+        int st = *p;
+        while (s[*p] && (s[*p] == '-' || s[*p] == '+' || s[*p] == '.' ||
+                         s[*p] == 'e' || s[*p] == 'E' || (s[*p] >= '0' && s[*p] <= '9'))) (*p)++;
+        if (*p == st) return -1;
+        me = js__push(d, JS_NUM, st);
+        if (me < 0) return -1;
+        d->toks[me].end = *p;
+    }
+
+    d->toks[me].next = d->count;
+    return me;
+}
+
+// Tokenises `text` (NUL terminated, `len` bytes) and returns the root token,
+// or -1 if the document is malformed. Tokens go to the heap (or scoped
+// memory with PIX_MEM_SCOPED); release them with js_free.
+static inline int js_parse(js_doc& d, const char* text, size_t len, unsigned mem = PIX_MEM_GLOBAL) {
+    d.text = text;
+    d.count = 0;
+    d.cap = (int)(len / 3) + 64;                  // ~3.5 characters per token in practice
+    d.toks = pix_new<js_tok>((size_t)d.cap, mem & PIX_MEM_SCOPED);
+    d.owns = true;
+    if (!d.toks) return -1;
+    int pos = 0;
+    return js__value(&d, &pos);
+}
+static inline void js_free(js_doc& d) {
+    if (d.owns) pix_free(d.toks);
+    d.toks = 0;
+    d.count = d.cap = 0;
+}
+
+static inline int js_type(const js_doc& d, int tok) { return tok < 0 ? 0 : d.toks[tok].type; }
+
+static inline bool js_is(const js_doc& d, int tok, const char* lit) {
+    if (tok < 0 || d.toks[tok].type != JS_STR) return false;
+    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
+    return strlen(lit) == n && memcmp(d.text + d.toks[tok].start, lit, n) == 0;
+}
+
+// the value under `key` in an object
+static inline int js_get(const js_doc& d, int obj, const char* key) {
+    if (obj < 0 || d.toks[obj].type != JS_OBJ) return -1;
+    int k = obj + 1;
+    for (int i = 0; i < d.toks[obj].count; i++) {
+        int v = d.toks[k].next;
+        if (js_is(d, k, key)) return v;
+        k = d.toks[v].next;
+    }
+    return -1;
+}
+
+static inline int js_len(const js_doc& d, int arr) {
+    return (arr >= 0 && d.toks[arr].type == JS_ARR) ? d.toks[arr].count : 0;
+}
+
+// element i of an array
+static inline int js_at(const js_doc& d, int arr, int i) {
+    if (arr < 0 || d.toks[arr].type != JS_ARR || i < 0 || i >= d.toks[arr].count) return -1;
+    int e = arr + 1;
+    while (i-- > 0) e = d.toks[e].next;
+    return e;
+}
+
+// Walking siblings in O(1) each: the first element of an array, or the first
+// key of an object (its value is js_value_of(key)); js_next steps from an
+// element (or a key's value) to the one after it. -1 past the end.
+static inline int js_first(const js_doc& d, int container) {
+    return (container >= 0 && d.toks[container].count > 0) ? container + 1 : -1;
+}
+static inline int js_value_of(const js_doc& d, int key) { return key >= 0 ? d.toks[key].next : -1; }
+static inline int js_next(const js_doc& d, int container, int tok) {
+    if (tok < 0) return -1;
+    int n = d.toks[tok].next;
+    return n < d.toks[container].next ? n : -1;
+}
+
+static inline float js_float(const js_doc& d, int tok, float def) {
+    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
+    return strtof(d.text + d.toks[tok].start, 0);
+}
+
+static inline int js_int(const js_doc& d, int tok, int def) {
+    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
+    return (int)strtol(d.text + d.toks[tok].start, 0, 10);
+}
+
+static inline bool js_bool(const js_doc& d, int tok, bool def) {
+    if (tok < 0 || d.toks[tok].type != JS_BOOL) return def;
+    return d.text[d.toks[tok].start] == 't';
+}
+
+// The raw characters of a string (escapes are not decoded), cut to fit.
+static inline void js_str(const js_doc& d, int tok, char* out, size_t cap) {
+    if (cap == 0) return;
+    out[0] = 0;
+    if (tok < 0 || d.toks[tok].type != JS_STR) return;
+    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, d.text + d.toks[tok].start, n);
+    out[n] = 0;
+}
+
+#endif // PIX_JSON_HPP
+
 // ---- loader/gltf_loader.hpp ------------------------------------------------
 #ifndef PIX_GLTF_LOADER_HPP
 #define PIX_GLTF_LOADER_HPP
@@ -3184,6 +4087,10 @@ struct framebuffer {
     int width;
     int height;
     bool hdr;
+    // Rows stored top first, so the colour texture reads upright like any
+    // image: 2D canvases (pix_create_canvas). 3D targets keep GL's bottom-up
+    // rows; pix_draw_target flips those.
+    bool top_down;
 };
 
 // `hdr` picks a packed float format (R11G11B10F: HDR range at half the memory
@@ -4950,9 +5857,8 @@ struct pix_material_uniform {
 };
 
 // material.blend
-#define PIX_BLEND_OPAQUE   0
-#define PIX_BLEND_ALPHA    1   // sorted back to front, classic transparency
-#define PIX_BLEND_ADDITIVE 2   // glows, fire, holograms
+// (PIX_BLEND_* live in dtype.hpp, shared with 2D; blended materials are
+// sorted back to front)
 
 struct material {
     idx shader;          // 0 = the built-in PBR surface; else see load_surface_shader
@@ -5601,6 +6507,12 @@ PIXDEF void pix_render_view(pix_renderer& renderer, const pix_view& view);
 // the window). Bloom, effects and FXAA run when the source is screen sized;
 // other sizes get the tonemap and grade.
 PIXDEF void pix_post_process(pix_renderer& renderer, const framebuffer& source, const framebuffer* dest);
+// The enabled post effects alone, run over whatever is already drawn in
+// `target` (null = the window) and written back into it: how a 2D frame,
+// which never passes through the tonemap, gets the same screen effects.
+// `target` must be the renderer's size. There is no depth, so depth-driven
+// effects (outline, depth blur) see a flat scene.
+PIXDEF void pix_apply_effects(pix_renderer& renderer, const framebuffer* target);
 // A fullscreen pass with your own shader (from pix_load_fullscreen_shader):
 // `textures` bound to uTex0..uTex3, uParams = params, uTexel = one dest pixel.
 PIXDEF void pix_fullscreen_pass(pix_renderer& renderer, idx program, const idx* textures, int texture_count,
@@ -5733,8 +6645,21 @@ PIXDEF void draw_text(const pixi_text& text, idx shader, const mat4& view_proj);
 
 // ---- core/draw2d.hpp -------------------------------------------------------
 // pix - immediate-mode 2D: shapes, textures, text. Everything drawn between
-// flushes goes into one CPU vertex array and out in as few draw calls as the
-// texture changes allow (one, for a game that uses a sprite atlas).
+// flushes goes into one CPU vertex array and out in as few draw calls as
+// possible:
+//
+//   * up to PIX_BATCH2D_SLOTS (16) textures share one draw - each vertex
+//     names its slot - so sprites from several sheets, text and shapes
+//     interleave freely; a flush happens only when a 17th texture turns up,
+//     the blend mode, the camera or the clip rectangle changes, or the
+//     buffer fills
+//   * each flush uploads exactly the bytes it used, so even a frame forced
+//     into many flushes stays cheap
+//   * shapes sample a white texture that always sits in slot 0, so they never
+//     cost a texture change at all
+//   * quads are indexed (4 vertices, not 6), and every shape reserves its
+//     vertices once - a circle is one reservation and no trigonometry per
+//     segment
 //
 //   pix_batch2d b;
 //   pix_batch2d_create(b);
@@ -5745,6 +6670,9 @@ PIXDEF void draw_text(const pixi_text& text, idx shader, const mat4& view_proj);
 //
 // The app layer (app.hpp) owns one of these and wraps every call as
 // pix_draw_*, so most games never touch the batch directly.
+//
+// Angles are degrees, 0 pointing right (+x), growing clockwise on screen
+// (y points down).
 #ifndef PIX_DRAW2D_HPP
 #define PIX_DRAW2D_HPP
 
@@ -5757,6 +6685,10 @@ struct pix_camera2d {
     float zoom;       // 0 is treated as 1
 };
 
+// Textures one draw can mix; slot 0 is always white. 16 is what every GL 4.x
+// driver guarantees a fragment shader can sample.
+#define PIX_BATCH2D_SLOTS 16
+
 struct pix__vertex2d {
     float x, y, u, v;
     pix_color color;
@@ -5764,7 +6696,7 @@ struct pix__vertex2d {
     uint8_t mode;        // 0 texture * colour, 255 SDF glyph
     uint8_t weight;      // SDF edge bias, 128 = normal
     uint8_t outline_w;   // SDF outline width, 0..255 -> 0..0.5
-    uint8_t pad;
+    uint8_t slot;        // which of the batch's textures to sample
 };
 
 struct pix_text_style2d {
@@ -5776,39 +6708,69 @@ struct pix_text_style2d {
 };
 
 struct pix_batch2d {
-    GLuint vao, vbo, program;
-    GLint  u_proj, u_tex;
+    GLuint vao, vbo, ebo, program;
+    GLint  u_proj;
     pix__vertex2d* verts;
-    size_t count, capacity;   // vertices
-    idx    texture;           // bound to the vertices pending
+    uint16_t*      indices;
+    size_t count, capacity;               // vertices
+    size_t index_count, index_capacity;
+    idx    slots[PIX_BATCH2D_SLOTS];      // textures the pending vertices use
+    int    slot_count;
     idx    white;
-    mat4   projection;        // screen space, y down
-    mat4   transform;         // projection * camera
+    int    blend;                         // PIX_BLEND_*
+    mat4   projection;                    // screen space, y down
+    mat4   transform;                     // projection * camera
+    pix_camera2d camera;                  // the camera in use (parallax reads its target)
+    bool   has_camera;
     int    width, height;
-    int    draws;             // draw calls since begin
+    bool   top_down;                      // the target stores its rows top first (2D canvases)
+    int    draws;                         // draw calls since begin
     bool   scissor;
 };
 
+// `capacity` in vertices, at most 65536 (indices are 16-bit).
 PIXDEF void pix_batch2d_create(pix_batch2d& b, size_t capacity = 65536);
 PIXDEF void pix_batch2d_destroy(pix_batch2d& b);
 // Starts screen-space drawing into a target of this size (the window, or a
-// render target). Pixel (0,0) is the top-left corner.
-PIXDEF void pix_batch2d_begin(pix_batch2d& b, int width, int height);
+// render target). Pixel (0,0) is the top-left corner. `top_down` is for
+// targets read back as textures with their first row at the top (canvases);
+// the window and 3D targets keep GL's bottom-up rows.
+PIXDEF void pix_batch2d_begin(pix_batch2d& b, int width, int height, bool top_down = false);
 // World-space drawing through a camera; null returns to screen space.
 PIXDEF void pix_batch2d_set_camera(pix_batch2d& b, const pix_camera2d* cam);
+// The world rectangle the batch shows right now, through its camera if one is
+// set (the bounding box when rotated): what culling tests against.
+PIXDEF pix_rect pix_batch2d_visible(const pix_batch2d& b);
 // Clip everything after this to a screen rectangle; w <= 0 turns clipping off.
 PIXDEF void pix_batch2d_scissor(pix_batch2d& b, pix_rect rect);
+// PIX_BLEND_ALPHA (the default), _ADDITIVE, _MULTIPLY or _PREMULTIPLIED.
+PIXDEF void pix_batch2d_set_blend(pix_batch2d& b, int blend);
 PIXDEF void pix_batch2d_flush(pix_batch2d& b);
 
 // ---- shapes ----
 PIXDEF void pix_batch_rect(pix_batch2d& b, pix_rect r, pix_color c);
 PIXDEF void pix_batch_rect_gradient(pix_batch2d& b, pix_rect r, pix_color top, pix_color bottom);
+// one colour per corner: top-left, top-right, bottom-right, bottom-left
+PIXDEF void pix_batch_rect_colors(pix_batch2d& b, pix_rect r, pix_color tl, pix_color tr,
+                                  pix_color br, pix_color bl);
 PIXDEF void pix_batch_rect_lines(pix_batch2d& b, pix_rect r, float thickness, pix_color c);
 PIXDEF void pix_batch_rect_rounded(pix_batch2d& b, pix_rect r, float radius, pix_color c);
+PIXDEF void pix_batch_rect_rounded_lines(pix_batch2d& b, pix_rect r, float radius, float thickness, pix_color c);
 PIXDEF void pix_batch_rect_pro(pix_batch2d& b, pix_rect r, vec2 origin, float rotation_deg, pix_color c);
 PIXDEF void pix_batch_line(pix_batch2d& b, vec2 a, vec2 c, float thickness, pix_color color);
+// Connected segments with mitred joins; on very sharp corners the mitre is
+// capped at twice the thickness instead of shooting off to a spike. `closed`
+// joins the last point back to the first.
+PIXDEF void pix_batch_polyline(pix_batch2d& b, const vec2* points, int count, float thickness, pix_color c,
+                               bool closed = false);
 PIXDEF void pix_batch_circle(pix_batch2d& b, vec2 center, float radius, pix_color c);
 PIXDEF void pix_batch_circle_lines(pix_batch2d& b, vec2 center, float radius, float thickness, pix_color c);
+PIXDEF void pix_batch_ellipse(pix_batch2d& b, vec2 center, float rx, float ry, pix_color c);
+PIXDEF void pix_batch_ellipse_lines(pix_batch2d& b, vec2 center, float rx, float ry, float thickness, pix_color c);
+// The band between two radii from one angle to another: arcs, gauges, cooldown
+// rings. inner = 0 gives a pie slice.
+PIXDEF void pix_batch_ring(pix_batch2d& b, vec2 center, float inner, float outer, float start_deg,
+                           float end_deg, pix_color c);
 PIXDEF void pix_batch_triangle(pix_batch2d& b, vec2 p0, vec2 p1, vec2 p2, pix_color c);
 // convex polygon, points in order
 PIXDEF void pix_batch_polygon(pix_batch2d& b, const vec2* points, int count, pix_color c);
@@ -5819,6 +6781,27 @@ PIXDEF void pix_batch_texture(pix_batch2d& b, const pix_texture& t, float x, flo
 // where it lands, rotated `rotation_deg` about `origin` (relative to dst's corner).
 PIXDEF void pix_batch_texture_pro(pix_batch2d& b, const pix_texture& t, pix_rect src, pix_rect dst,
                                   vec2 origin, float rotation_deg, pix_color tint);
+// Any four corners with their texture coordinates (0..1), in order around
+// the quad: the building block for sprites, skewed cards and custom meshes.
+// `gl_texture` 0 draws untextured.
+PIXDEF void pix_batch_quad(pix_batch2d& b, idx gl_texture, const vec2 corners[4], const vec2 uvs[4],
+                           pix_color tint);
+// A panel that stretches without distorting its frame: `border` (left, top,
+// right, bottom, in source pixels) keeps the corners at their size, stretches
+// the edges along one axis and the middle along both. If `dst` is smaller
+// than the borders, they shrink together.
+PIXDEF void pix_batch_nine_slice(pix_batch2d& b, const pix_texture& t, pix_rect src, vec4 border,
+                                 pix_rect dst, pix_color tint);
+
+// ---- parallax ----
+// A texture as a background layer that scrolls at `factor` of the camera's
+// movement: (0, 0) stays fixed like a distant sky, (0.5, 0.5) moves at half
+// speed, (1, 1) moves with the world. `offset` is where its top-left sits in
+// the world (at camera target 0), `scale` its size. `repeat_x` / `repeat_y`
+// tile it endlessly across the view - one quad, the texture repeats on the
+// GPU, so it needs its own texture (not one packed in an atlas).
+PIXDEF void pix_batch_parallax(pix_batch2d& b, const pix_texture& t, vec2 factor, vec2 offset, float scale,
+                               bool repeat_x, bool repeat_y, pix_color tint);
 
 // ---- text (SDF: sharp at any size) ----
 PIXDEF pix_text_style2d pix_text_style(float size);
@@ -5829,7 +6812,439 @@ PIXDEF void pix_batch_text_ex(pix_batch2d& b, font_data& font, const char* text,
 // width and height the text would take, multi-line aware
 PIXDEF vec2 pix_measure_text(const font_data& font, const char* text, float size, float spacing = 0.0f);
 
+// ---- cameras and rectangles ----
+
+// Where a screen pixel lands in the world, and the reverse.
+static inline vec2 pix_screen_to_world_2d(const pix_camera2d& cam, vec2 screen) {
+    float zoom = cam.zoom != 0.0f ? cam.zoom : 1.0f;
+    vec2 d = v2scale(v2sub(screen, cam.offset), 1.0f / zoom);
+    return v2add(cam.target, v2rotate(d, -cam.rotation * PIX_DEG2RAD));
+}
+static inline vec2 pix_world_to_screen_2d(const pix_camera2d& cam, vec2 world) {
+    float zoom = cam.zoom != 0.0f ? cam.zoom : 1.0f;
+    return v2add(cam.offset, v2rotate(v2scale(v2sub(world, cam.target), zoom), cam.rotation * PIX_DEG2RAD));
+}
+// The world rectangle a `width` x `height` screen shows through the camera
+// (its bounding box when rotated): skip drawing whatever lies outside it.
+static inline pix_rect pix_camera2d_visible(const pix_camera2d& cam, float width, float height) {
+    vec2 c[4] = { pix_screen_to_world_2d(cam, v2(0, 0)), pix_screen_to_world_2d(cam, v2(width, 0)),
+                  pix_screen_to_world_2d(cam, v2(width, height)), pix_screen_to_world_2d(cam, v2(0, height)) };
+    vec2 lo = c[0], hi = c[0];
+    for (int i = 1; i < 4; i++) {
+        lo = v2(minf(lo.x, c[i].x), minf(lo.y, c[i].y));
+        hi = v2(maxf(hi.x, c[i].x), maxf(hi.y, c[i].y));
+    }
+    pix_rect r = { lo.x, lo.y, hi.x - lo.x, hi.y - lo.y };
+    return r;
+}
+static inline bool pix_rect_overlaps(pix_rect a, pix_rect b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+static inline bool pix_rect_contains(pix_rect r, vec2 p) {
+    return p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
+}
+
+// ---- screen shake ----
+//
+// Trauma-based shake (Squirrel Eiserloh, "Math for Game Programmers: Juicing
+// Your Cameras with Math", GDC 2016): hits add trauma 0..1, it drains over
+// time, and the shake is trauma squared - so small hits barely nudge and big
+// ones slam - driven by smooth noise rather than random jumps.
+//
+//   static pix_shake shake;                       // zero = sensible defaults
+//   if (hit) pix_shake_add(shake, 0.4f);
+//   pix_begin_2d(pix_shake_camera(shake, cam, dt));
+struct pix_shake {
+    float trauma;          // 0..1, what pix_shake_add raises
+    float max_offset;      // pixels at full trauma (0 = 20)
+    float max_angle;       // degrees at full trauma (0 = 4)
+    float decay;           // trauma lost per second (0 = 1.2)
+    float frequency;       // how fast it wobbles (0 = 18)
+    float time;
+    vec2  offset;          // this frame's shake, also usable for a 3D camera
+    float angle;           // degrees
+};
+static inline void pix_shake_add(pix_shake& s, float trauma) { s.trauma = saturatef(s.trauma + trauma); }
+// Advances the shake by dt and fills s.offset / s.angle.
+static inline void pix_shake_update(pix_shake& s, float dt) {
+    float decay = s.decay > 0.0f ? s.decay : 1.2f;
+    float freq = s.frequency > 0.0f ? s.frequency : 18.0f;
+    float max_offset = s.max_offset > 0.0f ? s.max_offset : 20.0f;
+    float max_angle = s.max_angle > 0.0f ? s.max_angle : 4.0f;
+    s.time += dt * freq;
+    float k = s.trauma * s.trauma;
+    // three independent noise streams, recentred from 0..1 to -1..1
+    s.offset = v2(max_offset * k * (value_noise2(s.time, 0.5f, 101) * 2.0f - 1.0f),
+                  max_offset * k * (value_noise2(s.time, 0.5f, 202) * 2.0f - 1.0f));
+    s.angle = max_angle * k * (value_noise2(s.time, 0.5f, 303) * 2.0f - 1.0f);
+    s.trauma = maxf(s.trauma - decay * dt, 0.0f);
+}
+// `cam` shaken by the current trauma (advancing it by dt).
+static inline pix_camera2d pix_shake_camera(pix_shake& s, pix_camera2d cam, float dt) {
+    pix_shake_update(s, dt);
+    cam.offset = v2add(cam.offset, s.offset);
+    cam.rotation += s.angle;
+    return cam;
+}
+
 #endif // PIX_DRAW2D_HPP
+
+
+
+// ---- core/atlas.hpp --------------------------------------------------------
+// pix - sprite atlases and sprite animation.
+//
+// An atlas is a texture plus the rectangles of the sprites in it: frames,
+// each with a pivot, and animations, each a sequence of frames with a
+// timing. Everything drawn from one atlas shares one texture, so it batches
+// into a single draw call.
+//
+//   pix_texture tex = pix_load_texture("hero.png", TEXTURE_PIXELATED);
+//   pix_rect rects[32];
+//   int n = pix_rects_grid(rects, 32, tex.width, tex.height, 32, 32);   // or list them by hand
+//   pix_atlas hero = pix_create_atlas(tex, rects, n);
+//   pix_atlas_add_anim(hero, "run", 0, 6, 12.0f);
+//   pix_sprite_player p = {};
+//   // each frame:
+//   pix_sprite_play(p, hero, "run");
+//   pix_sprite_update(p, hero, dt);
+//   pix_draw_sprite_anim(hero, p, position);
+//
+// The rectangles are yours to make: by hand, with the pix_rects_* helpers
+// (grids, rows, columns), or read from an Aseprite / TexturePacker export
+// with pix_rects_from_json - whose extras (names, trimming, durations, tags)
+// pix_atlas_apply_json adds afterwards. pix_atlas_build is the other way in:
+// it packs loose images into a texture of its own (skyline packing, edges
+// extruded so neighbouring sprites never bleed into each other).
+#ifndef PIX_ATLAS_HPP
+#define PIX_ATLAS_HPP
+
+struct pix_atlas_frame {
+    pix_rect src;        // the pixels in the atlas texture
+    vec2  offset;        // where src sits inside the untrimmed frame (trimmed exports cut empty borders)
+    vec2  size;          // the untrimmed frame's size
+    vec2  pivot;         // pixels from the untrimmed frame's top-left: placed at the draw position, turned about
+    float duration;      // seconds this frame shows when animated; 0 = the animation's fps decides
+    uint32_t name_hash;
+    uint32_t name;       // offset into pix_atlas::names, or 0xFFFFFFFF when unnamed
+};
+
+#define PIX_ANIM_LOOP     0   // round and round
+#define PIX_ANIM_ONCE     1   // stops on the last frame (pix_sprite_player::finished)
+#define PIX_ANIM_PINGPONG 2   // forward, then back, then forward...
+
+struct pix_sprite_anim {
+    char     name[32];
+    uint32_t name_hash;
+    uint32_t first;      // into pix_atlas::sequence
+    uint32_t count;      // frames in the sequence
+    float    fps;        // for frames without a duration of their own (0 = 10)
+    uint8_t  mode;       // PIX_ANIM_*
+};
+
+struct pix_atlas {
+    pix_texture texture;
+    bool owns_texture;   // pix_unload_atlas frees the texture too
+    pix_atlas_frame*  frames;  int frame_count, frame_cap;
+    pix_sprite_anim*  anims;   int anim_count, anim_cap;
+    uint16_t* sequence;        int sequence_count, sequence_cap;   // frame indices, in play order
+    char*     names;           uint32_t names_used, names_cap;
+};
+
+// ---- making atlases ----
+
+// One frame per rectangle (pixels in `texture`), in order: frame i is
+// rects[i]. Pivots start at each frame's centre. The texture stays yours -
+// pix_unload_atlas does not free it.
+PIXDEF pix_atlas pix_create_atlas(pix_texture texture, const pix_rect* rects, int count);
+// Frees the frames and animations (and the texture only if pix_atlas_build made it).
+PIXDEF void      pix_unload_atlas(pix_atlas& atlas);
+
+// ---- rectangles ----
+//
+// Each fills `out` (room for `max`) and returns how many it wrote.
+
+// Equal cells of an image, left to right then top to bottom, after a
+// `margin` around the image and `spacing` between cells: a sprite sheet.
+PIXDEF int pix_rects_grid(pix_rect* out, int max, int image_w, int image_h, int cell_w, int cell_h,
+                          int margin = 0, int spacing = 0);
+// `count` cells side by side from (x, y): one animation strip of a sheet
+PIXDEF int pix_rects_row(pix_rect* out, int max, float x, float y, float cell_w, float cell_h, int count,
+                         float spacing = 0.0f);
+// `count` cells stacked downwards from (x, y)
+PIXDEF int pix_rects_column(pix_rect* out, int max, float x, float y, float cell_w, float cell_h, int count,
+                            float spacing = 0.0f);
+// The frame rectangles of an Aseprite or TexturePacker JSON export (hash or
+// array format), in the file's order. `image_out`, if given, receives the
+// image's path, relative to the JSON's folder like the file says it. 0 if
+// the file cannot be read (logged).
+PIXDEF int pix_rects_from_json(const char* json_path, pix_rect* out, int max, char* image_out = nullptr,
+                               size_t image_cap = 0);
+// The rest of such an export, onto an atlas created from its rectangles:
+// frame names, trimming, pivots and per-frame durations, Aseprite tags and
+// TexturePacker animation lists as animations. False if the file cannot be read.
+PIXDEF bool pix_atlas_apply_json(pix_atlas& atlas, const char* json_path);
+
+// frame index by name, -1 if there is none (look it up once, keep the index)
+PIXDEF int  pix_atlas_find(const pix_atlas& atlas, const char* frame_name);
+// Sets every frame's pivot as a fraction of its size: (0.5, 0.5) the centre
+// (the default), (0.5, 1) the feet, (0, 0) the top-left corner.
+PIXDEF void pix_atlas_set_pivot(pix_atlas& atlas, vec2 normalized);
+
+// ---- animations ----
+
+// `count` frames from `first_frame` on, at `fps`. Returns the animation's index.
+PIXDEF int pix_atlas_add_anim(pix_atlas& atlas, const char* name, int first_frame, int count, float fps,
+                              int mode = PIX_ANIM_LOOP);
+// any frames, in any order (repeats allowed)
+PIXDEF int pix_atlas_add_anim_frames(pix_atlas& atlas, const char* name, const int* frames, int count, float fps,
+                                     int mode = PIX_ANIM_LOOP);
+PIXDEF int pix_atlas_find_anim(const pix_atlas& atlas, const char* name);
+
+// A playhead: one per animated thing, zero-initialised is ready to use.
+struct pix_sprite_player {
+    int      anim;       // which animation (-1 or 0 before the first play: see pix_sprite_play)
+    int      step;       // position in the animation, 0..count-1
+    float    time;       // seconds into the current step
+    float    speed;      // playback rate; 0 counts as 1
+    bool     paused;
+    bool     finished;   // a PIX_ANIM_ONCE animation has reached its last frame
+    bool     playing;    // pix_sprite_play has been called
+    int      dir;        // +1 forward, -1 backward (ping-pong)
+    uint32_t loops;      // times it has wrapped round
+    uint64_t entered;    // steps entered during the last update, one bit per step (first 64)
+};
+
+// Starts an animation, unless it is the one already playing (pass `restart`
+// to start it over anyway) - so calling it every frame with the animation you
+// want is the normal way to use it.
+PIXDEF void pix_sprite_play(pix_sprite_player& p, const pix_atlas& atlas, const char* anim, bool restart = false);
+PIXDEF void pix_sprite_play(pix_sprite_player& p, int anim, bool restart = false);
+PIXDEF void pix_sprite_update(pix_sprite_player& p, const pix_atlas& atlas, float dt);
+// the atlas frame to draw now, -1 if nothing is playing
+PIXDEF int  pix_sprite_frame(const pix_sprite_player& p, const pix_atlas& atlas);
+// True if the last update stepped onto `step` (a footstep frame, the frame a
+// sword connects). Counts every step passed, even when a long update skips
+// several at once.
+static inline bool pix_sprite_entered(const pix_sprite_player& p, int step) {
+    return step >= 0 && step < 64 && ((p.entered >> step) & 1u) != 0;
+}
+
+// ---- packing atlases at load time ----
+//
+// Many small images cost a texture each; packed into one they draw as one.
+//
+//   pix_atlas_builder b = {};
+//   pix_atlas_builder_add_file(b, "coin", "coin.png");
+//   pix_atlas_builder_add_sheet(b, "run", "hero_run.png", 32, 32, 12);   // frames run_0.. + animation "run"
+//   pix_atlas atlas = pix_atlas_build(b);                                 // frees the builder's images
+struct pix__atlas_item {
+    unsigned char* pixels;   // RGBA, owned by the builder until the build
+    int w, h;
+    int x, y;                // where the build placed it (inside the padding)
+    uint32_t name;           // into the builder's names
+};
+struct pix__atlas_pending_anim { char name[32]; int first, count; float fps; int mode; };
+struct pix_atlas_builder {
+    pix__atlas_item* items;  int count, cap;
+    pix__atlas_pending_anim* anims; int anim_count, anim_cap;
+    char* names; uint32_t names_used, names_cap;
+};
+// one image from RGBA pixels (copied)
+PIXDEF void pix_atlas_builder_add(pix_atlas_builder& b, const char* name, const void* rgba, int w, int h);
+PIXDEF bool pix_atlas_builder_add_file(pix_atlas_builder& b, const char* name, const char* png_path);
+// A sheet of equal cells (after a `margin` around the sheet, `spacing` between
+// cells): frames named name_0, name_1, ... and, when fps > 0, an animation
+// called `name` over all of them. Returns how many frames it added.
+PIXDEF int  pix_atlas_builder_add_sheet(pix_atlas_builder& b, const char* name, const char* png_path,
+                                        int frame_w, int frame_h, float fps = 10.0f, int mode = PIX_ANIM_LOOP,
+                                        int margin = 0, int spacing = 0);
+// Packs everything into one texture no larger than max_size on a side,
+// `padding` pixels apart with the edges extruded into the gap. Frees the
+// builder's images either way; frame_count is 0 if it did not fit.
+PIXDEF pix_atlas pix_atlas_build(pix_atlas_builder& b, idx texture_flags = TEXTURE_PIXELATED,
+                                 int max_size = 4096, int padding = 1);
+PIXDEF void pix_atlas_builder_free(pix_atlas_builder& b);
+
+// ---- drawing ----
+
+#define PIX_FLIP_X 1   // mirrored left-right about the pivot
+#define PIX_FLIP_Y 2   // upside down about the pivot
+
+// Frame `frame` with its pivot at `pos`, scaled, turned `rotation_deg`
+// about the pivot. Trimmed frames land exactly where the untrimmed ones would.
+PIXDEF void pix_batch_sprite(pix_batch2d& b, const pix_atlas& atlas, int frame, vec2 pos, vec2 scale,
+                             float rotation_deg, pix_color tint, int flags);
+
+#endif // PIX_ATLAS_HPP
+
+
+
+// ---- core/tilemap.hpp ------------------------------------------------------
+// pix - tilemaps: grids of tiles from an atlas, drawn in layers, with
+// autotiling, parallax and object layers, loaded from Tiled or built in code.
+//
+//   pix_tilemap level = pix_load_tilemap("level1.tmj");      // a Tiled map (JSON)
+//   // each frame, inside pix_begin_2d(cam) ... pix_end_2d():
+//   pix_draw_tilemap(level);
+//
+// How it stays fast. A tile is 8 bytes on the GPU - its cell, its tile index
+// and its flips - and the vertex shader turns it into a quad, looking its
+// texture rectangle up in a small table. So:
+//   * static tiles cost no CPU work at all per frame; editing a tile
+//     re-uploads only its 32x32 chunk, and only once that chunk is on screen
+//   * only chunks overlapping the view are drawn, one instanced draw each
+//   * animated tiles change one table entry, never the tiles that use them
+//
+// Tile indices are frames of the map's tileset atlas (atlas.hpp). The map
+// owns the atlas when it loaded it (pix_load_tilemap); a map created with
+// pix_create_tilemap only borrows yours, which must outlive it.
+#ifndef PIX_TILEMAP_HPP
+#define PIX_TILEMAP_HPP
+
+#define PIX_TILE_CHUNK 32                  // chunks are 32 x 32 tiles
+
+// flips, as Tiled stores them; combine with |
+#define PIX_TILE_FLIP_X 0x80000000u        // mirrored left-right
+#define PIX_TILE_FLIP_Y 0x40000000u        // mirrored top-bottom
+#define PIX_TILE_FLIP_D 0x20000000u        // mirrored across the diagonal (with X or Y: a 90 degree turn)
+
+#define PIX_LAYER_TILES   0
+#define PIX_LAYER_IMAGE   1                // a parallax background image
+#define PIX_LAYER_OBJECTS 2                // Tiled objects: spawn points, triggers, ...
+
+#define PIX_MAX_TERRAINS 16                // autotile terrains 1..15 (0 = none)
+
+// Autotiling: which tile each arrangement of same-terrain neighbours gets.
+#define PIX_AUTOTILE_16 16                 // edges only: 16 tiles
+#define PIX_AUTOTILE_47 47                 // edges and corners ("blob"): 47 tiles
+struct pix_autotile {
+    int      mode;                         // PIX_AUTOTILE_16 or _47; 0 = unset
+    uint16_t table[256];                   // neighbour mask -> tile index
+};
+
+struct pix_tile_layer {
+    int   kind;                            // PIX_LAYER_*
+    char  name[32];
+    bool  visible;
+    vec2  offset;                          // world units, added to everything in the layer
+    vec2  parallax;                        // scroll factor against the camera: (1, 1) moves with the world
+    pix_color tint;
+    // tiles: width * height cells, row by row; low 16 bits tile + 1 (0 = empty),
+    // the top bits PIX_TILE_FLIP_*
+    uint32_t* cells;
+    uint8_t*  terrain;                     // autotile paint per cell, made on first paint
+    // image layers
+    pix_texture image;
+    bool owns_image;                       // loaded by pix_load_tilemap (yours otherwise)
+    bool repeat_x, repeat_y;
+    // GPU (tile layers): each 32x32 chunk has a fixed slot in one buffer
+    GLuint    buffer;
+    int32_t*  chunk_slot;                  // -1 = no slot yet
+    uint16_t* chunk_count;                 // tiles in it last upload
+    uint8_t*  chunk_dirty;
+    int       slots_used, slots_cap;
+};
+
+struct pix_map_property { uint32_t key, value; };   // offsets into pix_tilemap::strings
+
+struct pix_map_object {
+    char  name[48];
+    char  type[48];                        // Tiled's "type" / "class"
+    float x, y, w, h;                      // world units; Tiled puts tile objects' y at their bottom
+    float rotation;                        // degrees, clockwise
+    int   tile;                            // tile objects: the tile, else -1
+    int   layer;                           // the object layer it came from
+    int   first_property, property_count;
+};
+
+struct pix_tile_anim { int tile; int first, count; float total; int shown; };
+
+struct pix_tilemap {
+    int   width, height;                   // in tiles
+    float tile_w, tile_h;                  // world units per tile
+    pix_atlas tileset;
+    bool  owns_tileset;
+    pix_color background;                  // Tiled's background colour, if any (alpha 0 = none)
+    pix_tile_layer* layers;  int layer_count, layer_cap;
+    pix_map_object* objects; int object_count, object_cap;
+    pix_map_property* properties; int property_count, property_cap;
+    char* strings; uint32_t strings_used, strings_cap;
+    pix_autotile terrains[PIX_MAX_TERRAINS];
+    // animated tiles: frames and durations live in anim_frames / anim_times
+    pix_tile_anim* anims; int anim_count, anim_cap;
+    int*   anim_frames; float* anim_times; int anim_frame_count, anim_frame_cap;
+    // GPU: the texture rectangle of every tile, as drawn right now
+    GLuint rect_buffer;
+    vec4*  rects;                          // live (animated entries swapped)
+    int    rect_count;
+    bool   rects_dirty;
+};
+
+// ---- making maps ----
+
+// A map from a Tiled JSON export (.tmj / .json, orthogonal, not infinite).
+// Every tileset it uses - image sheets or image collections, embedded or
+// external .tsj - is packed into one atlas; tile animations, flips, layer
+// offsets, parallax, opacity and tint, image layers and object layers with
+// their properties all come across. width is 0 on failure (logged).
+PIXDEF pix_tilemap pix_load_tilemap(const char* tiled_json_path, idx texture_flags = TEXTURE_PIXELATED);
+// An empty map in code, `tile_w` x `tile_h` world units per tile, drawing
+// from `tileset` (borrowed: keep it alive).
+PIXDEF pix_tilemap pix_create_tilemap(int width, int height, float tile_w, float tile_h, const pix_atlas& tileset);
+PIXDEF void        pix_unload_tilemap(pix_tilemap& map);
+PIXDEF int         pix_tilemap_add_layer(pix_tilemap& map, const char* name);
+// a background image (see pix_batch_parallax); the texture stays yours
+PIXDEF int         pix_tilemap_add_image_layer(pix_tilemap& map, const char* name, pix_texture image,
+                                               vec2 parallax, bool repeat_x, bool repeat_y);
+PIXDEF int         pix_tilemap_find_layer(const pix_tilemap& map, const char* name);
+
+// ---- tiles ----
+
+// `tile` -1 clears the cell; `flags` PIX_TILE_FLIP_*
+PIXDEF void pix_tilemap_set(pix_tilemap& map, int layer, int x, int y, int tile, uint32_t flags = 0);
+PIXDEF void pix_tilemap_fill(pix_tilemap& map, int layer, int x, int y, int w, int h, int tile);
+// the tile there, -1 for empty or outside the map
+PIXDEF int  pix_tilemap_get(const pix_tilemap& map, int layer, int x, int y);
+// The cell under a world point (ignoring layer offsets); false outside the map.
+PIXDEF bool pix_tilemap_tile_at(const pix_tilemap& map, vec2 world, int* tx, int* ty);
+// a cell's world rectangle
+PIXDEF pix_rect pix_tilemap_tile_rect(const pix_tilemap& map, int tx, int ty);
+// Makes `tile` cycle through `frames`, each shown for its duration (seconds),
+// everywhere it is used. Free per tile: it changes one table entry.
+PIXDEF void pix_tilemap_animate_tile(pix_tilemap& map, int tile, const int* frames, const float* seconds, int count);
+
+// ---- autotiling ----
+//
+// Paint terrain instead of placing tiles: pix_tilemap_paint marks a cell as
+// terrain t, and that cell and its neighbours pick the tile that fits their
+// neighbours (inner corners, edges, ends...) from the rules for t.
+//
+// Neighbour bits: N 1, NE 2, E 4, SE 8, S 16, SW 32, W 64, NW 128. For
+// PIX_AUTOTILE_16 only the edges count. For PIX_AUTOTILE_47 a corner counts
+// only when both edges beside it are set - the 47 arrangements that leaves.
+// pix_autotile_make lays the tiles out in ascending order of those masks from
+// `first_tile` on; pix_autotile_masks lists that order, so art can be drawn to
+// match (or fill pix_autotile::table yourself for any other layout).
+PIXDEF pix_autotile pix_autotile_make(int mode, int first_tile);
+PIXDEF int  pix_autotile_masks(int mode, uint8_t* out);         // fills up to 47 masks, returns the count
+PIXDEF void pix_tilemap_set_terrain(pix_tilemap& map, int terrain, const pix_autotile& rules);
+PIXDEF void pix_tilemap_paint(pix_tilemap& map, int layer, int x, int y, int terrain);   // 0 erases
+PIXDEF int  pix_tilemap_terrain(const pix_tilemap& map, int layer, int x, int y);
+
+// ---- objects ----
+
+PIXDEF int         pix_tilemap_find_object(const pix_tilemap& map, const char* name);   // -1 if none
+// a custom property of an object as text (Tiled's value, whatever its type), or null
+PIXDEF const char* pix_tilemap_object_property(const pix_tilemap& map, const pix_map_object& object, const char* key);
+
+// ---- drawing ----
+// Draws through the batch's current camera, culled to what it shows; `time`
+// (seconds) drives animated tiles.
+PIXDEF void pix_batch_tilemap_layer(pix_batch2d& b, pix_tilemap& map, int layer, float time);
+PIXDEF void pix_batch_tilemap(pix_batch2d& b, pix_tilemap& map, float time);
+
+#endif // PIX_TILEMAP_HPP
 
 
 
@@ -6020,7 +7435,8 @@ PIXDEF void pix_quit(void);
 PIXDEF float  pix_dt(void);          // seconds since the previous frame (capped at 0.1)
 PIXDEF double pix_time(void);        // seconds since pix_init
 PIXDEF int    pix_fps(void);         // smoothed
-PIXDEF int    pix_width(void);       // window client size in pixels
+// the size you draw in, in pixels: the window's, or the one pix_set_resolution set
+PIXDEF int    pix_width(void);
 PIXDEF int    pix_height(void);
 
 PIXDEF void pix_set_title(const char* title);
@@ -6070,6 +7486,85 @@ PIXDEF void pix_draw_fps(float x, float y);
 // Clip 2D drawing to a rectangle; pix_end_clip turns it off.
 PIXDEF void pix_begin_clip(pix_rect r);
 PIXDEF void pix_end_clip(void);
+PIXDEF void pix_draw_rect_rounded_lines(pix_rect r, float radius, float thickness, pix_color color);
+PIXDEF void pix_draw_rect_gradient_h(pix_rect r, pix_color left, pix_color right);
+PIXDEF void pix_draw_ellipse(vec2 center, float rx, float ry, pix_color color);
+PIXDEF void pix_draw_ellipse_lines(vec2 center, float rx, float ry, float thickness, pix_color color);
+// The band between two radii, from one angle to another (degrees, 0 = right,
+// clockwise): arcs, gauges, cooldown rings.
+PIXDEF void pix_draw_ring(vec2 center, float inner, float outer, float start_deg, float end_deg, pix_color color);
+// a pie slice
+PIXDEF void pix_draw_circle_sector(vec2 center, float radius, float start_deg, float end_deg, pix_color color);
+// connected line segments with clean corners; `closed` joins the ends
+PIXDEF void pix_draw_polyline(const vec2* points, int count, float thickness, pix_color color, bool closed = false);
+// a filled convex polygon, points in order
+PIXDEF void pix_draw_polygon(const vec2* points, int count, pix_color color);
+// A UI panel that stretches without distorting its frame. `border` is the
+// left, top, right and bottom frame width in source pixels.
+PIXDEF void pix_draw_nine_slice(const pix_texture& t, pix_rect src, vec4 border, pix_rect dst,
+                                pix_color tint = PIX_WHITE);
+// How 2D colours combine with what is drawn: PIX_BLEND_ADDITIVE for glows and
+// sparks, PIX_BLEND_MULTIPLY for shadows and darkening. pix_end_blend goes
+// back to normal alpha blending.
+PIXDEF void pix_begin_blend(int mode);
+PIXDEF void pix_end_blend(void);
+// The world rectangle a 2D camera shows on screen: skip drawing what is
+// outside it. (The size is the drawing area's, see pix_set_resolution.)
+PIXDEF pix_rect pix_camera2d_visible(const pix_camera2d& camera);
+// the mouse position in world coordinates, through a 2D camera
+PIXDEF vec2 pix_mouse_world_2d(const pix_camera2d& camera);
+
+// ---- sprites from an atlas (see atlas.hpp) ----
+// A frame drawn with its pivot at `pos`. `flags`: PIX_FLIP_X, PIX_FLIP_Y.
+PIXDEF void pix_draw_sprite(const pix_atlas& atlas, int frame, vec2 pos, float scale = 1.0f,
+                            float rotation_deg = 0.0f, pix_color tint = PIX_WHITE, int flags = 0);
+// by name (a lookup per call: keep pix_atlas_find's index for hot loops)
+PIXDEF void pix_draw_sprite(const pix_atlas& atlas, const char* frame_name, vec2 pos, float scale = 1.0f,
+                            float rotation_deg = 0.0f, pix_color tint = PIX_WHITE, int flags = 0);
+// whatever frame the player is on
+PIXDEF void pix_draw_sprite_anim(const pix_atlas& atlas, const pix_sprite_player& player, vec2 pos,
+                                 float scale = 1.0f, float rotation_deg = 0.0f, pix_color tint = PIX_WHITE,
+                                 int flags = 0);
+
+// ---- tilemaps and parallax (see tilemap.hpp) ----
+// Through the current 2D camera, culled to the view; animated tiles run on pix_time.
+PIXDEF void pix_draw_tilemap(pix_tilemap& map);
+// one layer, so sprites can go between layers (ground, then characters, then roofs)
+PIXDEF void pix_draw_tilemap_layer(pix_tilemap& map, int layer);
+// A background that scrolls at `factor` of the camera: (0, 0) a fixed sky,
+// (0.3, 0.3) distant hills, (1, 1) the world itself. Repeats endlessly across
+// x (and y if asked). Use a texture of its own, not one from an atlas.
+PIXDEF void pix_draw_parallax(const pix_texture& t, vec2 factor, vec2 offset = { 0.0f, 0.0f }, float scale = 1.0f,
+                              bool repeat_x = true, bool repeat_y = false, pix_color tint = PIX_WHITE);
+
+// ---- canvases: drawing into a texture ----
+// A canvas is an image you draw into with the normal 2D calls, then draw like
+// a texture: a minimap, a cached background, a trail that fades, a
+// render-to-texture effect. `filter` is TEXTURE_LINEAR or TEXTURE_PIXELATED.
+PIXDEF framebuffer pix_create_canvas(int width, int height, idx filter = TEXTURE_LINEAR);
+PIXDEF void        pix_destroy_canvas(framebuffer& canvas);
+// Everything drawn between these (and pix_clear) goes into the canvas.
+PIXDEF void        pix_begin_canvas(const framebuffer& canvas);
+PIXDEF void        pix_end_canvas(void);
+// the canvas as a texture, for pix_draw_texture_pro and friends (its colours
+// are premultiplied by alpha; pix_draw_target accounts for that by itself)
+PIXDEF pix_texture pix_canvas_texture(const framebuffer& canvas);
+
+// ---- resolution ----
+// Draw at a fixed resolution and let pix scale it to the window: the whole
+// game (2D, 3D, the mouse, pix_width / pix_height) then works in those
+// pixels. The classic pixel-art setup is pix_set_resolution(320, 180).
+#define PIX_SCALE_INTEGER 0x0    // whole multiples only: every pixel the same size, bars around
+#define PIX_SCALE_FIT     0x1    // as large as fits, keeping the shape
+#define PIX_SCALE_SMOOTH  0x10   // or'd in: smooth filtering instead of crisp pixels
+// width or height 0 turns it off
+PIXDEF void pix_set_resolution(int width, int height, int mode = PIX_SCALE_INTEGER);
+
+// ---- screen effects ----
+// Effects added with pix_add_effect run once a frame: inside pix_end_3d for
+// 3D games, otherwise over the finished frame. Call this to run them earlier,
+// e.g. after the world and before the HUD so the HUD stays clean.
+PIXDEF void pix_apply_effects(void);
 
 // ---- 3D ----
 PIXDEF void pix_begin_3d(camera& cam);
@@ -8789,152 +10284,6 @@ bool obj_extract_group(mem_arena& arena, const mesh_file_data& src, size_t group
 #if defined(PIX_IMPLEMENTATION) && !defined(PIX_GLTF_LOADER_IMPL)
 #define PIX_GLTF_LOADER_IMPL
 
-// ---------------- json ----------------
-
-enum { JS_OBJ = 1, JS_ARR, JS_STR, JS_NUM, JS_BOOL, JS_NULL };
-
-struct js_tok {
-    uint8_t type;
-    int32_t start;  // for strings, the first char inside the quotes
-    int32_t end;    // exclusive
-    int32_t count;  // OBJ: member pairs, ARR: elements
-    int32_t next;   // token index just past this whole subtree
-};
-
-struct js_doc {
-    const char* text;  // NUL terminated
-    js_tok* toks;
-    int count;
-    int cap;
-};
-
-static void js__ws(const char* s, int* p) {
-    while (s[*p] == ' ' || s[*p] == '\t' || s[*p] == '\n' || s[*p] == '\r') (*p)++;
-}
-
-static int js__push(js_doc* d, uint8_t type, int start) {
-    if (d->count >= d->cap) return -1;
-    int i = d->count++;
-    js_tok* t = &d->toks[i];
-    t->type = type; t->start = start; t->end = start; t->count = 0; t->next = 0;
-    return i;
-}
-
-// recursive descent; tokens land in document order so `next` can be filled on the way out
-static int js__value(js_doc* d, int* p) {
-    const char* s = d->text;
-    js__ws(s, p);
-    char c = s[*p];
-    int me;
-
-    if (c == '{') {
-        me = js__push(d, JS_OBJ, *p);
-        if (me < 0) return -1;
-        (*p)++;
-        js__ws(s, p);
-        if (s[*p] == '}') (*p)++;
-        else for (;;) {
-            js__ws(s, p);
-            if (s[*p] != '"' || js__value(d, p) < 0) return -1; // key
-            js__ws(s, p);
-            if (s[*p] != ':') return -1;
-            (*p)++;
-            if (js__value(d, p) < 0) return -1;                 // value
-            d->toks[me].count++;
-            js__ws(s, p);
-            if (s[*p] == ',') { (*p)++; continue; }
-            if (s[*p] == '}') { (*p)++; break; }
-            return -1;
-        }
-    } else if (c == '[') {
-        me = js__push(d, JS_ARR, *p);
-        if (me < 0) return -1;
-        (*p)++;
-        js__ws(s, p);
-        if (s[*p] == ']') (*p)++;
-        else for (;;) {
-            if (js__value(d, p) < 0) return -1;
-            d->toks[me].count++;
-            js__ws(s, p);
-            if (s[*p] == ',') { (*p)++; continue; }
-            if (s[*p] == ']') { (*p)++; break; }
-            return -1;
-        }
-    } else if (c == '"') {
-        (*p)++;
-        int st = *p;
-        while (s[*p] && s[*p] != '"') { if (s[*p] == '\\') (*p)++; (*p)++; }
-        me = js__push(d, JS_STR, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-        if (s[*p] == '"') (*p)++;
-    } else if (c == 't' || c == 'f' || c == 'n') {
-        int st = *p;
-        while (s[*p] >= 'a' && s[*p] <= 'z') (*p)++;
-        me = js__push(d, c == 'n' ? JS_NULL : JS_BOOL, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-    } else {
-        int st = *p;
-        while (s[*p] && (s[*p] == '-' || s[*p] == '+' || s[*p] == '.' ||
-                         s[*p] == 'e' || s[*p] == 'E' || (s[*p] >= '0' && s[*p] <= '9'))) (*p)++;
-        if (*p == st) return -1;
-        me = js__push(d, JS_NUM, st);
-        if (me < 0) return -1;
-        d->toks[me].end = *p;
-    }
-
-    d->toks[me].next = d->count;
-    return me;
-}
-
-static bool js_is(const js_doc& d, int tok, const char* lit) {
-    if (tok < 0 || d.toks[tok].type != JS_STR) return false;
-    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
-    return strlen(lit) == n && memcmp(d.text + d.toks[tok].start, lit, n) == 0;
-}
-
-static int js_get(const js_doc& d, int obj, const char* key) {
-    if (obj < 0 || d.toks[obj].type != JS_OBJ) return -1;
-    int k = obj + 1;
-    for (int i = 0; i < d.toks[obj].count; i++) {
-        int v = d.toks[k].next;
-        if (js_is(d, k, key)) return v;
-        k = d.toks[v].next;
-    }
-    return -1;
-}
-
-static int js_len(const js_doc& d, int arr) {
-    return (arr >= 0 && d.toks[arr].type == JS_ARR) ? d.toks[arr].count : 0;
-}
-
-static int js_at(const js_doc& d, int arr, int i) {
-    if (arr < 0 || d.toks[arr].type != JS_ARR || i < 0 || i >= d.toks[arr].count) return -1;
-    int e = arr + 1;
-    while (i-- > 0) e = d.toks[e].next;
-    return e;
-}
-
-static float js_float(const js_doc& d, int tok, float def) {
-    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
-    return strtof(d.text + d.toks[tok].start, 0);
-}
-
-static int js_int(const js_doc& d, int tok, int def) {
-    if (tok < 0 || d.toks[tok].type != JS_NUM) return def;
-    return (int)strtol(d.text + d.toks[tok].start, 0, 10);
-}
-
-static void js_str(const js_doc& d, int tok, char* out, size_t cap) {
-    out[0] = 0;
-    if (tok < 0 || d.toks[tok].type != JS_STR || cap == 0) return;
-    size_t n = (size_t)(d.toks[tok].end - d.toks[tok].start);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, d.text + d.toks[tok].start, n);
-    out[n] = 0;
-}
-
 // ---------------- container ----------------
 
 struct gltf_file {
@@ -8998,6 +10347,8 @@ static bool gltf__open(mem_arena& arena, const char* path, gltf_file* g) {
 
     g->json.text = json_text;
     g->json.cap  = (int)(json_len / 3) + 64;      // ~3.5 chars per token in practice
+    g->json.count = 0;
+    g->json.owns = false;                         // tokens live in the arena
     g->json.toks = allocate<js_tok>(arena, (size_t)g->json.cap);
     if (!g->json.toks) return false;
     int pos = 0;
@@ -13620,9 +14971,11 @@ static void pix__bind_material(pix_renderer& r, pix__pass_state& st, idx materia
         // refractive surfaces composite the background themselves: no blending
         int mode = m.refraction > 0.0f ? PIX_BLEND_OPAQUE : m.blend;
         if (st.blend != mode) {
-            if (mode == PIX_BLEND_ADDITIVE)    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            else if (mode == PIX_BLEND_ALPHA)  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            else                               glBlendFunc(GL_ONE, GL_ZERO);
+            if (mode == PIX_BLEND_ADDITIVE)           glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            else if (mode == PIX_BLEND_ALPHA)         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            else if (mode == PIX_BLEND_MULTIPLY)      glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA);
+            else if (mode == PIX_BLEND_PREMULTIPLIED) glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            else                                      glBlendFunc(GL_ONE, GL_ZERO);
             st.blend = mode;
         }
     }
@@ -14336,6 +15689,42 @@ void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer
     pix__gpu_end(r, PIX_GPU_POST);
 }
 
+void pix_apply_effects(pix_renderer& r, const framebuffer* target) {
+    pix__sync_settings(r);
+    int effects = pix__enabled_effects(r);
+    if (!effects || !r.ldr_a.fbo) return;
+    // copy the frame so far into the first LDR target, then ping-pong the
+    // chain through the pair, the last effect writing back into `target`
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target ? target->fbo : 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r.ldr_a.fbo);
+    glBlitFramebuffer(0, 0, r.width, r.height, 0, 0, r.width, r.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    framebuffer* ping[2] = { &r.ldr_a, &r.ldr_b };
+    int at = 0, stage = 0;
+    for (int i = 0; i < r.post_effect_count; i++) {
+        const pix_post_effect& e = r.post_effects[i];
+        if (!e.enabled || !e.program) continue;
+        if (++stage == effects) pix__bind_dest(r, target);
+        else                    pix_bind_framebuffer(*ping[at ^ 1]);
+        glUseProgram(e.program);
+        glUniform1i(e.u_scene, 0);
+        glUniform1i(e.u_depth, 1);
+        glUniform2f(e.u_texel, 1.0f / (float)r.width, 1.0f / (float)r.height);
+        glUniform4f(e.u_params, e.params.x, e.params.y, e.params.z, e.params.w);
+        glUniform2f(e.u_near_far, 0.1f, 1000.0f);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, r.white_texture);      // no depth: everything at the far plane
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, ping[at]->color);
+        pix_draw_fullscreen();
+        at ^= 1;
+    }
+}
+
 // ---------------- stage: your own fullscreen pass ----------------
 
 static const char* const PIX__FULLSCREEN_PRELUDE = R"(#version 440 core
@@ -14641,6 +16030,7 @@ void draw_text(const pixi_text& text, idx shader, const mat4& view_proj) {
 #if defined(PIX_IMPLEMENTATION) && !defined(PIX_DRAW2D_IMPL)
 #define PIX_DRAW2D_IMPL
 #include <math.h>
+#include <stdio.h>
 
 static const char* const VSHDER_2D = R"(#version 440 core
 layout(location=0) in vec2 aPos;
@@ -14652,51 +16042,92 @@ uniform mat4 uProj;
 out vec2 vUV;
 out vec4 vColor;
 out vec4 vOutline;
-out vec4 vParams;
+out vec3 vParams;
+flat out int vSlot;
 void main() {
-    vUV = aUV; vColor = aColor; vOutline = aOutline; vParams = aParams;
+    vUV = aUV; vColor = aColor; vOutline = aOutline; vParams = aParams.xyz;
+    vSlot = int(aParams.w * 255.0 + 0.5);
     gl_Position = uProj * vec4(aPos, 0.0, 1.0);
 }
 )";
 
+// The slot is flat per triangle, so a 2x2 pixel quad never straddles two
+// slots in practice; gradients are still taken outside the switch, where
+// control flow is uniform, so mipmapped textures sample correctly.
 static const char* const FSHDER_2D = R"(#version 440 core
 in vec2 vUV;
 in vec4 vColor;
 in vec4 vOutline;
-in vec4 vParams;
+in vec3 vParams;
+flat in int vSlot;
 out vec4 frag;
-uniform sampler2D uTex;
+uniform sampler2D uTex[16];
+vec4 slot_sample(vec2 uv, vec2 dx, vec2 dy) {
+    switch (vSlot) {
+        case 0:  return textureGrad(uTex[0], uv, dx, dy);
+        case 1:  return textureGrad(uTex[1], uv, dx, dy);
+        case 2:  return textureGrad(uTex[2], uv, dx, dy);
+        case 3:  return textureGrad(uTex[3], uv, dx, dy);
+        case 4:  return textureGrad(uTex[4], uv, dx, dy);
+        case 5:  return textureGrad(uTex[5], uv, dx, dy);
+        case 6:  return textureGrad(uTex[6], uv, dx, dy);
+        case 7:  return textureGrad(uTex[7], uv, dx, dy);
+        case 8:  return textureGrad(uTex[8], uv, dx, dy);
+        case 9:  return textureGrad(uTex[9], uv, dx, dy);
+        case 10: return textureGrad(uTex[10], uv, dx, dy);
+        case 11: return textureGrad(uTex[11], uv, dx, dy);
+        case 12: return textureGrad(uTex[12], uv, dx, dy);
+        case 13: return textureGrad(uTex[13], uv, dx, dy);
+        case 14: return textureGrad(uTex[14], uv, dx, dy);
+        default: return textureGrad(uTex[15], uv, dx, dy);
+    }
+}
 void main() {
-    if (vParams.x < 0.5) { frag = texture(uTex, vUV) * vColor; return; }
+    vec4 t = slot_sample(vUV, dFdx(vUV), dFdy(vUV));
+    float w = max(fwidth(t.r), 1e-4);
+    if (vParams.x < 0.5) { frag = t * vColor; return; }
     // SDF glyph: 0.5 is the outline; fwidth keeps the edge one pixel wide at any scale
-    float sdf = texture(uTex, vUV).r;
-    float w = max(fwidth(sdf), 1e-4);
+    float sdf = t.r;
     float fill_edge = 0.5 - (vParams.y - 0.5);
     float outline_edge = fill_edge - vParams.z * 0.5;
     float fill = smoothstep(fill_edge - w, fill_edge + w, sdf);
     float outer = smoothstep(outline_edge - w, outline_edge + w, sdf);
-    float t = outer > 1e-4 ? clamp(fill / outer, 0.0, 1.0) : 0.0;
-    vec4 c = mix(vOutline, vColor, t);
+    float k = outer > 1e-4 ? clamp(fill / outer, 0.0, 1.0) : 0.0;
+    vec4 c = mix(vOutline, vColor, k);
     frag = vec4(c.rgb, c.a * outer);
 }
 )";
 
 void pix_batch2d_create(pix_batch2d& b, size_t capacity) {
     b = pix_batch2d();
-    b.capacity = capacity < 6 ? 6 : capacity - capacity % 6;
-    b.verts = pix_alloc<pix__vertex2d>(b.capacity);
+    if (capacity > 65536) capacity = 65536;
+    b.capacity = capacity < 64 ? 64 : capacity;
+    b.index_capacity = b.capacity * 3;        // a fan or strip needs up to 3 indices per vertex
+    b.verts = pix_new<pix__vertex2d>(b.capacity);
+    b.indices = pix_new<uint16_t>(b.index_capacity);
     b.program = opengl_create_shader(VSHDER_2D, FSHDER_2D);
     b.u_proj = glGetUniformLocation(b.program, "uProj");
-    b.u_tex = glGetUniformLocation(b.program, "uTex");
+    glUseProgram(b.program);
+    for (int i = 0; i < PIX_BATCH2D_SLOTS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "uTex[%d]", i);
+        glUniform1i(glGetUniformLocation(b.program, name), i);
+    }
+    glUseProgram(0);
     unsigned char white[4] = { 255, 255, 255, 255 };
     b.white = opengl_create_texture2d(1, 1, 4, white, TEXTURE_PIXELATED);
-    b.texture = b.white;
+    b.slots[0] = b.white;
+    b.slot_count = 1;
+    b.blend = PIX_BLEND_ALPHA;
 
     glGenVertexArrays(1, &b.vao);
     glGenBuffers(1, &b.vbo);
+    glGenBuffers(1, &b.ebo);
     glBindVertexArray(b.vao);
     glBindBuffer(GL_ARRAY_BUFFER, b.vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(b.capacity * sizeof(pix__vertex2d)), 0, GL_STREAM_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(b.index_capacity * sizeof(uint16_t)), 0, GL_STREAM_DRAW);
     GLsizei s = sizeof(pix__vertex2d);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, s, (void*)offsetof(pix__vertex2d, x));
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, s, (void*)offsetof(pix__vertex2d, u));
@@ -14710,48 +16141,74 @@ void pix_batch2d_create(pix_batch2d& b, size_t capacity) {
 
 void pix_batch2d_destroy(pix_batch2d& b) {
     if (b.vbo) glDeleteBuffers(1, &b.vbo);
+    if (b.ebo) glDeleteBuffers(1, &b.ebo);
     if (b.vao) glDeleteVertexArrays(1, &b.vao);
     opengl_destroy_shader(b.program);
     opengl_destroy_texture(b.white);
     pix_free(b.verts);
+    pix_free(b.indices);
     b = pix_batch2d();
 }
 
-void pix_batch2d_flush(pix_batch2d& b) {
-    if (!b.count) return;
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(b.program);
-    glUniformMatrix4fv(b.u_proj, 1, GL_FALSE, b.transform.data);
-    glUniform1i(b.u_tex, 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, b.texture);
-    glBindVertexArray(b.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, b.vbo);
-    // orphan, then fill: the driver never waits for last flush's draw
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(b.capacity * sizeof(pix__vertex2d)), 0, GL_STREAM_DRAW);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(b.count * sizeof(pix__vertex2d)), b.verts);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)b.count);
-    glBindVertexArray(0);
-    b.count = 0;
-    b.draws++;
+static void pix__2d_apply_blend(int blend) {
+    switch (blend) {
+        case PIX_BLEND_ADDITIVE:      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE); break;
+        case PIX_BLEND_MULTIPLY:      glBlendFuncSeparate(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE); break;
+        case PIX_BLEND_PREMULTIPLIED: glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); break;
+        default: glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA); break;
+    }
 }
 
-void pix_batch2d_begin(pix_batch2d& b, int width, int height) {
+void pix_batch2d_flush(pix_batch2d& b) {
+    if (b.index_count) {
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_BLEND);
+        pix__2d_apply_blend(b.blend);
+        glUseProgram(b.program);
+        glUniformMatrix4fv(b.u_proj, 1, GL_FALSE, b.transform.data);
+        for (int i = 0; i < b.slot_count; i++) {
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, b.slots[i]);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindVertexArray(b.vao);
+        // fresh storage of exactly the size used, filled in the same call: the
+        // driver never waits for the previous flush's draw, and a frame with
+        // many small flushes does not re-allocate the whole buffer each time
+        glBindBuffer(GL_ARRAY_BUFFER, b.vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(b.count * sizeof(pix__vertex2d)), b.verts, GL_STREAM_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(b.index_count * sizeof(uint16_t)), b.indices, GL_STREAM_DRAW);
+        glDrawElements(GL_TRIANGLES, (GLsizei)b.index_count, GL_UNSIGNED_SHORT, 0);
+        glBindVertexArray(0);
+        b.draws++;
+    }
+    b.count = 0;
+    b.index_count = 0;
+    b.slot_count = 1;    // white stays in slot 0
+}
+
+void pix_batch2d_begin(pix_batch2d& b, int width, int height, bool top_down) {
     pix_batch2d_flush(b);
     b.width = width;
     b.height = height;
-    b.projection = mat4_ortho(0.0f, (float)width, (float)height, 0.0f, -1.0f, 1.0f);
+    b.top_down = top_down;
+    // a top-down target gets its first row at the bottom of clip space, where GL stores row 0
+    b.projection = top_down ? mat4_ortho(0.0f, (float)width, 0.0f, (float)height, -1.0f, 1.0f)
+                            : mat4_ortho(0.0f, (float)width, (float)height, 0.0f, -1.0f, 1.0f);
     b.transform = b.projection;
+    b.has_camera = false;
     b.draws = 0;
+    b.blend = PIX_BLEND_ALPHA;
     if (b.scissor) { glDisable(GL_SCISSOR_TEST); b.scissor = false; }
 }
 
 void pix_batch2d_set_camera(pix_batch2d& b, const pix_camera2d* cam) {
     pix_batch2d_flush(b);
+    b.has_camera = cam != 0;
     if (!cam) { b.transform = b.projection; return; }
+    b.camera = *cam;
     float zoom = cam->zoom != 0.0f ? cam->zoom : 1.0f;
     // screen = offset + rotate(zoom * (world - target))
     mat4 m = mat4_translate(cam->offset.x, cam->offset.y, 0.0f);
@@ -14759,6 +16216,20 @@ void pix_batch2d_set_camera(pix_batch2d& b, const pix_camera2d* cam) {
     m = mat4_mul(m, mat4_scale(zoom, zoom, 1.0f));
     m = mat4_mul(m, mat4_translate(-cam->target.x, -cam->target.y, 0.0f));
     b.transform = mat4_mul(b.projection, m);
+}
+
+pix_rect pix_batch2d_visible(const pix_batch2d& b) {
+    // clip space -1..1 back through the inverse transform
+    mat4 inv = mat4_inverse(b.transform);
+    vec3 c[4] = { mat4_mul_point(inv, v3(-1, -1, 0)), mat4_mul_point(inv, v3(1, -1, 0)),
+                  mat4_mul_point(inv, v3(1, 1, 0)), mat4_mul_point(inv, v3(-1, 1, 0)) };
+    float x0 = c[0].x, x1 = c[0].x, y0 = c[0].y, y1 = c[0].y;
+    for (int i = 1; i < 4; i++) {
+        x0 = minf(x0, c[i].x); x1 = maxf(x1, c[i].x);
+        y0 = minf(y0, c[i].y); y1 = maxf(y1, c[i].y);
+    }
+    pix_rect r = { x0, y0, x1 - x0, y1 - y0 };
+    return r;
 }
 
 void pix_batch2d_scissor(pix_batch2d& b, pix_rect r) {
@@ -14769,50 +16240,154 @@ void pix_batch2d_scissor(pix_batch2d& b, pix_rect r) {
         return;
     }
     glEnable(GL_SCISSOR_TEST);
-    // GL's scissor origin is bottom-left
-    glScissor((GLint)r.x, (GLint)((float)b.height - r.y - r.h), (GLsizei)r.w, (GLsizei)r.h);
+    // GL's scissor origin is the target's first stored row
+    float y = b.top_down ? r.y : (float)b.height - r.y - r.h;
+    glScissor((GLint)r.x, (GLint)y, (GLsizei)r.w, (GLsizei)r.h);
     b.scissor = true;
 }
 
-// Room for `n` more vertices with `texture` bound, flushing if either changes.
-static pix__vertex2d* pix__2d_reserve(pix_batch2d& b, size_t n, idx texture) {
-    if (!texture) texture = b.white;
-    if (texture != b.texture) { pix_batch2d_flush(b); b.texture = texture; }
-    if (b.count + n > b.capacity) pix_batch2d_flush(b);
-    if (n > b.capacity) return 0;
-    pix__vertex2d* v = b.verts + b.count;
-    b.count += n;
-    memset(v, 0, n * sizeof(pix__vertex2d));
-    return v;
+void pix_batch2d_set_blend(pix_batch2d& b, int blend) {
+    if (blend == b.blend) return;
+    pix_batch2d_flush(b);
+    b.blend = blend;
 }
 
-static inline void pix__2d_set(pix__vertex2d& v, float x, float y, float u, float t, pix_color c) {
-    v.x = x; v.y = y; v.u = u; v.v = t; v.color = c;
+// ---- reserving geometry ----
+
+struct pix__2d_span {
+    pix__vertex2d* v;      // nv vertices to fill
+    uint16_t*      i;      // ni indices to fill, relative to base already
+    uint16_t       base;   // index of v[0]
+    uint8_t        slot;
+};
+
+// The slot `texture` (0 = white) occupies, binding it if new; flushes when
+// all slots are taken by others.
+static uint8_t pix__2d_slot(pix_batch2d& b, idx texture) {
+    if (!texture || texture == b.white) return 0;
+    for (int s = 1; s < b.slot_count; s++) if (b.slots[s] == texture) return (uint8_t)s;
+    if (b.slot_count == PIX_BATCH2D_SLOTS) pix_batch2d_flush(b);
+    b.slots[b.slot_count] = texture;
+    return (uint8_t)b.slot_count++;
 }
 
-// two triangles from four corners in order (tl, tr, br, bl)
+// Room for nv vertices and ni indices; flushes first if they would not fit.
+static bool pix__2d_reserve(pix_batch2d& b, size_t nv, size_t ni, idx texture, pix__2d_span* out) {
+    if (nv > b.capacity || ni > b.index_capacity) return false;
+    if (b.count + nv > b.capacity || b.index_count + ni > b.index_capacity) pix_batch2d_flush(b);
+    out->slot = pix__2d_slot(b, texture);    // after the flush above, so the slot survives
+    out->base = (uint16_t)b.count;
+    out->v = b.verts + b.count;
+    out->i = b.indices + b.index_count;
+    b.count += nv;
+    b.index_count += ni;
+    return true;
+}
+
+static inline void pix__2d_vert(pix__vertex2d& v, float x, float y, float u, float t, pix_color c, uint8_t slot) {
+    v.x = x; v.y = y; v.u = u; v.v = t;
+    v.color = c;
+    v.outline = PIX_BLANK;
+    v.mode = 0; v.weight = 0; v.outline_w = 0;
+    v.slot = slot;
+}
+
+// two triangles over corners in order (tl, tr, br, bl)
 static void pix__2d_quad(pix_batch2d& b, idx tex, const vec2* p, const vec2* uv, const pix_color* c) {
-    pix__vertex2d* v = pix__2d_reserve(b, 6, tex);
-    if (!v) return;
-    static const int order[6] = { 0, 1, 2, 0, 2, 3 };
-    for (int i = 0; i < 6; i++) {
-        int k = order[i];
-        pix__2d_set(v[i], p[k].x, p[k].y, uv[k].x, uv[k].y, c[k]);
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, 4, 6, tex, &s)) return;
+    for (int k = 0; k < 4; k++) pix__2d_vert(s.v[k], p[k].x, p[k].y, uv[k].x, uv[k].y, c[k], s.slot);
+    uint16_t q = s.base;
+    s.i[0] = q; s.i[1] = (uint16_t)(q + 1); s.i[2] = (uint16_t)(q + 2);
+    s.i[3] = q; s.i[4] = (uint16_t)(q + 2); s.i[5] = (uint16_t)(q + 3);
+}
+
+static int pix__circle_segments(float radius) {
+    int n = (int)(radius * 0.75f) + 12;   // enough that the edge never looks faceted
+    return n > 128 ? 128 : n;
+}
+
+// A filled ellipse sector as a triangle fan, or the band between two
+// ellipses as a strip. The rim is walked by rotating one vector by a fixed
+// step, so the loop has no sin/cos in it.
+static void pix__2d_arc(pix_batch2d& b, vec2 c, float rx_in, float ry_in, float rx_out, float ry_out,
+                        float a0, float a1, pix_color col) {
+    float sweep = a1 - a0;
+    if (sweep == 0.0f || rx_out <= 0.0f || ry_out <= 0.0f) return;
+    if (fabsf(sweep) > PIX_TAU) sweep = sweep > 0.0f ? PIX_TAU : -PIX_TAU;
+    int n = (int)((float)pix__circle_segments(maxf(rx_out, ry_out)) * fabsf(sweep) / PIX_TAU + 0.999f);
+    if (n < 2) n = 2;
+    float step = sweep / (float)n, cs = cosf(step), sn = sinf(step);
+    float dx = cosf(a0), dy = sinf(a0);
+    bool fill = rx_in <= 0.0f && ry_in <= 0.0f;
+    pix__2d_span s;
+    if (fill) {
+        if (!pix__2d_reserve(b, (size_t)n + 2, (size_t)n * 3, 0, &s)) return;
+        pix__2d_vert(s.v[0], c.x, c.y, 0, 0, col, 0);
+        for (int k = 0; k <= n; k++) {
+            pix__2d_vert(s.v[k + 1], c.x + dx * rx_out, c.y + dy * ry_out, 0, 0, col, 0);
+            float nx = dx * cs - dy * sn; dy = dx * sn + dy * cs; dx = nx;
+        }
+        for (int k = 0; k < n; k++) {
+            s.i[k * 3] = s.base;
+            s.i[k * 3 + 1] = (uint16_t)(s.base + 1 + k);
+            s.i[k * 3 + 2] = (uint16_t)(s.base + 2 + k);
+        }
+    } else {
+        if (!pix__2d_reserve(b, (size_t)(n + 1) * 2, (size_t)n * 6, 0, &s)) return;
+        for (int k = 0; k <= n; k++) {
+            pix__2d_vert(s.v[k * 2], c.x + dx * rx_out, c.y + dy * ry_out, 0, 0, col, 0);
+            pix__2d_vert(s.v[k * 2 + 1], c.x + dx * rx_in, c.y + dy * ry_in, 0, 0, col, 0);
+            float nx = dx * cs - dy * sn; dy = dx * sn + dy * cs; dx = nx;
+        }
+        for (int k = 0; k < n; k++) {
+            uint16_t o = (uint16_t)(s.base + k * 2);
+            uint16_t* i = s.i + k * 6;
+            i[0] = o; i[1] = (uint16_t)(o + 2); i[2] = (uint16_t)(o + 1);
+            i[3] = (uint16_t)(o + 1); i[4] = (uint16_t)(o + 2); i[5] = (uint16_t)(o + 3);
+        }
     }
 }
 
+// The outline of a rounded rectangle inset by `inset`, as `per_corner + 1`
+// points per corner, clockwise from the top-left corner's left end.
+static int pix__rounded_outline(pix_rect r, float rad, float inset, int per_corner, vec2* out) {
+    vec2 centers[4] = { {r.x + rad, r.y + rad}, {r.x + r.w - rad, r.y + rad},
+                        {r.x + r.w - rad, r.y + r.h - rad}, {r.x + rad, r.y + r.h - rad} };
+    float rr = maxf(rad - inset, 0.0f);
+    float step = (PIX_PI * 0.5f) / (float)per_corner, cs = cosf(step), sn = sinf(step);
+    int n = 0;
+    for (int k = 0; k < 4; k++) {
+        float a = PIX_PI + (float)k * PIX_PI * 0.5f;
+        float dx = cosf(a), dy = sinf(a);
+        for (int i = 0; i <= per_corner; i++) {
+            out[n++] = v2(centers[k].x + dx * rr, centers[k].y + dy * rr);
+            float nx = dx * cs - dy * sn; dy = dx * sn + dy * cs; dx = nx;
+        }
+    }
+    return n;
+}
+
+// ---- shapes ----
+
 void pix_batch_rect(pix_batch2d& b, pix_rect r, pix_color c) {
-    vec2 p[4] = { {r.x, r.y}, {r.x + r.w, r.y}, {r.x + r.w, r.y + r.h}, {r.x, r.y + r.h} };
-    vec2 uv[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
-    pix_color cs[4] = { c, c, c, c };
-    pix__2d_quad(b, 0, p, uv, cs);
+    pix_batch_rect_colors(b, r, c, c, c, c);
 }
 
 void pix_batch_rect_gradient(pix_batch2d& b, pix_rect r, pix_color top, pix_color bottom) {
-    vec2 p[4] = { {r.x, r.y}, {r.x + r.w, r.y}, {r.x + r.w, r.y + r.h}, {r.x, r.y + r.h} };
-    vec2 uv[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
-    pix_color cs[4] = { top, top, bottom, bottom };
-    pix__2d_quad(b, 0, p, uv, cs);
+    pix_batch_rect_colors(b, r, top, top, bottom, bottom);
+}
+
+void pix_batch_rect_colors(pix_batch2d& b, pix_rect r, pix_color tl, pix_color tr, pix_color br, pix_color bl) {
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, 4, 6, 0, &s)) return;
+    pix__2d_vert(s.v[0], r.x, r.y, 0, 0, tl, 0);
+    pix__2d_vert(s.v[1], r.x + r.w, r.y, 0, 0, tr, 0);
+    pix__2d_vert(s.v[2], r.x + r.w, r.y + r.h, 0, 0, br, 0);
+    pix__2d_vert(s.v[3], r.x, r.y + r.h, 0, 0, bl, 0);
+    uint16_t q = s.base;
+    s.i[0] = q; s.i[1] = (uint16_t)(q + 1); s.i[2] = (uint16_t)(q + 2);
+    s.i[3] = q; s.i[4] = (uint16_t)(q + 2); s.i[5] = (uint16_t)(q + 3);
 }
 
 void pix_batch_rect_pro(pix_batch2d& b, pix_rect r, vec2 origin, float rotation_deg, pix_color c) {
@@ -14838,81 +16413,160 @@ void pix_batch_line(pix_batch2d& b, vec2 a, vec2 e, float thickness, pix_color c
     pix__2d_quad(b, 0, p, uv, cs);
 }
 
+// a frame as one strip of eight corners: outer then inner
 void pix_batch_rect_lines(pix_batch2d& b, pix_rect r, float t, pix_color c) {
-    pix_batch_rect(b, { r.x, r.y, r.w, t }, c);
-    pix_batch_rect(b, { r.x, r.y + r.h - t, r.w, t }, c);
-    pix_batch_rect(b, { r.x, r.y + t, t, r.h - 2 * t }, c);
-    pix_batch_rect(b, { r.x + r.w - t, r.y + t, t, r.h - 2 * t }, c);
-}
-
-static int pix__circle_segments(float radius) {
-    int n = (int)(radius * 0.75f) + 12;   // enough that the edge never looks faceted
-    return n > 128 ? 128 : n;
+    t = minf(t, minf(r.w, r.h) * 0.5f);
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, 8, 24, 0, &s)) return;
+    float x0 = r.x, y0 = r.y, x1 = r.x + r.w, y1 = r.y + r.h;
+    vec2 p[8] = { {x0, y0}, {x1, y0}, {x1, y1}, {x0, y1},
+                  {x0 + t, y0 + t}, {x1 - t, y0 + t}, {x1 - t, y1 - t}, {x0 + t, y1 - t} };
+    for (int k = 0; k < 8; k++) pix__2d_vert(s.v[k], p[k].x, p[k].y, 0, 0, c, 0);
+    for (int k = 0; k < 4; k++) {
+        uint16_t o0 = (uint16_t)(s.base + k), o1 = (uint16_t)(s.base + (k + 1) % 4);
+        uint16_t i0 = (uint16_t)(o0 + 4), i1 = (uint16_t)(o1 + 4);
+        uint16_t* i = s.i + k * 6;
+        i[0] = o0; i[1] = o1; i[2] = i1; i[3] = o0; i[4] = i1; i[5] = i0;
+    }
 }
 
 void pix_batch_triangle(pix_batch2d& b, vec2 p0, vec2 p1, vec2 p2, pix_color c) {
-    pix__vertex2d* v = pix__2d_reserve(b, 3, 0);
-    if (!v) return;
-    pix__2d_set(v[0], p0.x, p0.y, 0, 0, c);
-    pix__2d_set(v[1], p1.x, p1.y, 0, 0, c);
-    pix__2d_set(v[2], p2.x, p2.y, 0, 0, c);
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, 3, 3, 0, &s)) return;
+    pix__2d_vert(s.v[0], p0.x, p0.y, 0, 0, c, 0);
+    pix__2d_vert(s.v[1], p1.x, p1.y, 0, 0, c, 0);
+    pix__2d_vert(s.v[2], p2.x, p2.y, 0, 0, c, 0);
+    s.i[0] = s.base; s.i[1] = (uint16_t)(s.base + 1); s.i[2] = (uint16_t)(s.base + 2);
 }
 
 void pix_batch_polygon(pix_batch2d& b, const vec2* pts, int count, pix_color c) {
-    for (int i = 1; i + 1 < count; i++) pix_batch_triangle(b, pts[0], pts[i], pts[i + 1], c);
+    if (count < 3) return;
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, (size_t)count, (size_t)(count - 2) * 3, 0, &s)) return;
+    for (int k = 0; k < count; k++) pix__2d_vert(s.v[k], pts[k].x, pts[k].y, 0, 0, c, 0);
+    for (int k = 0; k < count - 2; k++) {
+        s.i[k * 3] = s.base;
+        s.i[k * 3 + 1] = (uint16_t)(s.base + k + 1);
+        s.i[k * 3 + 2] = (uint16_t)(s.base + k + 2);
+    }
+}
+
+void pix_batch_polyline(pix_batch2d& b, const vec2* pts, int count, float thickness, pix_color c, bool closed) {
+    if (count < 2) return;
+    if (count == 2 && !closed) { pix_batch_line(b, pts[0], pts[1], thickness, c); return; }
+    int segs = closed ? count : count - 1;
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, (size_t)count * 2 + (closed ? 2 : 0), (size_t)segs * 6, 0, &s)) return;
+    float h = thickness * 0.5f;
+    for (int k = 0; k < count; k++) {
+        bool has_prev = closed || k > 0, has_next = closed || k < count - 1;
+        vec2 p = pts[k];
+        vec2 dp = has_prev ? v2norm(v2sub(p, pts[(k + count - 1) % count])) : v2(0, 0);
+        vec2 dn = has_next ? v2norm(v2sub(pts[(k + 1) % count], p)) : v2(0, 0);
+        if (!has_prev) dp = dn;
+        if (!has_next) dn = dp;
+        // the miter: the average of the two segment normals, lengthened so
+        // both edges keep their thickness - capped at 4x the half thickness,
+        // where a sharp corner would send it off towards infinity
+        vec2 n0 = v2(-dp.y, dp.x), n1 = v2(-dn.y, dn.x);
+        vec2 m = v2norm(v2add(n0, n1));
+        if (v2dot(m, m) < 1e-12f) m = n0;
+        float d = v2dot(m, n1);
+        float len = h / maxf(d, 0.25f);
+        vec2 o = v2scale(m, len);
+        pix__2d_vert(s.v[k * 2], p.x + o.x, p.y + o.y, 0, 0, c, 0);
+        pix__2d_vert(s.v[k * 2 + 1], p.x - o.x, p.y - o.y, 0, 0, c, 0);
+    }
+    if (closed) { s.v[count * 2] = s.v[0]; s.v[count * 2 + 1] = s.v[1]; }
+    for (int k = 0; k < segs; k++) {
+        uint16_t o = (uint16_t)(s.base + k * 2);
+        uint16_t* i = s.i + k * 6;
+        i[0] = o; i[1] = (uint16_t)(o + 2); i[2] = (uint16_t)(o + 1);
+        i[3] = (uint16_t)(o + 1); i[4] = (uint16_t)(o + 2); i[5] = (uint16_t)(o + 3);
+    }
 }
 
 void pix_batch_circle(pix_batch2d& b, vec2 ctr, float radius, pix_color c) {
-    int n = pix__circle_segments(radius);
-    float step = PIX_TAU / (float)n;
-    vec2 prev = v2(ctr.x + radius, ctr.y);
-    for (int i = 1; i <= n; i++) {
-        vec2 cur = v2(ctr.x + cosf(step * i) * radius, ctr.y + sinf(step * i) * radius);
-        pix_batch_triangle(b, ctr, prev, cur, c);
-        prev = cur;
-    }
+    pix__2d_arc(b, ctr, 0, 0, radius, radius, 0.0f, PIX_TAU, c);
 }
 
 void pix_batch_circle_lines(pix_batch2d& b, vec2 ctr, float radius, float t, pix_color c) {
-    int n = pix__circle_segments(radius);
-    float step = PIX_TAU / (float)n, ro = radius + t * 0.5f, ri = radius - t * 0.5f;
-    if (ri < 0.0f) ri = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float a0 = step * i, a1 = step * (i + 1);
-        vec2 p[4] = { v2(ctr.x + cosf(a0) * ro, ctr.y + sinf(a0) * ro), v2(ctr.x + cosf(a1) * ro, ctr.y + sinf(a1) * ro),
-                      v2(ctr.x + cosf(a1) * ri, ctr.y + sinf(a1) * ri), v2(ctr.x + cosf(a0) * ri, ctr.y + sinf(a0) * ri) };
-        vec2 uv[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
-        pix_color cs[4] = { c, c, c, c };
-        pix__2d_quad(b, 0, p, uv, cs);
-    }
+    float ri = maxf(radius - t * 0.5f, 0.0f), ro = radius + t * 0.5f;
+    pix__2d_arc(b, ctr, ri > 0.0f ? ri : 1e-4f, ri > 0.0f ? ri : 1e-4f, ro, ro, 0.0f, PIX_TAU, c);
 }
 
+void pix_batch_ellipse(pix_batch2d& b, vec2 ctr, float rx, float ry, pix_color c) {
+    pix__2d_arc(b, ctr, 0, 0, rx, ry, 0.0f, PIX_TAU, c);
+}
+
+void pix_batch_ellipse_lines(pix_batch2d& b, vec2 ctr, float rx, float ry, float t, pix_color c) {
+    float h = t * 0.5f;
+    pix__2d_arc(b, ctr, maxf(rx - h, 1e-4f), maxf(ry - h, 1e-4f), rx + h, ry + h, 0.0f, PIX_TAU, c);
+}
+
+void pix_batch_ring(pix_batch2d& b, vec2 ctr, float inner, float outer, float start_deg, float end_deg, pix_color c) {
+    pix__2d_arc(b, ctr, inner, inner, outer, outer, start_deg * PIX_DEG2RAD, end_deg * PIX_DEG2RAD, c);
+}
+
+// one convex fan around the centre, the four corner arcs as its rim
 void pix_batch_rect_rounded(pix_batch2d& b, pix_rect r, float radius, pix_color c) {
     float rad = minf(radius, minf(r.w, r.h) * 0.5f);
     if (rad <= 0.5f) { pix_batch_rect(b, r, c); return; }
-    pix_batch_rect(b, { r.x + rad, r.y, r.w - 2 * rad, r.h }, c);
-    pix_batch_rect(b, { r.x, r.y + rad, rad, r.h - 2 * rad }, c);
-    pix_batch_rect(b, { r.x + r.w - rad, r.y + rad, rad, r.h - 2 * rad }, c);
-    vec2 corners[4] = { {r.x + rad, r.y + rad}, {r.x + r.w - rad, r.y + rad},
-                        {r.x + r.w - rad, r.y + r.h - rad}, {r.x + rad, r.y + r.h - rad} };
-    int n = pix__circle_segments(rad) / 4 + 2;
-    for (int k = 0; k < 4; k++) {
-        float a0 = PIX_PI + (float)k * PIX_PI * 0.5f;
-        for (int i = 0; i < n; i++) {
-            float t0 = a0 + (PIX_PI * 0.5f) * (float)i / (float)n;
-            float t1 = a0 + (PIX_PI * 0.5f) * (float)(i + 1) / (float)n;
-            pix_batch_triangle(b, corners[k],
-                               v2(corners[k].x + cosf(t0) * rad, corners[k].y + sinf(t0) * rad),
-                               v2(corners[k].x + cosf(t1) * rad, corners[k].y + sinf(t1) * rad), c);
-        }
+    int per = pix__circle_segments(rad) / 4 + 2;
+    vec2 rim[4 * 36];
+    if (per > 35) per = 35;
+    int n = pix__rounded_outline(r, rad, 0.0f, per, rim);
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, (size_t)n + 1, (size_t)n * 3, 0, &s)) return;
+    pix__2d_vert(s.v[0], r.x + r.w * 0.5f, r.y + r.h * 0.5f, 0, 0, c, 0);
+    for (int k = 0; k < n; k++) pix__2d_vert(s.v[k + 1], rim[k].x, rim[k].y, 0, 0, c, 0);
+    for (int k = 0; k < n; k++) {
+        s.i[k * 3] = s.base;
+        s.i[k * 3 + 1] = (uint16_t)(s.base + 1 + k);
+        s.i[k * 3 + 2] = (uint16_t)(s.base + 1 + (k + 1) % n);
     }
 }
+
+void pix_batch_rect_rounded_lines(pix_batch2d& b, pix_rect r, float radius, float t, pix_color c) {
+    float rad = minf(radius, minf(r.w, r.h) * 0.5f);
+    if (rad <= 0.5f) { pix_batch_rect_lines(b, r, t, c); return; }
+    t = minf(t, minf(r.w, r.h) * 0.5f);
+    int per = pix__circle_segments(rad) / 4 + 2;
+    if (per > 35) per = 35;
+    vec2 outer[4 * 36], inner[4 * 36];
+    int n = pix__rounded_outline(r, rad, 0.0f, per, outer);
+    // the inner edge: the same corner centres, the radius shrunk by t; where
+    // t passes the radius the inner corner goes square, which is correct
+    pix_rect in = { r.x + t, r.y + t, r.w - 2 * t, r.h - 2 * t };
+    float rin = maxf(rad - t, 0.0f);
+    if (rin > 0.0f) pix__rounded_outline(in, rin, 0.0f, per, inner);
+    else for (int k = 0; k < 4; k++) {
+        vec2 corner = k == 0 ? v2(in.x, in.y) : k == 1 ? v2(in.x + in.w, in.y)
+                    : k == 2 ? v2(in.x + in.w, in.y + in.h) : v2(in.x, in.y + in.h);
+        for (int i = 0; i <= per; i++) inner[k * (per + 1) + i] = corner;
+    }
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, (size_t)n * 2, (size_t)n * 6, 0, &s)) return;
+    for (int k = 0; k < n; k++) {
+        pix__2d_vert(s.v[k * 2], outer[k].x, outer[k].y, 0, 0, c, 0);
+        pix__2d_vert(s.v[k * 2 + 1], inner[k].x, inner[k].y, 0, 0, c, 0);
+    }
+    for (int k = 0; k < n; k++) {
+        uint16_t o = (uint16_t)(s.base + k * 2), p = (uint16_t)(s.base + ((k + 1) % n) * 2);
+        uint16_t* i = s.i + k * 6;
+        i[0] = o; i[1] = p; i[2] = (uint16_t)(o + 1);
+        i[3] = (uint16_t)(o + 1); i[4] = p; i[5] = (uint16_t)(p + 1);
+    }
+}
+
+// ---- textures ----
 
 void pix_batch_texture_pro(pix_batch2d& b, const pix_texture& t, pix_rect src, pix_rect dst,
                            vec2 origin, float rotation_deg, pix_color tint) {
     if (!t.id || t.width <= 0 || t.height <= 0) return;
-    float u0 = src.x / (float)t.width, v0 = src.y / (float)t.height;
-    float u1 = (src.x + src.w) / (float)t.width, v1 = (src.y + src.h) / (float)t.height;
+    float iw = 1.0f / (float)t.width, ih = 1.0f / (float)t.height;
+    float u0 = src.x * iw, v0 = src.y * ih;
+    float u1 = (src.x + src.w) * iw, v1 = (src.y + src.h) * ih;
     float w = fabsf(dst.w), h = fabsf(dst.h);
     vec2 local[4] = { {-origin.x, -origin.y}, {w - origin.x, -origin.y},
                       {w - origin.x, h - origin.y}, {-origin.x, h - origin.y} };
@@ -14933,6 +16587,57 @@ void pix_batch_texture(pix_batch2d& b, const pix_texture& t, float x, float y, p
     pix_rect src = { 0, 0, (float)t.width, (float)t.height };
     pix_rect dst = { x, y, (float)t.width, (float)t.height };
     pix_batch_texture_pro(b, t, src, dst, v2(0, 0), 0.0f, tint);
+}
+
+void pix_batch_quad(pix_batch2d& b, idx tex, const vec2 corners[4], const vec2 uvs[4], pix_color tint) {
+    pix_color cs[4] = { tint, tint, tint, tint };
+    pix__2d_quad(b, tex, corners, uvs, cs);
+}
+
+// a 4x4 grid of vertices, nine quads, one reservation
+void pix_batch_nine_slice(pix_batch2d& b, const pix_texture& t, pix_rect src, vec4 border, pix_rect dst, pix_color tint) {
+    if (!t.id || t.width <= 0 || t.height <= 0) return;
+    float l = border.x, tp = border.y, r = border.z, bt = border.w;
+    // borders keep their size unless the panel is too small for them
+    float kx = (l + r) > dst.w && (l + r) > 0.0f ? dst.w / (l + r) : 1.0f;
+    float ky = (tp + bt) > dst.h && (tp + bt) > 0.0f ? dst.h / (tp + bt) : 1.0f;
+    float xs[4] = { dst.x, dst.x + l * kx, dst.x + dst.w - r * kx, dst.x + dst.w };
+    float ys[4] = { dst.y, dst.y + tp * ky, dst.y + dst.h - bt * ky, dst.y + dst.h };
+    float iw = 1.0f / (float)t.width, ih = 1.0f / (float)t.height;
+    float us[4] = { src.x * iw, (src.x + l) * iw, (src.x + src.w - r) * iw, (src.x + src.w) * iw };
+    float vs[4] = { src.y * ih, (src.y + tp) * ih, (src.y + src.h - bt) * ih, (src.y + src.h) * ih };
+    pix__2d_span s;
+    if (!pix__2d_reserve(b, 16, 54, t.id, &s)) return;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) pix__2d_vert(s.v[y * 4 + x], xs[x], ys[y], us[x], vs[y], tint, s.slot);
+    int n = 0;
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++) {
+            uint16_t q = (uint16_t)(s.base + y * 4 + x);
+            s.i[n++] = q; s.i[n++] = (uint16_t)(q + 1); s.i[n++] = (uint16_t)(q + 5);
+            s.i[n++] = q; s.i[n++] = (uint16_t)(q + 5); s.i[n++] = (uint16_t)(q + 4);
+        }
+}
+
+// ---- parallax ----
+
+void pix_batch_parallax(pix_batch2d& b, const pix_texture& t, vec2 factor, vec2 offset, float scale,
+                        bool repeat_x, bool repeat_y, pix_color tint) {
+    if (!t.id || t.width <= 0 || t.height <= 0 || scale <= 0.0f) return;
+    // the layer's origin trails the camera: at factor 1 it is fixed in the
+    // world, at factor 0 it rides along with the camera
+    vec2 target = b.has_camera ? b.camera.target : v2(0, 0);
+    vec2 origin = v2(offset.x + target.x * (1.0f - factor.x), offset.y + target.y * (1.0f - factor.y));
+    float sw = (float)t.width * scale, sh = (float)t.height * scale;
+    pix_rect view = pix_batch2d_visible(b);
+    float x0 = repeat_x ? view.x : origin.x, x1 = repeat_x ? view.x + view.w : origin.x + sw;
+    float y0 = repeat_y ? view.y : origin.y, y1 = repeat_y ? view.y + view.h : origin.y + sh;
+    if (x1 <= x0 || y1 <= y0) return;
+    float u0 = (x0 - origin.x) / sw, u1 = (x1 - origin.x) / sw;
+    float v0 = (y0 - origin.y) / sh, v1 = (y1 - origin.y) / sh;
+    vec2 p[4] = { {x0, y0}, {x1, y0}, {x1, y1}, {x0, y1} };
+    vec2 uv[4] = { {u0, v0}, {u1, v0}, {u1, v1}, {u0, v1} };
+    pix_batch_quad(b, t.id, p, uv, tint);
 }
 
 // ---- text ----
@@ -14985,17 +16690,20 @@ void pix_batch_text_ex(pix_batch2d& b, font_data& font, const char* text, vec2 p
             float x1 = x0 + g.crop.z * scale, y1 = y0 + g.crop.w * scale;
             float u0 = g.crop.x * iw, v0 = g.crop.y * ih;
             float u1 = (g.crop.x + g.crop.z) * iw, v1 = (g.crop.y + g.crop.w) * ih;
-            pix__vertex2d* v = pix__2d_reserve(b, 6, font.atlas_texture);
-            if (!v) return;
-            float xs[6] = { x0, x1, x1, x0, x1, x0 }, ys[6] = { y0, y0, y1, y0, y1, y1 };
-            float us[6] = { u0, u1, u1, u0, u1, u0 }, vs[6] = { v0, v0, v1, v0, v1, v1 };
-            for (int i = 0; i < 6; i++) {
-                pix__2d_set(v[i], xs[i], ys[i], us[i], vs[i], color);
-                v[i].outline = st.outline_color;
-                v[i].mode = 255;
-                v[i].weight = weight;
-                v[i].outline_w = outline;
+            pix__2d_span s;
+            if (!pix__2d_reserve(b, 4, 6, font.atlas_texture, &s)) return;
+            float xs[4] = { x0, x1, x1, x0 }, ys[4] = { y0, y0, y1, y1 };
+            float us[4] = { u0, u1, u1, u0 }, vs[4] = { v0, v0, v1, v1 };
+            for (int i = 0; i < 4; i++) {
+                pix__2d_vert(s.v[i], xs[i], ys[i], us[i], vs[i], color, s.slot);
+                s.v[i].outline = st.outline_color;
+                s.v[i].mode = 255;
+                s.v[i].weight = weight;
+                s.v[i].outline_w = outline;
             }
+            uint16_t q = s.base;
+            s.i[0] = q; s.i[1] = (uint16_t)(q + 1); s.i[2] = (uint16_t)(q + 2);
+            s.i[3] = q; s.i[4] = (uint16_t)(q + 2); s.i[5] = (uint16_t)(q + 3);
         }
         pen_x += g.advance * scale + st.spacing;
     }
@@ -15020,6 +16728,1299 @@ vec2 pix_measure_text(const font_data& font, const char* text, float size, float
 }
 
 #endif // PIX_DRAW2D_IMPL
+
+// ---- core/atlas.hpp --------------------------------------------------------
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_ATLAS_IMPL)
+#define PIX_ATLAS_IMPL
+#include <stdio.h>
+
+static uint32_t pix__name_hash(const char* s) {              // FNV-1a
+    uint32_t h = 2166136261u;
+    for (; s && *s; s++) { h ^= (uint8_t)*s; h *= 16777619u; }
+    return h;
+}
+
+// grows a pix_mem array to hold `need` elements
+template<typename T>
+static bool pix__grow(T*& data, int& cap, int need) {
+    if (need <= cap) return true;
+    int n = cap ? cap : 16;
+    while (n < need) n *= 2;
+    T* grown = (T*)pix_mem_realloc(data, (size_t)n * sizeof(T));
+    if (!grown) return false;
+    data = grown;
+    cap = n;
+    return true;
+}
+
+static uint32_t pix__pool_add(char*& pool, uint32_t& used, uint32_t& cap, const char* s) {
+    if (!s || !*s) return 0xFFFFFFFFu;
+    uint32_t n = (uint32_t)strlen(s) + 1;
+    if (used + n > cap) {
+        uint32_t c = cap ? cap : 256;
+        while (c < used + n) c *= 2;
+        char* grown = (char*)pix_mem_realloc(pool, c);
+        if (!grown) return 0xFFFFFFFFu;
+        pool = grown;
+        cap = c;
+    }
+    memcpy(pool + used, s, n);
+    uint32_t at = used;
+    used += n;
+    return at;
+}
+
+static int pix__atlas_add_frame(pix_atlas& a, const char* name, pix_rect src, vec2 offset, vec2 size, float duration) {
+    if (!pix__grow(a.frames, a.frame_cap, a.frame_count + 1)) return -1;
+    pix_atlas_frame& f = a.frames[a.frame_count];
+    f.src = src;
+    f.offset = offset;
+    f.size = size;
+    f.pivot = v2(size.x * 0.5f, size.y * 0.5f);
+    f.duration = duration;
+    f.name_hash = name ? pix__name_hash(name) : 0;
+    f.name = pix__pool_add(a.names, a.names_used, a.names_cap, name);
+    return a.frame_count++;
+}
+
+pix_atlas pix_create_atlas(pix_texture t, const pix_rect* rects, int count) {
+    pix_atlas a = {};
+    a.texture = t;
+    if (count > 65535) { pix_log("pix: an atlas holds at most 65535 frames"); count = 65535; }
+    if (count > 0 && !pix__grow(a.frames, a.frame_cap, count)) return a;
+    for (int i = 0; i < count; i++)
+        pix__atlas_add_frame(a, 0, rects[i], v2(0, 0), v2(rects[i].w, rects[i].h), 0.0f);
+    return a;
+}
+
+int pix_rects_grid(pix_rect* out, int max, int iw, int ih, int cw, int ch, int margin, int spacing) {
+    int n = 0;
+    if (cw <= 0 || ch <= 0) return 0;
+    for (int y = margin; y + ch <= ih - margin; y += ch + spacing)
+        for (int x = margin; x + cw <= iw - margin && n < max; x += cw + spacing) {
+            pix_rect r = { (float)x, (float)y, (float)cw, (float)ch };
+            out[n++] = r;
+        }
+    return n;
+}
+
+int pix_rects_row(pix_rect* out, int max, float x, float y, float cw, float ch, int count, float spacing) {
+    int n = count < max ? count : max;
+    for (int i = 0; i < n; i++) { pix_rect r = { x + i * (cw + spacing), y, cw, ch }; out[i] = r; }
+    return n > 0 ? n : 0;
+}
+
+int pix_rects_column(pix_rect* out, int max, float x, float y, float cw, float ch, int count, float spacing) {
+    int n = count < max ? count : max;
+    for (int i = 0; i < n; i++) { pix_rect r = { x, y + i * (ch + spacing), cw, ch }; out[i] = r; }
+    return n > 0 ? n : 0;
+}
+
+void pix_unload_atlas(pix_atlas& a) {
+    if (a.owns_texture) pix_unload_texture(a.texture);
+    pix_free(a.frames);
+    pix_free(a.anims);
+    pix_free(a.sequence);
+    pix_free(a.names);
+    a = pix_atlas();
+}
+
+int pix_atlas_find(const pix_atlas& a, const char* name) {
+    uint32_t h = pix__name_hash(name);
+    for (int i = 0; i < a.frame_count; i++)
+        if (a.frames[i].name_hash == h && a.frames[i].name != 0xFFFFFFFFu && strcmp(a.names + a.frames[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+void pix_atlas_set_pivot(pix_atlas& a, vec2 n) {
+    for (int i = 0; i < a.frame_count; i++) a.frames[i].pivot = v2(a.frames[i].size.x * n.x, a.frames[i].size.y * n.y);
+}
+
+// a new animation with room for `count` frame indices; the caller fills them
+static uint16_t* pix__atlas_new_anim(pix_atlas& a, const char* name, int count, float fps, int mode) {
+    if (count <= 0 || !pix__grow(a.anims, a.anim_cap, a.anim_count + 1) ||
+        !pix__grow(a.sequence, a.sequence_cap, a.sequence_count + count)) return 0;
+    pix_sprite_anim& an = a.anims[a.anim_count++];
+    memset(&an, 0, sizeof(an));
+    strncpy(an.name, name ? name : "", sizeof(an.name) - 1);
+    an.name_hash = pix__name_hash(an.name);
+    an.first = (uint32_t)a.sequence_count;
+    an.count = (uint32_t)count;
+    an.fps = fps;
+    an.mode = (uint8_t)mode;
+    uint16_t* slots = a.sequence + a.sequence_count;
+    a.sequence_count += count;
+    return slots;
+}
+
+int pix_atlas_add_anim_frames(pix_atlas& a, const char* name, const int* frames, int count, float fps, int mode) {
+    for (int i = 0; i < count; i++)
+        if (frames[i] < 0 || frames[i] >= a.frame_count) {
+            pix_log("pix: animation '%s' uses frame %d, the atlas has %d", name ? name : "", frames[i], a.frame_count);
+            return -1;
+        }
+    uint16_t* s = pix__atlas_new_anim(a, name, count, fps, mode);
+    if (!s) return -1;
+    for (int i = 0; i < count; i++) s[i] = (uint16_t)frames[i];
+    return a.anim_count - 1;
+}
+
+int pix_atlas_add_anim(pix_atlas& a, const char* name, int first, int count, float fps, int mode) {
+    if (count <= 0 || first < 0 || first + count > a.frame_count) {
+        pix_log("pix: animation '%s' wants frames %d..%d, the atlas has %d", name ? name : "", first, first + count - 1, a.frame_count);
+        return -1;
+    }
+    uint16_t* s = pix__atlas_new_anim(a, name, count, fps, mode);
+    if (!s) return -1;
+    for (int i = 0; i < count; i++) s[i] = (uint16_t)(first + i);
+    return a.anim_count - 1;
+}
+
+int pix_atlas_find_anim(const pix_atlas& a, const char* name) {
+    uint32_t h = pix__name_hash(name);
+    for (int i = 0; i < a.anim_count; i++)
+        if (a.anims[i].name_hash == h && strcmp(a.anims[i].name, name) == 0) return i;
+    return -1;
+}
+
+// ---- JSON (Aseprite / TexturePacker) ----
+
+// Both JSON helpers walk the export's frames the same way: an object keyed by
+// name (hash format) or an array whose entries carry "filename". `fn` gets
+// the frame's index, its name and its token.
+template<typename F>
+static void pix__json_frames(const js_doc& d, int root, F fn) {
+    char name[128];
+    int frames = js_get(d, root, "frames"), i = 0;
+    if (js_type(d, frames) == JS_OBJ) {
+        for (int k = js_first(d, frames); k >= 0; k = js_next(d, frames, js_value_of(d, k)), i++) {
+            js_str(d, k, name, sizeof(name));
+            fn(i, name, js_value_of(d, k));
+        }
+    } else {
+        for (int e = js_first(d, frames); e >= 0; e = js_next(d, frames, e), i++) {
+            js_str(d, js_get(d, e, "filename"), name, sizeof(name));
+            fn(i, name, e);
+        }
+    }
+}
+
+static int pix__json_open(const char* path, js_doc& d) {
+    size_t size = 0;
+    char* text = (char*)pix_read_file(path, &size, PIX_MEM_SCOPED);
+    int root = text ? js_parse(d, text, size, PIX_MEM_SCOPED) : -1;
+    if (root < 0) pix_log("pix: could not read '%s'", path);
+    return root;
+}
+
+int pix_rects_from_json(const char* json_path, pix_rect* out, int max, char* image_out, size_t image_cap) {
+    pix_mem_scope scope = pix_scope_begin();
+    js_doc d;
+    int root = pix__json_open(json_path, d), n = 0;
+    if (root >= 0) {
+        pix__json_frames(d, root, [&](int i, const char* name, int fr) {
+            if (i >= max) return;
+            int r = js_get(d, fr, "frame");
+            pix_rect src = { js_float(d, js_get(d, r, "x"), 0), js_float(d, js_get(d, r, "y"), 0),
+                             js_float(d, js_get(d, r, "w"), 0), js_float(d, js_get(d, r, "h"), 0) };
+            if (js_bool(d, js_get(d, fr, "rotated"), false))
+                pix_log("pix: frame '%s' is stored rotated; export without rotation", name);
+            out[n++] = src;
+        });
+        if (image_out && image_cap) js_str(d, js_get(d, js_get(d, root, "meta"), "image"), image_out, image_cap);
+    }
+    pix_scope_end(scope);
+    return n;
+}
+
+bool pix_atlas_apply_json(pix_atlas& a, const char* json_path) {
+    pix_mem_scope scope = pix_scope_begin();
+    js_doc d;
+    int root = pix__json_open(json_path, d);
+    if (root < 0) { pix_scope_end(scope); return false; }
+    char name[128];
+
+    // per frame: name, trimming, pivot, duration
+    pix__json_frames(d, root, [&](int i, const char* fname, int fr) {
+        if (i >= a.frame_count) return;
+        pix_atlas_frame& f = a.frames[i];
+        int sss = js_get(d, fr, "spriteSourceSize"), ss = js_get(d, fr, "sourceSize");
+        f.offset = v2(js_float(d, js_get(d, sss, "x"), 0), js_float(d, js_get(d, sss, "y"), 0));
+        f.size = v2(js_float(d, js_get(d, ss, "w"), f.src.w), js_float(d, js_get(d, ss, "h"), f.src.h));
+        f.duration = js_float(d, js_get(d, fr, "duration"), 0.0f) * 0.001f;   // Aseprite: milliseconds
+        int pv = js_get(d, fr, "pivot");                                      // TexturePacker: normalised
+        f.pivot = v2(f.size.x * js_float(d, js_get(d, pv, "x"), 0.5f), f.size.y * js_float(d, js_get(d, pv, "y"), 0.5f));
+        f.name_hash = pix__name_hash(fname);
+        f.name = pix__pool_add(a.names, a.names_used, a.names_cap, fname);
+    });
+    int meta = js_get(d, root, "meta");
+
+    // Aseprite tags: frame ranges with a direction
+    int tags = js_get(d, meta, "frameTags");
+    for (int t = js_first(d, tags); t >= 0; t = js_next(d, tags, t)) {
+        js_str(d, js_get(d, t, "name"), name, sizeof(name));
+        int from = js_int(d, js_get(d, t, "from"), 0), to = js_int(d, js_get(d, t, "to"), 0);
+        if (from < 0 || to >= a.frame_count || to < from) continue;
+        bool reverse = js_is(d, js_get(d, t, "direction"), "reverse") ||
+                       js_is(d, js_get(d, t, "direction"), "pingpong_reverse");
+        bool ping = js_is(d, js_get(d, t, "direction"), "pingpong") ||
+                    js_is(d, js_get(d, t, "direction"), "pingpong_reverse");
+        int n = to - from + 1;
+        int* list = pix_new<int>((size_t)n, PIX_MEM_SCOPED);
+        for (int i = 0; i < n; i++) list[i] = reverse ? to - i : from + i;
+        pix_atlas_add_anim_frames(a, name, list, n, 0.0f, ping ? PIX_ANIM_PINGPONG : PIX_ANIM_LOOP);
+    }
+
+    // TexturePacker: "animations": { "walk": ["walk_0.png", ...] }
+    int anims = js_get(d, root, "animations");
+    if (js_type(d, anims) == JS_OBJ) {
+        for (int k = js_first(d, anims); k >= 0; k = js_next(d, anims, js_value_of(d, k))) {
+            js_str(d, k, name, sizeof(name));
+            int arr = js_value_of(d, k), n = js_len(d, arr), got = 0;
+            int* list = pix_new<int>((size_t)(n > 0 ? n : 1), PIX_MEM_SCOPED);
+            char fname[128];
+            for (int e = js_first(d, arr); e >= 0; e = js_next(d, arr, e)) {
+                js_str(d, e, fname, sizeof(fname));
+                int f = pix_atlas_find(a, fname);
+                if (f >= 0) list[got++] = f;
+            }
+            if (got) pix_atlas_add_anim_frames(a, name, list, got, 10.0f, PIX_ANIM_LOOP);
+        }
+    }
+    pix_scope_end(scope);
+    return true;
+}
+
+// ---- playback ----
+
+void pix_sprite_play(pix_sprite_player& p, int anim, bool restart) {
+    if (p.playing && p.anim == anim && !restart) return;
+    p.anim = anim;
+    p.step = 0;
+    p.time = 0.0f;
+    p.dir = 1;
+    p.finished = false;
+    p.loops = 0;
+    p.entered = 1;            // the first step counts as entered
+    p.playing = anim >= 0;
+}
+
+void pix_sprite_play(pix_sprite_player& p, const pix_atlas& a, const char* anim, bool restart) {
+    int i = pix_atlas_find_anim(a, anim);
+    if (i < 0 && p.anim != -2) {
+        pix_log("pix: no animation '%s' in this atlas", anim);
+        p.anim = -2;          // logged once, not every frame
+        return;
+    }
+    if (i >= 0) pix_sprite_play(p, i, restart);
+}
+
+static float pix__step_seconds(const pix_atlas& a, const pix_sprite_anim& an, int step) {
+    float d = a.frames[a.sequence[an.first + step]].duration;
+    if (d > 0.0f) return d;
+    return 1.0f / (an.fps > 0.0f ? an.fps : 10.0f);
+}
+
+void pix_sprite_update(pix_sprite_player& p, const pix_atlas& a, float dt) {
+    p.entered = 0;
+    if (!p.playing || p.paused || p.finished || p.anim < 0 || p.anim >= a.anim_count) return;
+    const pix_sprite_anim& an = a.anims[p.anim];
+    int count = (int)an.count;
+    if (count <= 0) return;
+    p.time += dt * (p.speed > 0.0f ? p.speed : 1.0f);
+    float dur = pix__step_seconds(a, an, p.step);
+    for (int guard = 0; p.time >= dur && guard < 4096; guard++) {
+        p.time -= dur;
+        int next = p.step + p.dir;
+        if (an.mode == PIX_ANIM_ONCE) {
+            if (next >= count) { p.finished = true; p.time = 0.0f; break; }
+        } else if (an.mode == PIX_ANIM_PINGPONG) {
+            if (next >= count)  { p.dir = -1; next = count >= 2 ? count - 2 : 0; }
+            else if (next < 0)  { p.dir = 1;  next = count >= 2 ? 1 : 0; p.loops++; }
+        } else if (next >= count) {
+            next = 0;
+            p.loops++;
+        }
+        p.step = next;
+        if (p.step < 64) p.entered |= 1ull << p.step;
+        dur = pix__step_seconds(a, an, p.step);
+    }
+}
+
+int pix_sprite_frame(const pix_sprite_player& p, const pix_atlas& a) {
+    if (!p.playing || p.anim < 0 || p.anim >= a.anim_count) return -1;
+    const pix_sprite_anim& an = a.anims[p.anim];
+    int step = p.step < (int)an.count ? p.step : (int)an.count - 1;
+    return step >= 0 ? a.sequence[an.first + step] : -1;
+}
+
+// ---- building ----
+
+void pix_atlas_builder_add(pix_atlas_builder& b, const char* name, const void* rgba, int w, int h) {
+    if (!rgba || w <= 0 || h <= 0 || !pix__grow(b.items, b.cap, b.count + 1)) return;
+    pix__atlas_item& it = b.items[b.count];
+    it.pixels = pix_new<unsigned char>((size_t)w * h * 4);
+    if (!it.pixels) return;
+    memcpy(it.pixels, rgba, (size_t)w * h * 4);
+    it.w = w; it.h = h; it.x = it.y = 0;
+    it.name = pix__pool_add(b.names, b.names_used, b.names_cap, name);
+    b.count++;
+}
+
+bool pix_atlas_builder_add_file(pix_atlas_builder& b, const char* name, const char* path) {
+    pix_mem_scope s = pix_scope_begin();
+    int w, h;
+    unsigned char* px = pix_load_image_rgba(path, &w, &h, PIX_MEM_SCOPED);
+    if (px) pix_atlas_builder_add(b, name, px, w, h);
+    else    pix_log("pix: atlas builder could not load '%s'", path);
+    pix_scope_end(s);
+    return px != 0;
+}
+
+int pix_atlas_builder_add_sheet(pix_atlas_builder& b, const char* name, const char* path, int fw, int fh,
+                                float fps, int mode, int margin, int spacing) {
+    if (fw <= 0 || fh <= 0) return 0;
+    pix_mem_scope s = pix_scope_begin();
+    int w, h;
+    unsigned char* px = pix_load_image_rgba(path, &w, &h, PIX_MEM_SCOPED);
+    if (!px) { pix_log("pix: atlas builder could not load '%s'", path); pix_scope_end(s); return 0; }
+    unsigned char* cell = pix_new<unsigned char>((size_t)fw * fh * 4, PIX_MEM_SCOPED);
+    int first = b.count, n = 0;
+    char fname[96];
+    for (int y = margin; y + fh <= h - margin; y += fh + spacing)
+        for (int x = margin; x + fw <= w - margin; x += fw + spacing) {
+            for (int r = 0; r < fh; r++) memcpy(cell + (size_t)r * fw * 4, px + ((size_t)(y + r) * w + x) * 4, (size_t)fw * 4);
+            snprintf(fname, sizeof(fname), "%s_%d", name, n++);
+            pix_atlas_builder_add(b, fname, cell, fw, fh);
+        }
+    pix_scope_end(s);
+    if (fps > 0.0f && n > 0 && pix__grow(b.anims, b.anim_cap, b.anim_count + 1)) {
+        pix__atlas_pending_anim& an = b.anims[b.anim_count++];
+        memset(&an, 0, sizeof(an));
+        strncpy(an.name, name, sizeof(an.name) - 1);
+        an.first = first; an.count = n; an.fps = fps; an.mode = mode;
+    }
+    return n;
+}
+
+void pix_atlas_builder_free(pix_atlas_builder& b) {
+    for (int i = 0; i < b.count; i++) pix_free(b.items[i].pixels);
+    pix_free(b.items);
+    pix_free(b.anims);
+    pix_free(b.names);
+    b = pix_atlas_builder();
+}
+
+// Skyline bottom-left packing: the packed area's top edge is a list of
+// horizontal segments; each rectangle goes where its top would end lowest,
+// then becomes part of the skyline. Tall-first ordering keeps it tight.
+struct pix__skyline { int x, y, w; };
+
+static bool pix__skyline_place(pix__skyline* sky, int& n, int width, int max_h, int w, int h, int* ox, int* oy) {
+    int best = -1, best_y = 0, best_top = 0x7FFFFFFF, best_waste = 0x7FFFFFFF;
+    for (int i = 0; i < n; i++) {
+        if (sky[i].x + w > width) break;
+        int y = 0, left = w, j = i;
+        while (left > 0 && j < n) { if (sky[j].y > y) y = sky[j].y; left -= sky[j].w; j++; }
+        if (left > 0 || y + h > max_h) continue;
+        int waste = 0;            // the area left under the rectangle, for ties
+        left = w;
+        for (int k = i; k < j; k++) { int span = sky[k].w < left ? sky[k].w : left; waste += (y - sky[k].y) * span; left -= span; }
+        if (y + h < best_top || (y + h == best_top && waste < best_waste)) {
+            best = i; best_y = y; best_top = y + h; best_waste = waste;
+        }
+    }
+    if (best < 0) return false;
+    int x = sky[best].x;
+    *ox = x; *oy = best_y;
+    // the new segment, then trim what it covers
+    pix__skyline seg = { x, best_y + h, w };
+    int i = best;
+    memmove(sky + i + 1, sky + i, (size_t)(n - i) * sizeof(pix__skyline));
+    sky[i] = seg;
+    n++;
+    for (int k = i + 1; k < n;) {
+        int over = sky[i].x + sky[i].w - sky[k].x;
+        if (over <= 0) break;
+        if (over >= sky[k].w) { memmove(sky + k, sky + k + 1, (size_t)(n - k - 1) * sizeof(pix__skyline)); n--; continue; }
+        sky[k].x += over; sky[k].w -= over;
+        break;
+    }
+    for (int k = 0; k + 1 < n;) {          // merge neighbours at the same height
+        if (sky[k].y == sky[k + 1].y) {
+            sky[k].w += sky[k + 1].w;
+            memmove(sky + k + 1, sky + k + 2, (size_t)(n - k - 2) * sizeof(pix__skyline));
+            n--;
+        } else k++;
+    }
+    return true;
+}
+
+pix_atlas pix_atlas_build(pix_atlas_builder& b, idx flags, int max_size, int pad) {
+    pix_atlas a = {};
+    if (b.count == 0) { pix_atlas_builder_free(b); return a; }
+    pix_mem_scope scope = pix_scope_begin();
+    // tallest first
+    int* order = pix_new<int>((size_t)b.count, PIX_MEM_SCOPED);
+    long long area = 0;
+    int widest = 0;
+    for (int i = 0; i < b.count; i++) {
+        order[i] = i;
+        area += (long long)(b.items[i].w + 2 * pad) * (b.items[i].h + 2 * pad);
+        if (b.items[i].w + 2 * pad > widest) widest = b.items[i].w + 2 * pad;
+    }
+    for (int i = 1; i < b.count; i++) {
+        int v = order[i], j = i;
+        while (j > 0 && b.items[order[j - 1]].h < b.items[v].h) { order[j] = order[j - 1]; j--; }
+        order[j] = v;
+    }
+    // the narrowest power-of-two width that holds it all within max_size
+    int width = 64, height = 0;
+    while (width < widest || (long long)width * width < area) width *= 2;
+    pix__skyline* sky = pix_new<pix__skyline>((size_t)b.count * 2 + 2, PIX_MEM_SCOPED);
+    bool packed = false;
+    for (; width <= max_size && !packed; width *= 2) {
+        int n = 1;
+        sky[0].x = 0; sky[0].y = 0; sky[0].w = width;
+        packed = true;
+        height = 0;
+        for (int k = 0; k < b.count && packed; k++) {
+            pix__atlas_item& it = b.items[order[k]];
+            int x, y;
+            if (!pix__skyline_place(sky, n, width, max_size, it.w + 2 * pad, it.h + 2 * pad, &x, &y)) { packed = false; break; }
+            it.x = x + pad; it.y = y + pad;
+            if (y + it.h + 2 * pad > height) height = y + it.h + 2 * pad;
+        }
+        if (packed) break;
+    }
+    if (!packed) {
+        pix_log("pix: atlas does not fit in %dx%d", max_size, max_size);
+        pix_scope_end(scope);
+        pix_atlas_builder_free(b);
+        return a;
+    }
+    height = (height + 3) & ~3;
+    unsigned char* px = pix_new<unsigned char>((size_t)width * height * 4, PIX_MEM_SCOPED | PIX_MEM_ZERO);
+    for (int i = 0; i < b.count; i++) {
+        const pix__atlas_item& it = b.items[i];
+        // the image plus its padding, the padding repeating the nearest edge
+        // pixel: filtering at a frame's border then samples its own colour
+        for (int y = -pad; y < it.h + pad; y++) {
+            int sy = y < 0 ? 0 : (y >= it.h ? it.h - 1 : y);
+            unsigned char* dst = px + ((size_t)(it.y + y) * width + (it.x - pad)) * 4;
+            const unsigned char* row = it.pixels + (size_t)sy * it.w * 4;
+            for (int x = -pad; x < it.w + pad; x++, dst += 4) {
+                int sx = x < 0 ? 0 : (x >= it.w ? it.w - 1 : x);
+                memcpy(dst, row + sx * 4, 4);
+            }
+        }
+    }
+    a.texture = pix_texture_from_pixels(px, width, height, 4, flags);
+    a.owns_texture = a.texture.id != 0;
+    pix_scope_end(scope);
+    for (int i = 0; i < b.count; i++) {
+        const pix__atlas_item& it = b.items[i];
+        pix_rect src = { (float)it.x, (float)it.y, (float)it.w, (float)it.h };
+        pix__atlas_add_frame(a, it.name != 0xFFFFFFFFu ? b.names + it.name : 0, src, v2(0, 0),
+                             v2((float)it.w, (float)it.h), 0.0f);
+    }
+    for (int i = 0; i < b.anim_count; i++)
+        pix_atlas_add_anim(a, b.anims[i].name, b.anims[i].first, b.anims[i].count, b.anims[i].fps, b.anims[i].mode);
+    pix_atlas_builder_free(b);
+    return a;
+}
+
+// ---- drawing ----
+
+void pix_batch_sprite(pix_batch2d& b, const pix_atlas& a, int frame, vec2 pos, vec2 scale, float rot, pix_color tint,
+                      int flags) {
+    if (frame < 0 || frame >= a.frame_count || !a.texture.id) return;
+    const pix_atlas_frame& f = a.frames[frame];
+    // the trimmed rectangle relative to the pivot, in untrimmed frame space
+    float x0 = f.offset.x - f.pivot.x, y0 = f.offset.y - f.pivot.y;
+    float x1 = x0 + f.src.w, y1 = y0 + f.src.h;
+    float iw = 1.0f / (float)a.texture.width, ih = 1.0f / (float)a.texture.height;
+    float u0 = f.src.x * iw, v0 = f.src.y * ih, u1 = (f.src.x + f.src.w) * iw, v1 = (f.src.y + f.src.h) * ih;
+    if (flags & PIX_FLIP_X) { float t = -x1; x1 = -x0; x0 = t; float u = u0; u0 = u1; u1 = u; }
+    if (flags & PIX_FLIP_Y) { float t = -y1; y1 = -y0; y0 = t; float v = v0; v0 = v1; v1 = v; }
+    vec2 c[4] = { {x0 * scale.x, y0 * scale.y}, {x1 * scale.x, y0 * scale.y},
+                  {x1 * scale.x, y1 * scale.y}, {x0 * scale.x, y1 * scale.y} };
+    if (rot != 0.0f) {
+        float r = rot * PIX_DEG2RAD, cs = cosf(r), sn = sinf(r);
+        for (int i = 0; i < 4; i++) c[i] = v2(c[i].x * cs - c[i].y * sn, c[i].x * sn + c[i].y * cs);
+    }
+    for (int i = 0; i < 4; i++) c[i] = v2add(c[i], pos);
+    vec2 uv[4] = { {u0, v0}, {u1, v0}, {u1, v1}, {u0, v1} };
+    pix_batch_quad(b, a.texture.id, c, uv, tint);
+}
+
+#endif // PIX_ATLAS_IMPL
+
+// ---- core/tilemap.hpp ------------------------------------------------------
+#if defined(PIX_IMPLEMENTATION) && !defined(PIX_TILEMAP_IMPL)
+#define PIX_TILEMAP_IMPL
+#include <stdio.h>
+#include <math.h>
+
+#define PIX__TILE_SSBO_BINDING 11
+
+static const char* const PIX__TILE_VS = R"(#version 440 core
+layout(location = 0) in uvec2 aTile;       // cell x | y << 16, tile | flips << 16
+layout(std430, binding = 11) readonly buffer PixTileRects { vec4 rects[]; };
+uniform mat4 uProj;
+uniform vec2 uTileSize;
+uniform vec2 uOffset;
+out vec2 vUV;
+void main() {
+    vec2 c = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));   // strip corners
+    vec2 cell = vec2(float(aTile.x & 0xFFFFu), float(aTile.x >> 16));
+    uint flips = aTile.y >> 16;
+    vec4 r = rects[aTile.y & 0xFFFFu];
+    // Tiled applies the diagonal flip first, then horizontal, then vertical;
+    // looking a corner's texel up undoes them in reverse
+    vec2 t = c;
+    if ((flips & 2u) != 0u) t.y = 1.0 - t.y;
+    if ((flips & 1u) != 0u) t.x = 1.0 - t.x;
+    if ((flips & 4u) != 0u) t = t.yx;
+    vUV = mix(r.xy, r.zw, t);
+    gl_Position = uProj * vec4((cell + c) * uTileSize + uOffset, 0.0, 1.0);
+}
+)";
+
+static const char* const PIX__TILE_FS = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uTex;
+uniform vec4 uTint;
+void main() { frag = texture(uTex, vUV) * uTint; }
+)";
+
+// one program and vertex layout for every tilemap, made on first draw
+static GLuint pix__tile_prog, pix__tile_vao;
+static GLint  pix__tile_u_proj, pix__tile_u_size, pix__tile_u_offset, pix__tile_u_tint, pix__tile_u_tex;
+
+static bool pix__tile_gl(void) {
+    if (pix__tile_prog) return true;
+    pix__tile_prog = opengl_create_shader(PIX__TILE_VS, PIX__TILE_FS);
+    if (!pix__tile_prog) return false;
+    pix__tile_u_proj   = glGetUniformLocation(pix__tile_prog, "uProj");
+    pix__tile_u_size   = glGetUniformLocation(pix__tile_prog, "uTileSize");
+    pix__tile_u_offset = glGetUniformLocation(pix__tile_prog, "uOffset");
+    pix__tile_u_tint   = glGetUniformLocation(pix__tile_prog, "uTint");
+    pix__tile_u_tex    = glGetUniformLocation(pix__tile_prog, "uTex");
+    glGenVertexArrays(1, &pix__tile_vao);
+    glBindVertexArray(pix__tile_vao);
+    glEnableVertexAttribArray(0);
+    glVertexAttribDivisor(0, 1);            // one record per tile, the quad comes from gl_VertexID
+    glBindVertexArray(0);
+    return true;
+}
+
+static uint32_t pix__map_string(pix_tilemap& m, const char* s) {
+    return pix__pool_add(m.strings, m.strings_used, m.strings_cap, s ? s : "");
+}
+
+static int pix__chunks_x(const pix_tilemap& m) { return (m.width + PIX_TILE_CHUNK - 1) / PIX_TILE_CHUNK; }
+static int pix__chunks_y(const pix_tilemap& m) { return (m.height + PIX_TILE_CHUNK - 1) / PIX_TILE_CHUNK; }
+
+static void pix__mark_dirty(pix_tilemap& m, pix_tile_layer& l, int x, int y) {
+    if (l.chunk_dirty) l.chunk_dirty[(y / PIX_TILE_CHUNK) * pix__chunks_x(m) + x / PIX_TILE_CHUNK] = 1;
+}
+
+static pix_tile_layer* pix__new_layer(pix_tilemap& m, int kind, const char* name) {
+    if (!pix__grow(m.layers, m.layer_cap, m.layer_count + 1)) return 0;
+    pix_tile_layer& l = m.layers[m.layer_count++];
+    memset(&l, 0, sizeof(l));
+    l.kind = kind;
+    strncpy(l.name, name ? name : "", sizeof(l.name) - 1);
+    l.visible = true;
+    l.parallax = v2(1, 1);
+    l.tint = PIX_WHITE;
+    if (kind == PIX_LAYER_TILES) {
+        int chunks = pix__chunks_x(m) * pix__chunks_y(m);
+        l.cells = pix_new<uint32_t>((size_t)m.width * m.height, PIX_MEM_ZERO);
+        l.chunk_slot = pix_new<int32_t>((size_t)chunks);
+        l.chunk_count = pix_new<uint16_t>((size_t)chunks, PIX_MEM_ZERO);
+        l.chunk_dirty = pix_new<uint8_t>((size_t)chunks);
+        for (int i = 0; i < chunks; i++) { l.chunk_slot[i] = -1; l.chunk_dirty[i] = 1; }
+    }
+    return &l;
+}
+
+// the tileset's rectangles, normalised, as the GPU table starts out
+static void pix__map_rects(pix_tilemap& m) {
+    pix_free(m.rects);
+    m.rect_count = m.tileset.frame_count;
+    m.rects = pix_new<vec4>((size_t)(m.rect_count > 0 ? m.rect_count : 1));
+    float iw = m.tileset.texture.width > 0 ? 1.0f / (float)m.tileset.texture.width : 0.0f;
+    float ih = m.tileset.texture.height > 0 ? 1.0f / (float)m.tileset.texture.height : 0.0f;
+    for (int i = 0; i < m.rect_count; i++) {
+        pix_rect s = m.tileset.frames[i].src;
+        m.rects[i] = v4(s.x * iw, s.y * ih, (s.x + s.w) * iw, (s.y + s.h) * ih);
+    }
+    m.rects_dirty = true;
+}
+
+pix_tilemap pix_create_tilemap(int width, int height, float tile_w, float tile_h, const pix_atlas& tileset) {
+    pix_tilemap m = {};
+    if (width <= 0 || height <= 0 || width > 65535 || height > 65535) {
+        pix_log("pix: tilemap size %dx%d (1..65535 per side)", width, height);
+        return m;
+    }
+    m.width = width; m.height = height;
+    m.tile_w = tile_w; m.tile_h = tile_h;
+    m.tileset = tileset;
+    m.owns_tileset = false;
+    pix__map_rects(m);
+    return m;
+}
+
+void pix_unload_tilemap(pix_tilemap& m) {
+    for (int i = 0; i < m.layer_count; i++) {
+        pix_tile_layer& l = m.layers[i];
+        if (l.buffer) glDeleteBuffers(1, &l.buffer);
+        if (l.owns_image) pix_unload_texture(l.image);
+        pix_free(l.cells); pix_free(l.terrain);
+        pix_free(l.chunk_slot); pix_free(l.chunk_count); pix_free(l.chunk_dirty);
+    }
+    if (m.rect_buffer) glDeleteBuffers(1, &m.rect_buffer);
+    if (m.owns_tileset) pix_unload_atlas(m.tileset);
+    pix_free(m.layers); pix_free(m.objects); pix_free(m.properties); pix_free(m.strings);
+    pix_free(m.anims); pix_free(m.anim_frames); pix_free(m.anim_times); pix_free(m.rects);
+    m = pix_tilemap();
+}
+
+int pix_tilemap_add_layer(pix_tilemap& m, const char* name) {
+    return pix__new_layer(m, PIX_LAYER_TILES, name) ? m.layer_count - 1 : -1;
+}
+
+int pix_tilemap_add_image_layer(pix_tilemap& m, const char* name, pix_texture image, vec2 parallax, bool rx, bool ry) {
+    pix_tile_layer* l = pix__new_layer(m, PIX_LAYER_IMAGE, name);
+    if (!l) return -1;
+    l->image = image;
+    l->parallax = parallax;
+    l->repeat_x = rx; l->repeat_y = ry;
+    return m.layer_count - 1;
+}
+
+int pix_tilemap_find_layer(const pix_tilemap& m, const char* name) {
+    for (int i = 0; i < m.layer_count; i++) if (strcmp(m.layers[i].name, name) == 0) return i;
+    return -1;
+}
+
+static pix_tile_layer* pix__tile_layer(pix_tilemap& m, int layer) {
+    if (layer < 0 || layer >= m.layer_count || m.layers[layer].kind != PIX_LAYER_TILES) return 0;
+    return &m.layers[layer];
+}
+
+void pix_tilemap_set(pix_tilemap& m, int layer, int x, int y, int tile, uint32_t flags) {
+    pix_tile_layer* l = pix__tile_layer(m, layer);
+    if (!l || x < 0 || y < 0 || x >= m.width || y >= m.height) return;
+    uint32_t v = (tile < 0 || tile > 65534) ? 0u : ((uint32_t)(tile + 1) | (flags & 0xE0000000u));
+    uint32_t& cell = l->cells[(size_t)y * m.width + x];
+    if (cell == v) return;
+    cell = v;
+    pix__mark_dirty(m, *l, x, y);
+}
+
+void pix_tilemap_fill(pix_tilemap& m, int layer, int x, int y, int w, int h, int tile) {
+    for (int j = y; j < y + h; j++) for (int i = x; i < x + w; i++) pix_tilemap_set(m, layer, i, j, tile);
+}
+
+int pix_tilemap_get(const pix_tilemap& m, int layer, int x, int y) {
+    if (layer < 0 || layer >= m.layer_count || m.layers[layer].kind != PIX_LAYER_TILES) return -1;
+    if (x < 0 || y < 0 || x >= m.width || y >= m.height) return -1;
+    return (int)(m.layers[layer].cells[(size_t)y * m.width + x] & 0xFFFFu) - 1;
+}
+
+bool pix_tilemap_tile_at(const pix_tilemap& m, vec2 w, int* tx, int* ty) {
+    int x = (int)floorf(w.x / m.tile_w), y = (int)floorf(w.y / m.tile_h);
+    if (tx) *tx = x;
+    if (ty) *ty = y;
+    return x >= 0 && y >= 0 && x < m.width && y < m.height;
+}
+
+pix_rect pix_tilemap_tile_rect(const pix_tilemap& m, int tx, int ty) {
+    pix_rect r = { tx * m.tile_w, ty * m.tile_h, m.tile_w, m.tile_h };
+    return r;
+}
+
+void pix_tilemap_animate_tile(pix_tilemap& m, int tile, const int* frames, const float* seconds, int count) {
+    if (tile < 0 || tile >= m.rect_count || count <= 0) return;
+    if (!pix__grow(m.anims, m.anim_cap, m.anim_count + 1)) return;
+    int need = m.anim_frame_count + count;
+    int cap_f = m.anim_frame_cap, cap_t = m.anim_frame_cap;
+    if (!pix__grow(m.anim_frames, cap_f, need) || !pix__grow(m.anim_times, cap_t, need)) return;
+    m.anim_frame_cap = cap_f < cap_t ? cap_f : cap_t;
+    pix_tile_anim& a = m.anims[m.anim_count++];
+    a.tile = tile; a.first = m.anim_frame_count; a.count = count; a.total = 0.0f; a.shown = -1;
+    for (int i = 0; i < count; i++) {
+        m.anim_frames[m.anim_frame_count] = frames[i];
+        m.anim_times[m.anim_frame_count] = seconds[i] > 0.0f ? seconds[i] : 0.1f;
+        a.total += m.anim_times[m.anim_frame_count++];
+    }
+}
+
+// ---- autotiling ----
+
+static uint8_t pix__autotile_reduce(uint8_t m) {
+    // a corner only counts when both edges next to it are there
+    if ((m & 1) == 0 || (m & 4) == 0)  m &= (uint8_t)~2;
+    if ((m & 4) == 0 || (m & 16) == 0) m &= (uint8_t)~8;
+    if ((m & 16) == 0 || (m & 64) == 0) m &= (uint8_t)~32;
+    if ((m & 64) == 0 || (m & 1) == 0)  m &= (uint8_t)~128;
+    return m;
+}
+
+int pix_autotile_masks(int mode, uint8_t* out) {
+    int n = 0;
+    if (mode == PIX_AUTOTILE_16) {
+        for (int m = 0; m < 16; m++) out[n++] = (uint8_t)m;
+        return n;
+    }
+    for (int m = 0; m < 256; m++) if (pix__autotile_reduce((uint8_t)m) == m) out[n++] = (uint8_t)m;
+    return n;   // 47
+}
+
+pix_autotile pix_autotile_make(int mode, int first) {
+    pix_autotile r = {};
+    r.mode = mode;
+    uint8_t masks[256];
+    int n = pix_autotile_masks(mode, masks);
+    uint16_t index_of[256] = {};
+    for (int i = 0; i < n; i++) index_of[masks[i]] = (uint16_t)(first + i);
+    for (int m = 0; m < 256; m++) {
+        if (mode == PIX_AUTOTILE_16) r.table[m] = (uint16_t)(first + (m & 15));
+        else                         r.table[m] = index_of[pix__autotile_reduce((uint8_t)m)];
+    }
+    return r;
+}
+
+void pix_tilemap_set_terrain(pix_tilemap& m, int terrain, const pix_autotile& rules) {
+    if (terrain > 0 && terrain < PIX_MAX_TERRAINS) m.terrains[terrain] = rules;
+}
+
+int pix_tilemap_terrain(const pix_tilemap& m, int layer, int x, int y) {
+    if (layer < 0 || layer >= m.layer_count || !m.layers[layer].terrain) return 0;
+    if (x < 0 || y < 0 || x >= m.width || y >= m.height) return 0;
+    return m.layers[layer].terrain[(size_t)y * m.width + x];
+}
+
+// re-picks one cell's tile from its painted neighbours; outside the map counts
+// as the same terrain, so terrain runs cleanly off the edges
+static void pix__autotile_cell(pix_tilemap& m, int layer, int x, int y) {
+    pix_tile_layer& l = m.layers[layer];
+    if (x < 0 || y < 0 || x >= m.width || y >= m.height) return;
+    int t = l.terrain[(size_t)y * m.width + x];
+    if (t == 0) return;
+    const pix_autotile& rules = m.terrains[t];
+    if (!rules.mode) return;
+    static const int dx[8] = { 0, 1, 1, 1, 0, -1, -1, -1 }, dy[8] = { -1, -1, 0, 1, 1, 1, 0, -1 };
+    uint8_t mask = 0;
+    for (int k = 0; k < 8; k++) {
+        int nx = x + dx[k], ny = y + dy[k];
+        bool same = nx < 0 || ny < 0 || nx >= m.width || ny >= m.height || l.terrain[(size_t)ny * m.width + nx] == t;
+        if (same) mask |= (uint8_t)(1u << k);
+    }
+    if (rules.mode == PIX_AUTOTILE_16)   // N E S W -> 1 2 4 8
+        mask = (uint8_t)(((mask & 1) ? 1 : 0) | ((mask & 4) ? 2 : 0) | ((mask & 16) ? 4 : 0) | ((mask & 64) ? 8 : 0));
+    pix_tilemap_set(m, layer, x, y, rules.table[mask]);
+}
+
+void pix_tilemap_paint(pix_tilemap& m, int layer, int x, int y, int terrain) {
+    pix_tile_layer* l = pix__tile_layer(m, layer);
+    if (!l || x < 0 || y < 0 || x >= m.width || y >= m.height || terrain < 0 || terrain >= PIX_MAX_TERRAINS) return;
+    if (!l->terrain) { l->terrain = pix_new<uint8_t>((size_t)m.width * m.height, PIX_MEM_ZERO); if (!l->terrain) return; }
+    l->terrain[(size_t)y * m.width + x] = (uint8_t)terrain;
+    if (terrain == 0) pix_tilemap_set(m, layer, x, y, -1);
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) pix__autotile_cell(m, layer, x + i, y + j);
+}
+
+// ---- objects ----
+
+int pix_tilemap_find_object(const pix_tilemap& m, const char* name) {
+    for (int i = 0; i < m.object_count; i++) if (strcmp(m.objects[i].name, name) == 0) return i;
+    return -1;
+}
+
+const char* pix_tilemap_object_property(const pix_tilemap& m, const pix_map_object& o, const char* key) {
+    for (int i = 0; i < o.property_count; i++) {
+        const pix_map_property& p = m.properties[o.first_property + i];
+        if (strcmp(m.strings + p.key, key) == 0) return m.strings + p.value;
+    }
+    return 0;
+}
+
+// ---- drawing ----
+
+// Packs a chunk's non-empty tiles into its slot (growing the buffer when a
+// new slot is needed) - the only time tiles travel to the GPU.
+static void pix__upload_chunk(pix_tilemap& m, pix_tile_layer& l, int cx, int cy) {
+    int ci = cy * pix__chunks_x(m) + cx;
+    l.chunk_dirty[ci] = 0;
+    PIX_STACK_BUFFER(uint32_t, recs, PIX_TILE_CHUNK * PIX_TILE_CHUNK * 2, PIX_TILE_CHUNK * PIX_TILE_CHUNK * 2);
+    int n = 0;
+    int x1 = (cx + 1) * PIX_TILE_CHUNK, y1 = (cy + 1) * PIX_TILE_CHUNK;
+    if (x1 > m.width) x1 = m.width;
+    if (y1 > m.height) y1 = m.height;
+    for (int y = cy * PIX_TILE_CHUNK; y < y1; y++) {
+        const uint32_t* row = l.cells + (size_t)y * m.width;
+        for (int x = cx * PIX_TILE_CHUNK; x < x1; x++) {
+            uint32_t c = row[x];
+            if (!(c & 0xFFFFu)) continue;
+            uint32_t flips = ((c & PIX_TILE_FLIP_X) ? 1u : 0u) | ((c & PIX_TILE_FLIP_Y) ? 2u : 0u) | ((c & PIX_TILE_FLIP_D) ? 4u : 0u);
+            recs[n * 2] = (uint32_t)x | ((uint32_t)y << 16);
+            recs[n * 2 + 1] = ((c & 0xFFFFu) - 1u) | (flips << 16);
+            n++;
+        }
+    }
+    l.chunk_count[ci] = (uint16_t)n;
+    if (!n) return;
+    const GLsizeiptr slot_bytes = PIX_TILE_CHUNK * PIX_TILE_CHUNK * 8;
+    if (l.chunk_slot[ci] < 0) {
+        if (l.slots_used == l.slots_cap) {
+            // grow by doubling, copying what is there on the GPU
+            int cap = l.slots_cap ? l.slots_cap * 2 : 8;
+            GLuint grown;
+            glGenBuffers(1, &grown);
+            glBindBuffer(GL_COPY_WRITE_BUFFER, grown);
+            glBufferData(GL_COPY_WRITE_BUFFER, slot_bytes * cap, 0, GL_STATIC_DRAW);
+            if (l.buffer) {
+                glBindBuffer(GL_COPY_READ_BUFFER, l.buffer);
+                glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, slot_bytes * l.slots_used);
+                glDeleteBuffers(1, &l.buffer);
+            }
+            l.buffer = grown;
+            l.slots_cap = cap;
+        }
+        l.chunk_slot[ci] = l.slots_used++;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, l.buffer);
+    glBufferSubData(GL_ARRAY_BUFFER, slot_bytes * l.chunk_slot[ci], (GLsizeiptr)n * 8, recs);
+}
+
+// where the animated tiles are right now; only changed entries reach the GPU
+static void pix__animate_tiles(pix_tilemap& m, float time) {
+    for (int i = 0; i < m.anim_count; i++) {
+        pix_tile_anim& a = m.anims[i];
+        float t = fmodf(time, a.total);
+        int k = 0;
+        while (k < a.count - 1 && t >= m.anim_times[a.first + k]) { t -= m.anim_times[a.first + k]; k++; }
+        int frame = m.anim_frames[a.first + k];
+        if (frame == a.shown || frame < 0 || frame >= m.tileset.frame_count) continue;
+        a.shown = frame;
+        pix_rect s = m.tileset.frames[frame].src;
+        float iw = 1.0f / (float)m.tileset.texture.width, ih = 1.0f / (float)m.tileset.texture.height;
+        m.rects[a.tile] = v4(s.x * iw, s.y * ih, (s.x + s.w) * iw, (s.y + s.h) * ih);
+        if (m.rect_buffer && !m.rects_dirty) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, m.rect_buffer);
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)a.tile * 16, 16, &m.rects[a.tile]);
+        }
+    }
+}
+
+void pix_batch_tilemap_layer(pix_batch2d& b, pix_tilemap& m, int layer, float time) {
+    if (layer < 0 || layer >= m.layer_count) return;
+    pix_tile_layer& l = m.layers[layer];
+    if (!l.visible || l.kind == PIX_LAYER_OBJECTS) return;
+    if (l.kind == PIX_LAYER_IMAGE) {
+        pix_batch_parallax(b, l.image, l.parallax, l.offset, 1.0f, l.repeat_x, l.repeat_y, l.tint);
+        return;
+    }
+    if (!m.tileset.texture.id || !m.rect_count || !pix__tile_gl()) return;
+    pix_batch2d_flush(b);     // everything before the layer draws under it
+
+    // the layer trails the camera by its parallax, then its own offset
+    vec2 target = b.has_camera ? b.camera.target : v2(0, 0);
+    vec2 shift = v2(l.offset.x + target.x * (1.0f - l.parallax.x), l.offset.y + target.y * (1.0f - l.parallax.y));
+    pix_rect view = pix_batch2d_visible(b);
+    int tx0 = (int)floorf((view.x - shift.x) / m.tile_w), ty0 = (int)floorf((view.y - shift.y) / m.tile_h);
+    int tx1 = (int)floorf((view.x + view.w - shift.x) / m.tile_w), ty1 = (int)floorf((view.y + view.h - shift.y) / m.tile_h);
+    if (tx1 < 0 || ty1 < 0 || tx0 >= m.width || ty0 >= m.height) return;
+    int cx0 = tx0 < 0 ? 0 : tx0 / PIX_TILE_CHUNK, cy0 = ty0 < 0 ? 0 : ty0 / PIX_TILE_CHUNK;
+    int cx1 = (tx1 >= m.width ? m.width - 1 : tx1) / PIX_TILE_CHUNK;
+    int cy1 = (ty1 >= m.height ? m.height - 1 : ty1) / PIX_TILE_CHUNK;
+    int chunks_x = pix__chunks_x(m);
+    for (int cy = cy0; cy <= cy1; cy++)
+        for (int cx = cx0; cx <= cx1; cx++)
+            if (l.chunk_dirty[cy * chunks_x + cx]) pix__upload_chunk(m, l, cx, cy);
+    if (!l.buffer) return;
+
+    if (!m.rect_buffer) glGenBuffers(1, &m.rect_buffer);
+    pix__animate_tiles(m, time);
+    if (m.rects_dirty) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, m.rect_buffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)m.rect_count * 16, m.rects, GL_DYNAMIC_DRAW);
+        m.rects_dirty = false;
+    }
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    pix__2d_apply_blend(b.blend);
+    glUseProgram(pix__tile_prog);
+    glUniformMatrix4fv(pix__tile_u_proj, 1, GL_FALSE, b.transform.data);
+    glUniform2f(pix__tile_u_size, m.tile_w, m.tile_h);
+    glUniform2f(pix__tile_u_offset, shift.x, shift.y);
+    vec4 tint = pix_color_to_vec4(l.tint);
+    glUniform4f(pix__tile_u_tint, tint.x, tint.y, tint.z, tint.w);
+    glUniform1i(pix__tile_u_tex, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m.tileset.texture.id);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, PIX__TILE_SSBO_BINDING, m.rect_buffer);
+    glBindVertexArray(pix__tile_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, l.buffer);
+    glVertexAttribIPointer(0, 2, GL_UNSIGNED_INT, 8, 0);
+    for (int cy = cy0; cy <= cy1; cy++)
+        for (int cx = cx0; cx <= cx1; cx++) {
+            int ci = cy * chunks_x + cx;
+            if (!l.chunk_count[ci] || l.chunk_slot[ci] < 0) continue;
+            glDrawArraysInstancedBaseInstance(GL_TRIANGLE_STRIP, 0, 4, l.chunk_count[ci],
+                                              (GLuint)(l.chunk_slot[ci] * PIX_TILE_CHUNK * PIX_TILE_CHUNK));
+            b.draws++;
+        }
+    glBindVertexArray(0);
+}
+
+void pix_batch_tilemap(pix_batch2d& b, pix_tilemap& m, float time) {
+    for (int i = 0; i < m.layer_count; i++) pix_batch_tilemap_layer(b, m, i, time);
+}
+
+// ---- Tiled ----
+
+// "#RRGGBB" or "#AARRGGBB"
+static pix_color pix__tiled_color(const js_doc& d, int tok, pix_color def) {
+    char s[16];
+    js_str(d, tok, s, sizeof(s));
+    if (s[0] != '#') return def;
+    uint32_t v = (uint32_t)strtoul(s + 1, 0, 16);
+    if (strlen(s) == 7) return pix_rgba((int)(v >> 16) & 255, (int)(v >> 8) & 255, (int)v & 255);
+    if (strlen(s) == 9) return pix_rgba((int)(v >> 16) & 255, (int)(v >> 8) & 255, (int)v & 255, (int)(v >> 24) & 255);
+    return def;
+}
+
+static void pix__path_join(char* out, size_t cap, const char* base_file, const char* rel) {
+    const char* slash = strrchr(base_file, '/');
+    const char* back = strrchr(base_file, '\\');
+    if (back > slash) slash = back;
+    int dir = slash ? (int)(slash - base_file) + 1 : 0;
+    snprintf(out, cap, "%.*s%s", dir, base_file, rel);
+}
+
+static int pix__b64(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+// A tile layer's gids, from a plain array or base64 (raw, zlib or gzip).
+static bool pix__tiled_gids(const js_doc& d, int layer, uint32_t* out, size_t count) {
+    int data = js_get(d, layer, "data");
+    if (js_type(d, data) == JS_ARR) {
+        size_t i = 0;
+        for (int e = js_first(d, data); e >= 0 && i < count; e = js_next(d, data, e))
+            out[i++] = (uint32_t)strtoul(d.text + d.toks[e].start, 0, 10);
+        return true;
+    }
+    if (js_type(d, data) != JS_STR) return false;
+    // base64 straight from the JSON text, then maybe inflate
+    const char* s = d.text + d.toks[data].start;
+    size_t len = (size_t)(d.toks[data].end - d.toks[data].start);
+    unsigned char* raw = pix_new<unsigned char>(len, PIX_MEM_SCOPED);
+    size_t n = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        int v = pix__b64(s[i]);
+        if (v < 0) continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; raw[n++] = (unsigned char)(acc >> bits); }
+    }
+    size_t want = count * 4;
+    unsigned char* bytes = raw;
+    if (js_is(d, js_get(d, layer, "compression"), "zlib") || js_is(d, js_get(d, layer, "compression"), "gzip")) {
+        bytes = pix_new<unsigned char>(want, PIX_MEM_SCOPED);
+        size_t got = 0;
+        bool ok;
+        if (js_is(d, js_get(d, layer, "compression"), "zlib")) {
+            ok = zlib__inflate(raw, n, bytes, want, &got);
+        } else {
+            // gzip: a 10-byte header, optional fields, then raw deflate
+            size_t at = 10;
+            if (n < 18 || raw[0] != 0x1F || raw[1] != 0x8B) return false;
+            uint8_t flg = raw[3];
+            if (flg & 4) { at += 2 + (size_t)(raw[at] | (raw[at + 1] << 8)); }
+            if (flg & 8) { while (at < n && raw[at]) at++; at++; }
+            if (flg & 16) { while (at < n && raw[at]) at++; at++; }
+            if (flg & 2) at += 2;
+            inf__bits bb = {};
+            bb.data = raw + at;
+            bb.len = n - at;
+            ok = inf__run(&bb, bytes, want, &got);
+        }
+        if (!ok || got != want) return false;
+    } else if (js_get(d, layer, "compression") >= 0 && !js_is(d, js_get(d, layer, "compression"), "")) {
+        pix_log("pix: Tiled layer compression not supported (use CSV, base64, zlib or gzip)");
+        return false;
+    } else if (n < want) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++)
+        out[i] = (uint32_t)bytes[i * 4] | ((uint32_t)bytes[i * 4 + 1] << 8) | ((uint32_t)bytes[i * 4 + 2] << 16) |
+                 ((uint32_t)bytes[i * 4 + 3] << 24);
+    return true;
+}
+
+struct pix__tiled_ctx {
+    pix_tilemap* map;
+    const char*  path;
+    int*  gid_tile;          // gid -> tile index
+    uint32_t gid_count;
+    idx   flags;
+};
+
+static void pix__tiled_props(pix_tilemap& m, const js_doc& d, int props, pix_map_object& o) {
+    o.first_property = m.property_count;
+    o.property_count = 0;
+    char key[64], value[256];
+    for (int p = js_first(d, props); p >= 0; p = js_next(d, props, p)) {
+        js_str(d, js_get(d, p, "name"), key, sizeof(key));
+        int v = js_get(d, p, "value");
+        if (js_type(d, v) == JS_STR) js_str(d, v, value, sizeof(value));
+        else if (v >= 0) {
+            size_t n = (size_t)(d.toks[v].end - d.toks[v].start);
+            if (n >= sizeof(value)) n = sizeof(value) - 1;
+            memcpy(value, d.text + d.toks[v].start, n);
+            value[n] = 0;
+        } else value[0] = 0;
+        if (!pix__grow(m.properties, m.property_cap, m.property_count + 1)) return;
+        pix_map_property& pr = m.properties[m.property_count++];
+        pr.key = pix__map_string(m, key);
+        pr.value = pix__map_string(m, value);
+        o.property_count++;
+    }
+}
+
+static void pix__tiled_layers(pix__tiled_ctx& c, const js_doc& d, int layers, vec2 offset, vec2 parallax,
+                              float opacity, bool visible) {
+    pix_tilemap& m = *c.map;
+    char name[64], type[32], image[256], full[512];
+    for (int L = js_first(d, layers); L >= 0; L = js_next(d, layers, L)) {
+        js_str(d, js_get(d, L, "type"), type, sizeof(type));
+        js_str(d, js_get(d, L, "name"), name, sizeof(name));
+        vec2 off = v2(offset.x + js_float(d, js_get(d, L, "offsetx"), 0), offset.y + js_float(d, js_get(d, L, "offsety"), 0));
+        vec2 par = v2(parallax.x * js_float(d, js_get(d, L, "parallaxx"), 1), parallax.y * js_float(d, js_get(d, L, "parallaxy"), 1));
+        float op = opacity * js_float(d, js_get(d, L, "opacity"), 1.0f);
+        bool vis = visible && js_bool(d, js_get(d, L, "visible"), true);
+        pix_color tint = pix__tiled_color(d, js_get(d, L, "tintcolor"), PIX_WHITE);
+        tint.a = (uint8_t)(tint.a * op + 0.5f);
+        if (strcmp(type, "group") == 0) {
+            pix__tiled_layers(c, d, js_get(d, L, "layers"), off, par, op, vis);
+            continue;
+        }
+        pix_tile_layer* l = 0;
+        if (strcmp(type, "tilelayer") == 0) {
+            l = pix__new_layer(m, PIX_LAYER_TILES, name);
+            if (!l) return;
+            pix_mem_scope s = pix_scope_begin();
+            size_t count = (size_t)m.width * m.height;
+            uint32_t* gids = pix_new<uint32_t>(count, PIX_MEM_SCOPED | PIX_MEM_ZERO);
+            if (!pix__tiled_gids(d, L, gids, count)) pix_log("pix: could not read the tiles of layer '%s'", name);
+            for (size_t i = 0; i < count; i++) {
+                uint32_t g = gids[i], id = g & 0x0FFFFFFFu;
+                if (!id || id >= c.gid_count || c.gid_tile[id] < 0) continue;
+                l->cells[i] = (uint32_t)(c.gid_tile[id] + 1) | (g & 0xE0000000u);
+            }
+            pix_scope_end(s);
+        } else if (strcmp(type, "imagelayer") == 0) {
+            js_str(d, js_get(d, L, "image"), image, sizeof(image));
+            pix__path_join(full, sizeof(full), c.path, image);
+            pix_texture t = pix_load_texture(full, c.flags);
+            if (!t.id) continue;
+            l = pix__new_layer(m, PIX_LAYER_IMAGE, name);
+            if (!l) return;
+            l->image = t;
+            l->owns_image = true;
+            l->repeat_x = js_bool(d, js_get(d, L, "repeatx"), false);
+            l->repeat_y = js_bool(d, js_get(d, L, "repeaty"), false);
+        } else if (strcmp(type, "objectgroup") == 0) {
+            l = pix__new_layer(m, PIX_LAYER_OBJECTS, name);
+            if (!l) return;
+            int objs = js_get(d, L, "objects");
+            for (int o = js_first(d, objs); o >= 0; o = js_next(d, objs, o)) {
+                if (!pix__grow(m.objects, m.object_cap, m.object_count + 1)) break;
+                pix_map_object& ob = m.objects[m.object_count++];
+                memset(&ob, 0, sizeof(ob));
+                js_str(d, js_get(d, o, "name"), ob.name, sizeof(ob.name));
+                int t = js_get(d, o, "type");
+                if (t < 0) t = js_get(d, o, "class");
+                js_str(d, t, ob.type, sizeof(ob.type));
+                ob.x = js_float(d, js_get(d, o, "x"), 0) + off.x;
+                ob.y = js_float(d, js_get(d, o, "y"), 0) + off.y;
+                ob.w = js_float(d, js_get(d, o, "width"), 0);
+                ob.h = js_float(d, js_get(d, o, "height"), 0);
+                ob.rotation = js_float(d, js_get(d, o, "rotation"), 0);
+                uint32_t gid = (uint32_t)strtoul(js_get(d, o, "gid") >= 0 ? d.text + d.toks[js_get(d, o, "gid")].start : "0", 0, 10) & 0x0FFFFFFFu;
+                ob.tile = gid && gid < c.gid_count ? c.gid_tile[gid] : -1;
+                ob.layer = m.layer_count - 1;
+                pix__tiled_props(m, d, js_get(d, o, "properties"), ob);
+            }
+        } else {
+            continue;
+        }
+        l->offset = off;
+        l->parallax = par;
+        l->tint = tint;
+        l->visible = vis;
+    }
+}
+
+// a tileset (embedded, or the external .tsj it points at) into the builder
+struct pix__tiled_pending { int tile_gid; int frame_gids[64]; float seconds[64]; int count; };
+
+static void pix__tiled_tileset(pix__tiled_ctx& c, pix_atlas_builder& b, const js_doc& d, int ts, int firstgid,
+                               const char* ts_path, pix__tiled_pending*& pending, int& pend_n, int& pend_cap) {
+    char image[256], full[512], name[64];
+    js_str(d, js_get(d, ts, "name"), name, sizeof(name));
+    int tw = js_int(d, js_get(d, ts, "tilewidth"), 0), th = js_int(d, js_get(d, ts, "tileheight"), 0);
+    int tilecount = js_int(d, js_get(d, ts, "tilecount"), 0);
+    int tiles = js_get(d, ts, "tiles");
+    if (js_get(d, ts, "image") >= 0) {
+        js_str(d, js_get(d, ts, "image"), image, sizeof(image));
+        pix__path_join(full, sizeof(full), ts_path, image);
+        int base = b.count;
+        int n = pix_atlas_builder_add_sheet(b, name, full, tw, th, 0.0f, PIX_ANIM_LOOP,
+                                            js_int(d, js_get(d, ts, "margin"), 0), js_int(d, js_get(d, ts, "spacing"), 0));
+        if (tilecount <= 0 || tilecount > n) tilecount = n;
+        for (int i = 0; i < tilecount && (uint32_t)(firstgid + i) < c.gid_count; i++) c.gid_tile[firstgid + i] = base + i;
+    } else {
+        // an image collection: one picture per tile
+        for (int t = js_first(d, tiles); t >= 0; t = js_next(d, tiles, t)) {
+            js_str(d, js_get(d, t, "image"), image, sizeof(image));
+            pix__path_join(full, sizeof(full), ts_path, image);
+            int id = js_int(d, js_get(d, t, "id"), 0), at = b.count;
+            if (pix_atlas_builder_add_file(b, image, full) && (uint32_t)(firstgid + id) < c.gid_count)
+                c.gid_tile[firstgid + id] = at;
+        }
+    }
+    // tile animations, resolved once every tileset is in
+    for (int t = js_first(d, tiles); t >= 0; t = js_next(d, tiles, t)) {
+        int anim = js_get(d, t, "animation");
+        if (js_len(d, anim) == 0 || !pix__grow(pending, pend_cap, pend_n + 1)) continue;
+        pix__tiled_pending& p = pending[pend_n++];
+        p.tile_gid = firstgid + js_int(d, js_get(d, t, "id"), 0);
+        p.count = 0;
+        for (int f = js_first(d, anim); f >= 0 && p.count < 64; f = js_next(d, anim, f)) {
+            p.frame_gids[p.count] = firstgid + js_int(d, js_get(d, f, "tileid"), 0);
+            p.seconds[p.count++] = js_float(d, js_get(d, f, "duration"), 100.0f) * 0.001f;
+        }
+    }
+}
+
+pix_tilemap pix_load_tilemap(const char* path, idx flags) {
+    pix_tilemap m = {};
+    pix_mem_scope scope = pix_scope_begin();
+    size_t size = 0;
+    char* text = (char*)pix_read_file(path, &size, PIX_MEM_SCOPED);
+    js_doc d;
+    int root = text ? js_parse(d, text, size, PIX_MEM_SCOPED) : -1;
+    if (root < 0) { pix_log("pix: could not read tilemap '%s'", path); pix_scope_end(scope); return m; }
+    if (js_bool(d, js_get(d, root, "infinite"), false) ||
+        (js_get(d, root, "orientation") >= 0 && !js_is(d, js_get(d, root, "orientation"), "orthogonal"))) {
+        pix_log("pix: '%s' is infinite or not orthogonal; pix reads fixed-size orthogonal Tiled maps", path);
+        pix_scope_end(scope);
+        return m;
+    }
+    m.width = js_int(d, js_get(d, root, "width"), 0);
+    m.height = js_int(d, js_get(d, root, "height"), 0);
+    m.tile_w = js_float(d, js_get(d, root, "tilewidth"), 16);
+    m.tile_h = js_float(d, js_get(d, root, "tileheight"), 16);
+    m.background = pix__tiled_color(d, js_get(d, root, "backgroundcolor"), PIX_BLANK);
+    if (m.width <= 0 || m.height <= 0 || m.width > 65535 || m.height > 65535) {
+        pix_log("pix: tilemap '%s' has an unusable size", path);
+        m = pix_tilemap();
+        pix_scope_end(scope);
+        return m;
+    }
+
+    // gid range: the last tileset's firstgid plus its tile count
+    pix__tiled_ctx c = {};
+    c.map = &m; c.path = path; c.flags = flags;
+    int tilesets = js_get(d, root, "tilesets");
+    uint32_t max_gid = 1;
+    js_doc* ext = pix_new<js_doc>((size_t)(js_len(d, tilesets) + 1), PIX_MEM_SCOPED | PIX_MEM_ZERO);
+    int* ext_root = pix_new<int>((size_t)(js_len(d, tilesets) + 1), PIX_MEM_SCOPED);
+    char** ext_path = pix_new<char*>((size_t)(js_len(d, tilesets) + 1), PIX_MEM_SCOPED);
+    int k = 0;
+    for (int ts = js_first(d, tilesets); ts >= 0; ts = js_next(d, tilesets, ts), k++) {
+        ext_root[k] = -1;
+        ext_path[k] = 0;
+        int firstgid = js_int(d, js_get(d, ts, "firstgid"), 1);
+        int src = js_get(d, ts, "source");
+        int count_tok = js_get(d, ts, "tilecount");
+        if (src >= 0) {
+            char rel[256];
+            js_str(d, src, rel, sizeof(rel));
+            ext_path[k] = pix_new<char>(512, PIX_MEM_SCOPED);
+            pix__path_join(ext_path[k], 512, path, rel);
+            size_t es = 0;
+            char* et = (char*)pix_read_file(ext_path[k], &es, PIX_MEM_SCOPED);
+            ext_root[k] = et ? js_parse(ext[k], et, es, PIX_MEM_SCOPED) : -1;
+            if (ext_root[k] < 0) { pix_log("pix: could not read tileset '%s'", ext_path[k]); continue; }
+            count_tok = js_get(ext[k], ext_root[k], "tilecount");
+            uint32_t end = (uint32_t)(firstgid + js_int(ext[k], count_tok, 0));
+            if (end > max_gid) max_gid = end;
+        } else {
+            uint32_t end = (uint32_t)(firstgid + js_int(d, count_tok, 0));
+            int tiles = js_get(d, ts, "tiles");          // collections may skip ids
+            for (int t = js_first(d, tiles); t >= 0; t = js_next(d, tiles, t)) {
+                uint32_t e = (uint32_t)(firstgid + js_int(d, js_get(d, t, "id"), 0) + 1);
+                if (e > end) end = e;
+            }
+            if (end > max_gid) max_gid = end;
+        }
+    }
+    c.gid_count = max_gid + 1;
+    c.gid_tile = pix_new<int>(c.gid_count, PIX_MEM_SCOPED);
+    for (uint32_t i = 0; i < c.gid_count; i++) c.gid_tile[i] = -1;
+
+    pix_atlas_builder b = {};
+    pix__tiled_pending* pending = 0;
+    int pend_n = 0, pend_cap = 0;
+    k = 0;
+    for (int ts = js_first(d, tilesets); ts >= 0; ts = js_next(d, tilesets, ts), k++) {
+        int firstgid = js_int(d, js_get(d, ts, "firstgid"), 1);
+        if (ext_path[k]) {
+            if (ext_root[k] >= 0) pix__tiled_tileset(c, b, ext[k], ext_root[k], firstgid, ext_path[k], pending, pend_n, pend_cap);
+        } else {
+            pix__tiled_tileset(c, b, d, ts, firstgid, path, pending, pend_n, pend_cap);
+        }
+    }
+    m.tileset = pix_atlas_build(b, flags, 8192, 1);
+    m.owns_tileset = true;
+    if (!m.tileset.texture.id) pix_log("pix: tilemap '%s' has no usable tileset images", path);
+    pix__map_rects(m);
+    for (int i = 0; i < pend_n; i++) {
+        pix__tiled_pending& p = pending[i];
+        if (p.tile_gid <= 0 || (uint32_t)p.tile_gid >= c.gid_count || c.gid_tile[p.tile_gid] < 0) continue;
+        int frames[64];
+        for (int f = 0; f < p.count; f++)
+            frames[f] = (uint32_t)p.frame_gids[f] < c.gid_count ? c.gid_tile[p.frame_gids[f]] : -1;
+        pix_tilemap_animate_tile(m, c.gid_tile[p.tile_gid], frames, p.seconds, p.count);
+    }
+    pix_free(pending);
+
+    pix__tiled_layers(c, d, js_get(d, root, "layers"), v2(0, 0), v2(1, 1), 1.0f, true);
+    pix_scope_end(scope);
+    return m;
+}
+
+#endif // PIX_TILEMAP_IMPL
 
 // ---- core/platform_audio.hpp -----------------------------------------------
 #if defined(PIX_IMPLEMENTATION) && !defined(PIX_PLATFORM_AUDIO_IMPL)
@@ -15364,6 +18365,14 @@ struct pix__context {
     bool   quit;
     bool   first_frame;
     bool   in_3d;
+
+    framebuffer canvas;          // being drawn into, between pix_begin_canvas / pix_end_canvas
+    bool        in_canvas;
+    framebuffer virt;            // pix_set_resolution's target; fbo 0 = off
+    int         virt_mode;
+    pix_rect    virt_dst;        // where it lands in the window
+    float       virt_scale;
+    bool        effects_done;    // the screen effects already ran this frame
 };
 
 static pix__context* pix__ctx;
@@ -15399,18 +18408,91 @@ void pix_shutdown(void) {
     if (c.renderer_ready) pix_destroy_renderer(c.renderer);
     if (c.font_ready) { opengl_destroy_texture(c.font.atlas_texture); pix_free_font(c.font); }
     if (c.loader_ready) pix_destroy_data_loader(c.loader);
+    if (c.virt.fbo) pix_destroy_framebuffer(c.virt);
     pix_batch2d_destroy(c.batch);
     pix_destroy_window(c.window);
     pix_free(pix__ctx);
     pix__ctx = 0;
 }
 
+// ---- where a frame is drawn ----
+//
+// The frame target is the window, or the fixed-resolution target when
+// pix_set_resolution is on; a canvas temporarily replaces it.
+
+static int pix__frame_w(const pix__context& c) { return c.virt.fbo ? c.virt.width : c.window.width; }
+static int pix__frame_h(const pix__context& c) { return c.virt.fbo ? c.virt.height : c.window.height; }
+static const framebuffer* pix__frame_fb(const pix__context& c) { return c.virt.fbo ? &c.virt : 0; }
+
+// binds whatever 2D draws into right now and restarts the batch for it
+static void pix__bind_draw_target(pix__context& c) {
+    if (c.in_canvas) {
+        pix_bind_framebuffer(c.canvas);
+        pix_batch2d_begin(c.batch, c.canvas.width, c.canvas.height, c.canvas.top_down);
+    } else if (c.virt.fbo) {
+        pix_bind_framebuffer(c.virt);
+        pix_batch2d_begin(c.batch, c.virt.width, c.virt.height);
+    } else {
+        pix_bind_backbuffer(c.window.width, c.window.height);
+        pix_batch2d_begin(c.batch, c.window.width, c.window.height);
+    }
+}
+
+// the renderer always matches the frame target, so 3D and the effects line up
+static void pix__fit_renderer(pix__context& c) {
+    if (c.renderer_ready) pix_renderer_resize(c.renderer, pix__frame_w(c), pix__frame_h(c));
+}
+
+// where the fixed-resolution image lands in the window, and at what scale
+static void pix__place_virtual(pix__context& c) {
+    float ww = (float)c.window.width, wh = (float)c.window.height;
+    float vw = (float)c.virt.width, vh = (float)c.virt.height;
+    float s = minf(ww / vw, wh / vh);
+    // whole multiples keep every pixel the same size; a window smaller than
+    // the resolution itself still gets the fractional fit rather than nothing
+    if (!(c.virt_mode & PIX_SCALE_FIT) && s >= 1.0f) s = floorf(s);
+    c.virt_scale = s;
+    c.virt_dst.w = floorf(vw * s);
+    c.virt_dst.h = floorf(vh * s);
+    c.virt_dst.x = floorf((ww - c.virt_dst.w) * 0.5f);
+    c.virt_dst.y = floorf((wh - c.virt_dst.h) * 0.5f);
+}
+
+// The fixed-resolution image onto the window: one blit, no shader, black bars.
+static void pix__present_virtual(pix__context& c) {
+    if (!c.virt.fbo) return;
+    pix_batch2d_flush(c.batch);
+    pix__place_virtual(c);
+    pix_bind_backbuffer(c.window.width, c.window.height);
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    // both are stored bottom-up, so the rectangle only flips into GL's y
+    GLint x0 = (GLint)c.virt_dst.x, y0 = (GLint)(c.window.height - c.virt_dst.y - c.virt_dst.h);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, c.virt.fbo);
+    glBlitFramebuffer(0, 0, c.virt.width, c.virt.height, x0, y0, x0 + (GLint)c.virt_dst.w, y0 + (GLint)c.virt_dst.h,
+                      GL_COLOR_BUFFER_BIT, (c.virt_mode & PIX_SCALE_SMOOTH) ? GL_LINEAR : GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// the screen effects over the frame target, if they have not run yet
+static void pix__run_effects(pix__context& c) {
+    if (c.effects_done || !c.renderer_ready) return;
+    c.effects_done = true;
+    pix_batch2d_flush(c.batch);
+    pix__fit_renderer(c);
+    pix_apply_effects(c.renderer, pix__frame_fb(c));
+}
+
 bool pix_frame(void) {
     if (!pix__ctx) return false;
     pix__context& c = *pix__ctx;
+    if (c.in_canvas) { pix_log("pix: pix_begin_canvas without pix_end_canvas"); pix_end_canvas(); }
+    pix__run_effects(c);
     pix_batch2d_flush(c.batch);
+    pix__present_virtual(c);
     pix_update_window(c.window);     // presents the finished frame, then pumps input
-    if (c.window.resized && c.renderer_ready) pix_renderer_resize(c.renderer, c.window.width, c.window.height);
+    if (c.window.resized) pix__fit_renderer(c);
 
     c.now = pix_time_seconds();
     float dt = c.first_frame ? 1.0f / 60.0f : (float)(c.now - c.last);
@@ -15419,10 +18501,37 @@ bool pix_frame(void) {
     c.dt = dt > 0.1f ? 0.1f : dt;     // a breakpoint or a drag must not launch the physics
     if (dt > 0.0f) c.fps += (1.0f / dt - c.fps) * 0.05f;
 
-    pix_batch2d_begin(c.batch, c.window.width, c.window.height);
-    glViewport(0, 0, c.window.width, c.window.height);
+    c.effects_done = false;
+    pix__bind_draw_target(c);
     if (c.renderer_ready) pix_set_time(c.renderer, (float)(c.now - c.start));
     return !(c.window.should_close || c.quit);
+}
+
+void pix_set_resolution(int width, int height, int mode) {
+    pix__context& c = *pix__ctx;
+    pix_batch2d_flush(c.batch);
+    if (c.virt.fbo && (width != c.virt.width || height != c.virt.height || width <= 0 || height <= 0))
+        pix_destroy_framebuffer(c.virt);
+    c.virt_mode = mode;
+    if (width > 0 && height > 0 && !c.virt.fbo) {
+        c.virt = pix_create_render_target(width, height, false, false, false);
+        pix_bind_framebuffer(c.virt);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    if (c.virt.fbo) pix__place_virtual(c);
+    pix__fit_renderer(c);
+    if (!c.in_canvas) pix__bind_draw_target(c);
+}
+
+void pix_apply_effects(void) {
+    pix__context& c = *pix__ctx;
+    if (c.in_canvas) return;            // effects run over the frame, not a canvas
+    pix__run_effects(c);
+    // the effect passes moved the GL state; carry on drawing where we were
+    mat4 transform = c.batch.transform;
+    pix__bind_draw_target(c);
+    c.batch.transform = transform;
 }
 
 void pix_quit(void) { if (pix__ctx) pix__ctx->quit = true; }
@@ -15430,8 +18539,8 @@ void pix_quit(void) { if (pix__ctx) pix__ctx->quit = true; }
 float  pix_dt(void)     { return pix__ctx ? pix__ctx->dt : 0.0f; }
 double pix_time(void)   { return pix__ctx ? pix__ctx->now - pix__ctx->start : 0.0; }
 int    pix_fps(void)    { return pix__ctx ? (int)(pix__ctx->fps + 0.5f) : 0; }
-int    pix_width(void)  { return pix__ctx ? pix__ctx->window.width : 0; }
-int    pix_height(void) { return pix__ctx ? pix__ctx->window.height : 0; }
+int    pix_width(void)  { return pix__ctx ? pix__frame_w(*pix__ctx) : 0; }
+int    pix_height(void) { return pix__ctx ? pix__frame_h(*pix__ctx) : 0; }
 
 void pix_set_title(const char* title) { pix_set_window_title(pix__ctx->window, title); }
 void pix_set_vsync_enabled(bool on)   { pix_set_vsync(pix__ctx->window, on); }
@@ -15450,8 +18559,18 @@ bool pix_key_released(int key)      { return pix__key(key).released; }
 bool pix_mouse_down(int button)     { return pix__key(button).held; }
 bool pix_mouse_pressed(int button)  { return pix__key(button).pressed; }
 bool pix_mouse_released(int button) { return pix__key(button).released; }
-vec2 pix_mouse_position(void) { return v2((float)pix__ctx->window.mouse_x, (float)pix__ctx->window.mouse_y); }
-vec2 pix_mouse_delta(void)    { return v2((float)pix__ctx->window.mouse_rel_x, (float)pix__ctx->window.mouse_rel_y); }
+// in the drawing area's pixels: with a fixed resolution, through its scale
+vec2 pix_mouse_position(void) {
+    const pix__context& c = *pix__ctx;
+    vec2 m = v2((float)c.window.mouse_x, (float)c.window.mouse_y);
+    if (!c.virt.fbo || c.virt_scale <= 0.0f) return m;
+    return v2((m.x - c.virt_dst.x) / c.virt_scale, (m.y - c.virt_dst.y) / c.virt_scale);
+}
+vec2 pix_mouse_delta(void) {
+    const pix__context& c = *pix__ctx;
+    vec2 d = v2((float)c.window.mouse_rel_x, (float)c.window.mouse_rel_y);
+    return (c.virt.fbo && c.virt_scale > 0.0f) ? v2scale(d, 1.0f / c.virt_scale) : d;
+}
 int  pix_mouse_wheel(void)    { return pix__ctx->window.mouse_wheel; }
 
 const pix_gamepad& pix_get_gamepad(int index) {
@@ -15481,11 +18600,16 @@ vec2 pix_input_axis(void) {
 
 // ---- 2D ----
 
+// clears whatever 2D draws into right now: a canvas, the fixed-resolution
+// target or the window
 void pix_clear(pix_color c) {
-    pix_batch2d_flush(pix__ctx->batch);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, pix__ctx->window.width, pix__ctx->window.height);
+    pix__context& x = *pix__ctx;
+    pix_batch2d_flush(x.batch);
+    if (x.in_canvas)       pix_bind_framebuffer(x.canvas);
+    else if (x.virt.fbo)   pix_bind_framebuffer(x.virt);
+    else                   pix_bind_backbuffer(x.window.width, x.window.height);
     glDisable(GL_SCISSOR_TEST);
+    x.batch.scissor = false;
     glDepthMask(GL_TRUE);
     glClearColor(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, c.a / 255.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -15493,6 +18617,105 @@ void pix_clear(pix_color c) {
 
 void pix_begin_2d(const pix_camera2d& cam) { pix_batch2d_set_camera(pix__ctx->batch, &cam); }
 void pix_end_2d(void)                      { pix_batch2d_set_camera(pix__ctx->batch, 0); }
+
+void pix_draw_rect_rounded_lines(pix_rect r, float radius, float t, pix_color c) {
+    pix_batch_rect_rounded_lines(pix__ctx->batch, r, radius, t, c);
+}
+void pix_draw_rect_gradient_h(pix_rect r, pix_color left, pix_color right) {
+    pix_batch_rect_colors(pix__ctx->batch, r, left, right, right, left);
+}
+void pix_draw_ellipse(vec2 ctr, float rx, float ry, pix_color c) { pix_batch_ellipse(pix__ctx->batch, ctr, rx, ry, c); }
+void pix_draw_ellipse_lines(vec2 ctr, float rx, float ry, float t, pix_color c) {
+    pix_batch_ellipse_lines(pix__ctx->batch, ctr, rx, ry, t, c);
+}
+void pix_draw_ring(vec2 ctr, float inner, float outer, float a0, float a1, pix_color c) {
+    pix_batch_ring(pix__ctx->batch, ctr, inner, outer, a0, a1, c);
+}
+void pix_draw_circle_sector(vec2 ctr, float radius, float a0, float a1, pix_color c) {
+    pix_batch_ring(pix__ctx->batch, ctr, 0.0f, radius, a0, a1, c);
+}
+void pix_draw_polyline(const vec2* pts, int n, float t, pix_color c, bool closed) {
+    pix_batch_polyline(pix__ctx->batch, pts, n, t, c, closed);
+}
+void pix_draw_polygon(const vec2* pts, int n, pix_color c) { pix_batch_polygon(pix__ctx->batch, pts, n, c); }
+void pix_draw_nine_slice(const pix_texture& t, pix_rect src, vec4 border, pix_rect dst, pix_color tint) {
+    pix_batch_nine_slice(pix__ctx->batch, t, src, border, dst, tint);
+}
+void pix_begin_blend(int mode) { pix_batch2d_set_blend(pix__ctx->batch, mode); }
+void pix_end_blend(void)       { pix_batch2d_set_blend(pix__ctx->batch, PIX_BLEND_ALPHA); }
+
+pix_rect pix_camera2d_visible(const pix_camera2d& cam) {
+    return pix_camera2d_visible(cam, (float)pix_width(), (float)pix_height());
+}
+vec2 pix_mouse_world_2d(const pix_camera2d& cam) { return pix_screen_to_world_2d(cam, pix_mouse_position()); }
+
+// ---- sprites ----
+
+void pix_draw_sprite(const pix_atlas& a, int frame, vec2 pos, float scale, float rot, pix_color tint, int flags) {
+    pix_batch_sprite(pix__ctx->batch, a, frame, pos, v2(scale, scale), rot, tint, flags);
+}
+void pix_draw_sprite(const pix_atlas& a, const char* name, vec2 pos, float scale, float rot, pix_color tint, int flags) {
+    pix_batch_sprite(pix__ctx->batch, a, pix_atlas_find(a, name), pos, v2(scale, scale), rot, tint, flags);
+}
+void pix_draw_sprite_anim(const pix_atlas& a, const pix_sprite_player& p, vec2 pos, float scale, float rot,
+                          pix_color tint, int flags) {
+    pix_batch_sprite(pix__ctx->batch, a, pix_sprite_frame(p, a), pos, v2(scale, scale), rot, tint, flags);
+}
+
+// ---- tilemaps ----
+
+void pix_draw_tilemap(pix_tilemap& map) { pix_batch_tilemap(pix__ctx->batch, map, (float)pix_time()); }
+void pix_draw_tilemap_layer(pix_tilemap& map, int layer) {
+    pix_batch_tilemap_layer(pix__ctx->batch, map, layer, (float)pix_time());
+}
+void pix_draw_parallax(const pix_texture& t, vec2 factor, vec2 offset, float scale, bool rx, bool ry, pix_color tint) {
+    pix_batch_parallax(pix__ctx->batch, t, factor, offset, scale, rx, ry, tint);
+}
+
+// ---- canvases ----
+
+framebuffer pix_create_canvas(int width, int height, idx filter) {
+    pix_batch2d_flush(pix__ctx->batch);
+    framebuffer f = pix_create_render_target(width, height, false, false, false);
+    f.top_down = true;
+    GLint mode = (filter & 0xFF) == TEXTURE_PIXELATED ? GL_NEAREST : GL_LINEAR;
+    glBindTexture(GL_TEXTURE_2D, f.color);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mode);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mode);
+    // a fresh canvas is transparent, not whatever the driver left there
+    pix_bind_framebuffer(f);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    pix__context& c = *pix__ctx;
+    if (c.in_canvas)     pix_bind_framebuffer(c.canvas);
+    else if (c.virt.fbo) pix_bind_framebuffer(c.virt);
+    else                 pix_bind_backbuffer(c.window.width, c.window.height);
+    return f;
+}
+
+void pix_destroy_canvas(framebuffer& canvas) { pix_destroy_framebuffer(canvas); }
+
+void pix_begin_canvas(const framebuffer& canvas) {
+    pix__context& c = *pix__ctx;
+    if (c.in_canvas) { pix_log("pix: canvases do not nest; end the first one before beginning another"); return; }
+    pix_batch2d_flush(c.batch);
+    c.canvas = canvas;
+    c.in_canvas = true;
+    pix__bind_draw_target(c);
+}
+
+void pix_end_canvas(void) {
+    pix__context& c = *pix__ctx;
+    if (!c.in_canvas) return;
+    pix_batch2d_flush(c.batch);
+    c.in_canvas = false;
+    pix__bind_draw_target(c);
+}
+
+pix_texture pix_canvas_texture(const framebuffer& canvas) {
+    pix_texture t = { canvas.color, canvas.width, canvas.height };
+    return t;
+}
 
 void pix_draw_rect(float x, float y, float w, float h, pix_color c) { pix_rect r = { x, y, w, h }; pix_batch_rect(pix__ctx->batch, r, c); }
 void pix_draw_rect(pix_rect r, pix_color c)                        { pix_batch_rect(pix__ctx->batch, r, c); }
@@ -15551,7 +18774,7 @@ void pix_draw_fps(float x, float y) {
 pix_renderer& pix_get_renderer(void) {
     pix__context& c = *pix__ctx;
     if (!c.renderer_ready) {
-        c.renderer = pix_create_renderer(c.window.width, c.window.height);
+        c.renderer = pix_create_renderer(pix__frame_w(c), pix__frame_h(c));
         if (!(c.flags & PIX_NO_3D_EFFECTS)) pix_set_quality(c.renderer, PIX_QUALITY_HIGH);
         c.renderer_ready = true;
     }
@@ -15559,33 +18782,61 @@ pix_renderer& pix_get_renderer(void) {
 }
 
 void pix_begin_3d(camera& cam) {
-    pix_batch2d_flush(pix__ctx->batch);
+    pix__context& c = *pix__ctx;
+    pix_batch2d_flush(c.batch);
     pix_renderer& r = pix_get_renderer();
-    pix_renderer_resize(r, pix__ctx->window.width, pix__ctx->window.height);
+    pix__fit_renderer(c);
     begin_frame(r, cam);
-    pix__ctx->in_3d = true;
+    c.in_3d = true;
 }
 
 void pix_finish_3d(void) {
-    if (!pix__ctx->in_3d) return;
-    pix_finish_frame(pix__ctx->renderer);
-    pix__ctx->in_3d = false;
-    pix_batch2d_begin(pix__ctx->batch, pix__ctx->window.width, pix__ctx->window.height);
+    pix__context& c = *pix__ctx;
+    if (!c.in_3d) return;
+    pix_finish_frame(c.renderer);
+    c.in_3d = false;
+    pix__bind_draw_target(c);
 }
 
 void pix_draw_target(const framebuffer& t, pix_rect dst, pix_color tint) {
+    pix_batch2d& b = pix__ctx->batch;
     pix_texture tex = { t.color, t.width, t.height };
-    // render targets are stored bottom-up: a negative source height flips them
-    pix_rect src = { 0.0f, (float)t.height, (float)t.width, -(float)t.height };
-    pix_batch_texture_pro(pix__ctx->batch, tex, src, dst, v2(0, 0), 0.0f, tint);
+    if (!t.top_down) {
+        // 3D targets are stored bottom-up: a negative source height flips them
+        pix_rect src = { 0.0f, (float)t.height, (float)t.width, -(float)t.height };
+        pix_batch_texture_pro(b, tex, src, dst, v2(0, 0), 0.0f, tint);
+        return;
+    }
+    // A canvas holds colour already multiplied by its alpha (that is what
+    // alpha blending into a transparent target produces), so it goes back
+    // with premultiplied blending, and the tint is premultiplied to match.
+    int prev = b.blend;
+    pix_batch2d_set_blend(b, PIX_BLEND_PREMULTIPLIED);
+    float a = tint.a / 255.0f;
+    pix_color pre = pix_rgba((int)(tint.r * a + 0.5f), (int)(tint.g * a + 0.5f), (int)(tint.b * a + 0.5f), tint.a);
+    pix_rect src = { 0.0f, 0.0f, (float)t.width, (float)t.height };
+    pix_batch_texture_pro(b, tex, src, dst, v2(0, 0), 0.0f, pre);
+    pix_batch2d_set_blend(b, prev);
 }
 
 void pix_end_3d(void) {
-    if (!pix__ctx->in_3d) return;
-    end_frame(pix__ctx->renderer);
-    pix__ctx->in_3d = false;
-    // end_frame leaves the backbuffer bound; 2D continues on top of it
-    pix_batch2d_begin(pix__ctx->batch, pix__ctx->window.width, pix__ctx->window.height);
+    pix__context& c = *pix__ctx;
+    if (!c.in_3d) return;
+    if (c.virt.fbo) {
+        // end_frame's stages, with the fixed-resolution target as the output
+        pix_renderer& r = c.renderer;
+        pix_render_shadows(r);
+        pix_render_reflections(r);
+        pix_render_view(r, pix_view_default(r, r.frame_camera));
+        pix_post_process(r, r.scene_target, &c.virt);
+        pix_finish_frame(r);
+    } else {
+        end_frame(c.renderer);
+    }
+    c.in_3d = false;
+    c.effects_done = true;     // the post pass ran them, before any HUD
+    // 2D continues on top of the 3D image
+    pix__bind_draw_target(c);
 }
 
 static vec4 pix__tint(pix_color c) { return pix_color_to_vec4(c); }

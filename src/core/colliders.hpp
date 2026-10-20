@@ -643,4 +643,210 @@ static inline bool ray_vs_capsule(vec3 origin, vec3 dir, const capsule& c, float
     return hit;
 }
 
+// ---------------- oriented boxes ----------------
+//
+// A box turned to any orientation: a crate knocked over, a car on a slope, a
+// trigger volume along a rotated corridor. Same contract as the shapes above:
+// overlaps report the minimum translation, normal from the first shape toward
+// the second.
+
+struct obb {
+    vec3 centre;
+    vec3 half;   // half size along the box's own axes
+    mat3 axes;   // columns: the box's local x, y, z in world space, unit length
+};
+
+static inline obb obb_make(vec3 centre, vec3 half, quat rotation) {
+    obb b;
+    b.centre = centre;
+    b.half = half;
+    b.axes = mat3_from_quat(quat_norm(rotation));
+    return b;
+}
+
+// A model-space box (a mesh's bounds) carried through its transform; scale
+// ends up in `half`, so the axes stay unit length.
+static inline obb obb_from_aabb(const aabb& local, const mat4& transform) {
+    obb b;
+    b.centre = mat4_mul_point(transform, aabb_centre(local));
+    vec3 h = aabb_half(local);
+    vec3 cx = v3(transform.data[0], transform.data[1], transform.data[2]);
+    vec3 cy = v3(transform.data[4], transform.data[5], transform.data[6]);
+    vec3 cz = v3(transform.data[8], transform.data[9], transform.data[10]);
+    float sx = v3len(cx), sy = v3len(cy), sz = v3len(cz);
+    b.half = v3(h.x * sx, h.y * sy, h.z * sz);
+    b.axes = mat3_from_cols(sx > 0.0f ? v3scale(cx, 1.0f / sx) : v3(1, 0, 0),
+                            sy > 0.0f ? v3scale(cy, 1.0f / sy) : v3(0, 1, 0),
+                            sz > 0.0f ? v3scale(cz, 1.0f / sz) : v3(0, 0, 1));
+    return b;
+}
+
+// a world point in the box's own frame (centre at the origin, axes x, y, z)
+static inline vec3 obb_to_local(const obb& b, vec3 p) {
+    vec3 d = v3sub(p, b.centre);
+    return v3(v3dot(d, mat3_col(b.axes, 0)), v3dot(d, mat3_col(b.axes, 1)), v3dot(d, mat3_col(b.axes, 2)));
+}
+
+// the axis aligned box around it, for broadphase grids and culling
+static inline aabb obb_bounds(const obb& b) {
+    // each world axis reaches as far as the three box axes lean along it
+    vec3 e;
+    float* ep = &e.x;
+    for (int k = 0; k < 3; k++)
+        ep[k] = fabsf(b.axes.data[0 + k]) * b.half.x + fabsf(b.axes.data[3 + k]) * b.half.y
+              + fabsf(b.axes.data[6 + k]) * b.half.z;
+    return aabb_from_centre(b.centre, e);
+}
+
+static inline vec3 closest_point_obb(const obb& b, vec3 p) {
+    vec3 l = obb_to_local(b, p);
+    l = v3(clampf(l.x, -b.half.x, b.half.x), clampf(l.y, -b.half.y, b.half.y), clampf(l.z, -b.half.z, b.half.z));
+    return v3add(b.centre, mat3_mul_vec3(b.axes, l));
+}
+
+// Solved in the box's frame, where it is an AABB, then turned back.
+static inline bool collide_sphere_obb(const sphere& s, const obb& b, contact3* out) {
+    sphere local = sphere_make(obb_to_local(b, s.centre), s.radius);
+    if (!collide_sphere_aabb(local, aabb_from_centre(v3(0, 0, 0), b.half), out)) return false;
+    out->normal = mat3_mul_vec3(b.axes, out->normal);
+    return true;
+}
+
+// how far the box reaches along a unit axis from its centre
+static inline float obb__reach(const obb& b, vec3 axis) {
+    return b.half.x * fabsf(v3dot(mat3_col(b.axes, 0), axis))
+         + b.half.y * fabsf(v3dot(mat3_col(b.axes, 1), axis))
+         + b.half.z * fabsf(v3dot(mat3_col(b.axes, 2), axis));
+}
+
+// Separating axis test over the 15 axes that can separate two boxes: each
+// box's three face normals and the nine edge-edge cross products. The axis
+// with the least overlap is the cheapest way out.
+static inline bool collide_obb_obb(const obb& a, const obb& b, contact3* out) {
+    vec3 axes[15];
+    int n = 0;
+    for (int i = 0; i < 3; i++) axes[n++] = mat3_col(a.axes, i);
+    for (int i = 0; i < 3; i++) axes[n++] = mat3_col(b.axes, i);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            vec3 c = v3cross(mat3_col(a.axes, i), mat3_col(b.axes, j));
+            float l2 = v3dot(c, c);
+            if (l2 > 1e-6f) axes[n++] = v3scale(c, 1.0f / sqrtf(l2));   // parallel edges add nothing
+        }
+    vec3 d = v3sub(b.centre, a.centre);
+    float best = 1e30f;
+    vec3 best_axis = v3(0, 1, 0);
+    for (int k = 0; k < n; k++) {
+        float dist = v3dot(d, axes[k]);
+        float overlap = obb__reach(a, axes[k]) + obb__reach(b, axes[k]) - fabsf(dist);
+        if (overlap < 0.0f) return false;
+        // face axes win near-ties: an edge axis only takes over when it is
+        // clearly better, so resting boxes do not flicker between normals
+        bool better = k < 6 ? overlap < best : overlap < best * 0.95f - 1e-4f;
+        if (better) { best = overlap; best_axis = dist < 0.0f ? v3neg(axes[k]) : axes[k]; }
+    }
+    out->normal = best_axis;
+    out->depth = best;
+    return true;
+}
+
+// `dir` normalised, like the other ray tests; 0 when the ray starts inside
+static inline bool ray_vs_obb(vec3 origin, vec3 dir, const obb& b, float max_distance, float* out_t) {
+    vec3 o = obb_to_local(b, origin);
+    vec3 ld = v3(v3dot(dir, mat3_col(b.axes, 0)), v3dot(dir, mat3_col(b.axes, 1)), v3dot(dir, mat3_col(b.axes, 2)));
+    vec3 inv = v3(ld.x != 0.0f ? 1.0f / ld.x : 1e30f, ld.y != 0.0f ? 1.0f / ld.y : 1e30f,
+                  ld.z != 0.0f ? 1.0f / ld.z : 1e30f);
+    return ray_vs_aabb(o, inv, aabb_from_centre(v3(0, 0, 0), b.half), max_distance, out_t);
+}
+
+// ---------------- triangles ----------------
+//
+// For picking against real mesh geometry, standing on sloped terrain, and
+// interpolating anything stored per vertex.
+
+// unit normal of a triangle wound counter-clockwise when seen from its front
+static inline vec3 triangle_normal(vec3 a, vec3 b, vec3 c) { return v3norm(v3cross(v3sub(b, a), v3sub(c, a))); }
+
+// Barycentric weights (u, v, w) of p for triangle abc: p = a*u + b*v + c*w
+// with u + v + w = 1, p taken onto the triangle's plane. All three in 0..1
+// means p is inside. Interpolate uvs, normals or colours with them:
+//   uv = a_uv * w.x + b_uv * w.y + c_uv * w.z
+// A degenerate (zero area) triangle gives (1, 0, 0).
+static inline vec3 barycentric(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 e0 = v3sub(b, a), e1 = v3sub(c, a), e2 = v3sub(p, a);
+    float d00 = v3dot(e0, e0), d01 = v3dot(e0, e1), d11 = v3dot(e1, e1);
+    float d20 = v3dot(e2, e0), d21 = v3dot(e2, e1);
+    float denom = d00 * d11 - d01 * d01;
+    if (fabsf(denom) < 1e-20f) return v3(1.0f, 0.0f, 0.0f);
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    return v3(1.0f - v - w, v, w);
+}
+
+// The point of triangle abc nearest p: inside it, on an edge, or a corner
+// (Ericson, Real-Time Collision Detection 5.1.5).
+static inline vec3 closest_point_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 ab = v3sub(b, a), ac = v3sub(c, a), ap = v3sub(p, a);
+    float d1 = v3dot(ab, ap), d2 = v3dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;                              // corner a
+    vec3 bp = v3sub(p, b);
+    float d3 = v3dot(ab, bp), d4 = v3dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;                                // corner b
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)                          // edge ab
+        return v3add(a, v3scale(ab, d1 / (d1 - d3)));
+    vec3 cp = v3sub(p, c);
+    float d5 = v3dot(ab, cp), d6 = v3dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;                                // corner c
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)                          // edge ac
+        return v3add(a, v3scale(ac, d2 / (d2 - d6)));
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)            // edge bc
+        return v3add(b, v3scale(v3sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+    float k = 1.0f / (va + vb + vc);                                     // inside the face
+    return v3add(a, v3add(v3scale(ab, vb * k), v3scale(ac, vc * k)));
+}
+
+// normal from the sphere toward the triangle, like collide_sphere_aabb
+static inline bool collide_sphere_triangle(const sphere& s, vec3 a, vec3 b, vec3 c, contact3* out) {
+    vec3 q = closest_point_triangle(s.centre, a, b, c);
+    vec3 d = v3sub(q, s.centre);
+    float d2 = v3dot(d, d);
+    if (d2 > s.radius * s.radius) return false;
+    if (d2 > 1e-12f) {
+        float len = sqrtf(d2);
+        out->normal = v3scale(d, 1.0f / len);
+        out->depth = s.radius - len;
+    } else {                                    // centre on the surface: push out the front
+        out->normal = v3neg(triangle_normal(a, b, c));
+        out->depth = s.radius;
+    }
+    return true;
+}
+
+// Moller-Trumbore. `dir` normalised. The front face is the side the
+// triangle's corners run counter-clockwise from; one-sided tests skip rays
+// that come from behind. `out_bary`, if given, receives the hit's barycentric
+// weights for interpolating per-vertex data (uv under the mouse, say).
+static inline bool ray_vs_triangle(vec3 origin, vec3 dir, vec3 a, vec3 b, vec3 c, float max_distance,
+                                   bool two_sided, float* out_t, vec3* out_bary = nullptr) {
+    vec3 e1 = v3sub(b, a), e2 = v3sub(c, a);
+    vec3 pv = v3cross(dir, e2);
+    float det = v3dot(e1, pv);                  // > 0 when the ray meets the front
+    if (two_sided ? fabsf(det) < 1e-12f : det < 1e-12f) return false;
+    float inv = 1.0f / det;
+    vec3 tv = v3sub(origin, a);
+    float u = v3dot(tv, pv) * inv;
+    if (u < 0.0f || u > 1.0f) return false;
+    vec3 qv = v3cross(tv, e1);
+    float v = v3dot(dir, qv) * inv;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = v3dot(e2, qv) * inv;
+    if (t < 0.0f || t > max_distance) return false;
+    if (out_t) *out_t = t;
+    if (out_bary) *out_bary = v3(1.0f - u - v, u, v);
+    return true;
+}
+
 #endif // PIX_COLLIDERS_HPP

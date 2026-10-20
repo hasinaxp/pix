@@ -20,7 +20,7 @@
 //   core/profile.hpp        CPU section profiler
 //   core/colliders.hpp      2D/3D shape tests and contacts
 //   core/physics.hpp        character-scale physics world with broadphase
-//   loader/*                PNG, OBJ, glTF, WAV decoders and the asset tables
+//   loader/*                PNG, OBJ, glTF, WAV decoders, JSON reader, asset tables
 //   core/texture.hpp        textures from files
 //   core/font.hpp           TrueType -> SDF atlas
 //   core/framebuffer.hpp    render targets
@@ -32,7 +32,9 @@
 //   core/renderer.hpp       instanced PBR 3D renderer: shadows, bloom, FXAA
 //   core/sprite.hpp         retained sprite batches
 //   core/text.hpp           retained text
-//   core/draw2d.hpp         immediate 2D: shapes, textures, SDF text
+//   core/draw2d.hpp         immediate 2D: shapes, textures, SDF text, cameras, shake
+//   core/atlas.hpp          sprite atlases, sprite animation, atlas packing
+//   core/tilemap.hpp        tilemaps, Tiled loading, autotiling, parallax layers
 //   core/platform_audio.hpp + core/sound.hpp   mixer and playback
 //   core/app.hpp            pix_init / pix_frame / pix_draw_* - start here
 // No guard of its own on purpose: every module carries an API guard and a
@@ -53,6 +55,7 @@
 #include "loader/png_loader.hpp"
 #include "loader/png_writer.hpp"
 #include "loader/obj_loader.hpp"
+#include "loader/json.hpp"
 #include "loader/gltf_loader.hpp"
 #include "loader/wav_loader.hpp"
 #include "loader/data_loader.hpp"
@@ -68,6 +71,8 @@
 #include "core/sprite.hpp"
 #include "core/text.hpp"
 #include "core/draw2d.hpp"
+#include "core/atlas.hpp"
+#include "core/tilemap.hpp"
 #include "core/platform_audio.hpp"
 #include "core/sound.hpp"
 #include "core/app.hpp"

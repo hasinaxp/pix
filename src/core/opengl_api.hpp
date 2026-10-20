@@ -158,6 +158,7 @@ typedef void  (APIENTRY* PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfl
 typedef void  (APIENTRY* PFN_glUniform4fv)(GLint, GLsizei, const GLfloat*);
 typedef void  (APIENTRY* PFN_glUniform1f)(GLint, GLfloat);
 typedef void  (APIENTRY* PFN_glDrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
+typedef void  (APIENTRY* PFN_glDrawArraysInstancedBaseInstance)(GLenum, GLint, GLsizei, GLsizei, GLuint);
 typedef void  (APIENTRY* PFN_glGenFramebuffers)(GLsizei, GLuint*);
 typedef void  (APIENTRY* PFN_glBindFramebuffer)(GLenum, GLuint);
 typedef void  (APIENTRY* PFN_glDeleteFramebuffers)(GLsizei, const GLuint*);
@@ -211,7 +212,7 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glBufferData) E(glBufferSubData) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
     E(glEnableVertexAttribArray) E(glDisableVertexAttribArray) E(glVertexAttrib4f) \
     E(glVertexAttribDivisor) E(glDrawElementsInstanced) E(glDrawElementsInstancedBaseVertex) \
-    E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) \
+    E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) E(glDrawArraysInstancedBaseInstance) \
     E(glActiveTexture) E(glGenerateMipmap) E(glGetUniformLocation) \
     E(glUniformMatrix4fv) E(glUniform3f) E(glUniform1i) E(glUniform2f) E(glUniform4f) E(glUniform1f) \
     E(glUniform4fv) \

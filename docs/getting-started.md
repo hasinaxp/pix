@@ -181,7 +181,8 @@ Within 2D, later draws cover earlier ones, like layers of paint.
 
 **2D** uses pixels. `(0, 0)` is the **top-left** corner of the window. X grows
 to the right and **Y grows downward**. `pix_width()` and `pix_height()` give
-the window size.
+the size you draw in: the window's, unless you fix a resolution with
+`pix_set_resolution` (see [2D rendering](2d-rendering.md#fixed-resolution-and-pixel-art)).
 
 **3D** uses **Y up**. The ground is the XZ plane. Distances are in whatever
 unit you choose, but the defaults (fog, shadow distance, light falloff,
@@ -257,8 +258,36 @@ folder the program was started from, not necessarily the folder the `.exe`
 is in. Run your game from the folder that contains your assets, or set the
 working directory in Visual Studio's debugging settings.
 
-pix reads PNG images, OBJ and glTF (`.gltf` / `.glb`) models, WAV sounds and
-TrueType (`.ttf`) fonts.
+pix reads PNG images, OBJ and glTF (`.gltf` / `.glb`) models, WAV sounds,
+TrueType (`.ttf`) fonts, Aseprite / TexturePacker sprite atlases, and JSON.
+
+### Reading your own JSON files
+
+For settings, levels or dialogue, pix includes a small JSON reader. It
+reads values straight out of the file text without copying:
+
+```cpp
+size_t size;
+char* text = (char*)pix_read_file("assets/level1.json", &size);
+js_doc doc;
+int root = js_parse(doc, text, size);                 // -1 if the file is not valid JSON
+
+int enemies = js_get(doc, root, "enemies");
+for (int e = js_first(doc, enemies); e >= 0; e = js_next(doc, enemies, e)) {
+    float x = js_float(doc, js_get(doc, e, "x"), 0.0f);   // the last argument is the default
+    float y = js_float(doc, js_get(doc, e, "y"), 0.0f);
+    char kind[32]; js_str(doc, js_get(doc, e, "kind"), kind, sizeof(kind));
+    spawn(kind, x, y);
+}
+js_free(doc);
+pix_free(text);
+```
+
+Every lookup returns a token index, or -1 when the key or element is
+missing. Passing -1 along is harmless and simply gives the default at the
+end, so you don't need to check each step. Also available: `js_int`,
+`js_bool`, `js_len`, `js_at(doc, array, i)`, `js_type`, and, for walking an
+object's keys, `js_first` / `js_value_of` / `js_next`.
 
 ## Window options
 
@@ -359,7 +388,7 @@ build debug city      build without optimisation, with debug info
 | `float pix_dt()` | seconds the last frame took, at most 0.1 |
 | `double pix_time()` | seconds since `pix_init` |
 | `int pix_fps()` | frames per second, smoothed |
-| `int pix_width()`, `int pix_height()` | window size in pixels |
+| `int pix_width()`, `int pix_height()` | the size you draw in: the window's, or a [fixed resolution](2d-rendering.md#fixed-resolution-and-pixel-art) |
 | `void pix_set_title(title)` | |
 | `void pix_set_vsync_enabled(on)` | |
 | `void pix_toggle_fullscreen()` | |
