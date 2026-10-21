@@ -24,6 +24,16 @@ typedef ptrdiff_t GLintptr;
 #define GL_CLIP_DISTANCE0       0x3000
 #endif
 #define GL_FRAGMENT_SHADER      0x8B30
+#define GL_GEOMETRY_SHADER      0x8DD9
+#define GL_TESS_CONTROL_SHADER  0x8E88
+#define GL_TESS_EVALUATION_SHADER 0x8E87
+#define GL_PATCHES              0x000E
+#define GL_PATCH_VERTICES       0x8E72
+#ifndef GL_TEXTURE_3D
+#define GL_TEXTURE_3D           0x806F
+#endif
+#define GL_R16F                 0x822D
+#define GL_RG16F                0x822F
 #define GL_COMPILE_STATUS       0x8B81
 #define GL_LINK_STATUS          0x8B82
 #define GL_ARRAY_BUFFER         0x8892
@@ -202,6 +212,12 @@ typedef void  (APIENTRY* PFN_glUniform1ui)(GLint, GLuint);
 typedef void  (APIENTRY* PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void  (APIENTRY* PFN_glUniform1fv)(GLint, GLsizei, const GLfloat*);
 typedef void  (APIENTRY* PFN_glUniform3fv)(GLint, GLsizei, const GLfloat*);
+typedef void  (APIENTRY* PFN_glPatchParameteri)(GLenum, GLint);
+typedef void  (APIENTRY* PFN_glTexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+typedef void  (APIENTRY* PFN_glGenSamplers)(GLsizei, GLuint*);
+typedef void  (APIENTRY* PFN_glDeleteSamplers)(GLsizei, const GLuint*);
+typedef void  (APIENTRY* PFN_glBindSampler)(GLuint, GLuint);
+typedef void  (APIENTRY* PFN_glSamplerParameteri)(GLuint, GLenum, GLint);
 typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei);
 
 #define GL_FUNC_LIST \
@@ -225,7 +241,8 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glGetQueryObjectiv) E(glGetQueryObjectui64v) E(glBlendFuncSeparate) E(glCopyBufferSubData) E(glCopyImageSubData) \
     E(glDispatchCompute) E(glDispatchComputeIndirect) E(glMemoryBarrier) E(glBindImageTexture) \
     E(glGetBufferSubData) E(glBindBufferRange) E(glDrawArraysIndirect) E(glDrawElementsIndirect) \
-    E(glMultiDrawElementsIndirect) E(glTexStorage2D) E(glUniform1ui) E(glUniform2i) E(glUniform1fv) E(glUniform3fv)
+    E(glMultiDrawElementsIndirect) E(glTexStorage2D) E(glUniform1ui) E(glUniform2i) E(glUniform1fv) E(glUniform3fv) \
+    E(glPatchParameteri) E(glTexImage3D) E(glGenSamplers) E(glDeleteSamplers) E(glBindSampler) E(glSamplerParameteri)
 
 #define E(name) extern PFN_##name name;
 GL_FUNC_LIST

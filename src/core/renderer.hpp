@@ -126,7 +126,7 @@ struct material {
     // dielectric gives the Fresnel reflection of a polished floor or water.
     float planar_reflection;
     // > 0: the surface is see-through and bends what is behind it by this much
-    // (0.02 - 0.1 is glass to thick water). lpha then means opacity of the
+    // (0.02 - 0.1 is glass to thick water). alpha then means opacity of the
     // surface itself over the refracted view. Drawn in the transparent pass.
     float refraction;
     // Free for custom surface shaders (uParams0 / uParams1). The built-in water
@@ -145,6 +145,16 @@ struct material {
     // the program skinned meshes use with this material (0 = built-in; see
     // load_skinned_surface_shader)
     idx skinned_shader;
+
+    // ---- outlines ----
+    // > 0: an ink line this many world units wide around the surface (the mesh
+    // drawn again, pushed out along its normals, back faces only)
+    float outline_width;
+    vec3  outline_color;    // sRGB
+    // 0..255: which group the screen outline (r.outline) separates this
+    // surface into; group edges get inked, and with r.outline.groups_only only
+    // groups other than 0 are - a selection highlight
+    uint8_t outline_group;
 
     // extra textures for custom shaders: uTex1..uTex4 (0 = unbound)
     idx textures[4];
@@ -208,13 +218,22 @@ struct pix_scene_block {
     float screen[4];
     float shadow_eye[4];
     float shadow_dir[4];
+    float inv_view_proj[16];
+    float prev_view_proj[16];
+    float proj[16];
+    float fog_height[4];
+    float screen_fx[4];
+    float shadow_soft[4];
 };
 
+#define PIX_MAX_SHADOW_TILES 16   // local light shadow atlas tiles (a spot uses 1, a point 6)
 struct pix_light_block {
     float pos_radius[MAX_SHADER_LIGHTS * 4];
     float color_inner[MAX_SHADER_LIGHTS * 4];
     float dir_outer[MAX_SHADER_LIGHTS * 4];
     float meta[4];
+    float shadow[MAX_SHADER_LIGHTS * 4];
+    float tiles[PIX_MAX_SHADOW_TILES * 16];
 };
 
 // The pipeline stages, timed separately; what pix_gpu_pass_ms indexes.
@@ -251,6 +270,82 @@ struct pix_shadow_settings {
     bool  stagger;       // the near cascade every frame, the two far ones on alternate
                          // frames: about a third less shadow work, and what moves far
                          // off updates its shadow at half rate
+    // > 0: soft shadows that widen with distance from the caster (PCSS) - the
+    // sun's angular size in radians; the real sun is ~0.01, 0.02..0.05 reads soft
+    float penumbra;
+    // > 0: screen-space contact shadows this long (metres) - the small gaps
+    // under feet and objects that the shadow map is too coarse to see
+    float contact;
+    // shadows from spot and point lights with light.cast_shadows set
+    bool  local;
+    int   local_resolution;   // the atlas side, texels (tiles are a quarter of it)
+};
+
+// What the main view keeps beside its colour: depth plus view-space normals.
+// AUTO runs the prepass whenever something needs it (screen AO, contact
+// shadows, normal or group outlines, a post effect that reads uNormal); with
+// it on, the lit pass shades each visible pixel once.
+#define PIX_PREPASS_AUTO 0
+#define PIX_PREPASS_ON   1
+#define PIX_PREPASS_OFF  2
+
+// Screen-space ambient occlusion: corners, creases and contact darken.
+struct pix_ao_settings {
+    bool  enabled;
+    float radius;            // metres the occlusion reaches, 0.6
+    float intensity;         // 1.5: higher is darker
+    int   samples;           // 12; 8 is cheaper, 16 smoother
+    bool  half_resolution;   // true: a quarter of the cost, a little softer
+};
+
+// Ink lines from the screen: where depth jumps, surfaces fold, or one
+// material group (material.outline_group) meets another.
+struct pix_outline_settings {
+    bool  enabled;
+    vec3  color;             // sRGB, black by default
+    float thickness;         // pixels, 1
+    float depth_threshold;   // relative depth jump that counts as an edge, 0.1
+    float normal_threshold;  // 0..2 bend that counts as an edge, 0.4; 0 = none
+    bool  object_edges;      // ink where outline groups meet (true)
+    bool  groups_only;       // only around groups other than 0: selection highlights
+    float fade_distance;     // fade lines out by this distance, 0 = never
+};
+
+// Height and colour of the fog; its colour and density come from the time of
+// day or pix_set_fog.
+struct pix_fog_settings {
+    float height;            // where height fog is at full density, world y
+    float height_falloff;    // per metre above it; 0 = even fog everywhere (and density means the old exp2 fog)
+    float sun_scatter;       // 0..: fog glows toward the sun
+    float max_opacity;       // 1: the fog never hides more than this much
+};
+
+// Light you can see in the air: sun shafts through gaps (from the shadow
+// map), cones under spot lights, halos round lamps.
+struct pix_volumetric_settings {
+    bool  enabled;
+    float density;           // 0.02: how much the air scatters, per metre
+    float anisotropy;        // -1..1: 0.6 glows toward the light
+    float intensity;         // sun shafts, 1
+    float light_intensity;   // spot and point light volumes, 1
+    float max_distance;      // metres marched, 80
+    int   steps;             // 24
+    bool  lights;            // spot and point lights scatter too
+};
+
+struct pix_dof_settings {
+    bool  enabled;
+    float focus_distance;    // metres
+    float focus_range;       // metres either side that stay sharp-ish
+    float max_blur;          // pixels, 8
+    bool  auto_focus;        // focus on whatever is in the middle of the screen
+};
+
+struct pix_motion_blur_settings {
+    bool  enabled;
+    float strength;          // 1 = a full frame of motion
+    int   samples;           // 8
+    float max_length;        // fraction of the screen, 0.05
 };
 
 #define PIX_TONEMAP_ACES     0   // filmic, rolls highlights off - the default
@@ -271,6 +366,14 @@ struct pix_post_settings {
     vec3  color_filter;    // multiplies the final image; (1,1,1) = none
     bool  fxaa;            // cheap edge anti-aliasing
     bool  dither;          // breaks up banding in smooth gradients (skies, fog)
+    // eye adaptation: exposure follows the scene's average brightness
+    bool  auto_exposure;
+    float exposure_key;    // the average it aims for, 0.18
+    float exposure_speed;  // how quickly it adapts, 1.5
+    float exposure_min, exposure_max;   // limits on the adapted multiplier, 0.25..4
+    idx   lut;             // a colour-grading cube from pix_load_color_lut, 0 = none
+    float lut_strength;    // 1
+    float grain;           // film grain, 0 = none, ~0.04 visible
 };
 
 // A user fullscreen pass run after tonemapping, in the order added.
@@ -279,7 +382,7 @@ struct pix_post_effect {
     idx  program;
     bool enabled;
     vec4 params;           // uParams in the shader, free for the effect to use
-    GLint u_scene, u_depth, u_texel, u_params, u_near_far;
+    GLint u_scene, u_depth, u_texel, u_params, u_near_far, u_normal;
 };
 
 // Reflections beyond the analytic sky. Like the other settings: plain data,
@@ -316,6 +419,8 @@ struct pix__geometry_pool {
 
 struct pix__program_uniforms {
     GLuint program;
+    GLint screen_fx, local_shadow, shadow_raw, outline_group, outline_width, outline_color;
+    bool  patches;      // has tessellation stages: draws GL_PATCHES
     GLint tex, color, metallic, roughness, emissive, cutoff, unlit, shadow_map;
     GLint model, tint, bones, light_view_proj;
     GLint env_map, planar_map, refract_map, planar, refraction;
@@ -440,6 +545,15 @@ struct pix_renderer {
     pix_shadow_settings shadows;
     pix_post_settings   post;
     pix_reflection_settings reflections;
+    int                 prepass;          // PIX_PREPASS_*
+    pix_ao_settings     ao;
+    pix_outline_settings outline;
+    pix_fog_settings    fog;
+    pix_volumetric_settings volumetrics;
+    pix_dof_settings    dof;
+    pix_motion_blur_settings motion_blur;
+    bool      wireframe;                  // draw every opaque mesh's edges over it
+    pix_color wireframe_color;
     pix_post_effect     post_effects[PIX_MAX_POST_EFFECTS];
     int                 post_effect_count;
     float exposure;          // set by the time of day; post.exposure scales it
@@ -490,7 +604,7 @@ struct pix_renderer {
     framebuffer ldr_a, ldr_b;         // tonemapped ping-pong for FXAA and post effects
     framebuffer shadow_map;           // depth atlas, cascades side by side
     framebuffer bloom_a, bloom_b;
-    GLint u_post[12];                 // cached uniform locations, see pix__cache_uniforms
+    GLint u_post[32];                 // cached uniform locations, see pix__cache_uniforms
     GLint u_bloom[6];
     GLint u_fxaa[2];
     GLint u_sky, u_particle[2];
@@ -525,6 +639,35 @@ struct pix_renderer {
     int   cascade_mask;              // cascades rendered this frame (bit per cascade)
     unsigned shadow_frame;           // counts frames with shadows, for the stagger
     float cascade_fit_key[3];        // resolution, distance, depth range last fitted with
+
+    // ---- scene buffers and the passes that read them ----
+    GLuint normal_tex, prepass_fbo;      // prepass normals; depth is scene_target's
+    bool   prepass_done;                 // this frame's main view ran the prepass
+    framebuffer fx_a, fx_b;              // screen AO / contact shadows and its blur
+    bool   fx_valid;
+    framebuffer vol_a, vol_b;            // volumetric light, half resolution
+    framebuffer hdr_a, hdr_b;            // full-size HDR ping-pong: motion blur, DoF
+    framebuffer dof_half;
+    GLuint lum_tex, lum_fbo;             // log luminance, mipmapped to its average
+    GLuint adapt_tex[2], adapt_fbo[2];   // adapted luminance, ping-pong 1x1
+    int    adapt_index;
+    bool   adapt_fresh;
+    float  last_time;
+    framebuffer local_shadow;            // spot / point shadow atlas
+    int    local_tiles;                  // tiles used this frame
+    mat4   local_tile_vp[PIX_MAX_SHADOW_TILES];
+    vec3   local_tile_eye[PIX_MAX_SHADOW_TILES];
+    float  local_tile_far[PIX_MAX_SHADOW_TILES];
+    float  local_info[MAX_SHADER_LIGHTS * 4];
+    GLuint shadow_raw_sampler;           // the sun atlas read without comparison (PCSS)
+    mat4   prev_view_proj;
+    unsigned frame_number;
+    GLenum draw_mode;                    // GL_TRIANGLES, or GL_PATCHES while a tessellated program draws
+    idx prepass_shader, prepass_skinned_shader, fx_shader, bilateral_shader;
+    idx outline_shader, outline_skinned_shader, volumetric_shader, motion_blur_shader;
+    idx dof_blur_shader, dof_composite_shader, luminance_shader, adapt_shader, wire_shader;
+    struct { idx surface, prepass; } prepass_twins[MAX_SHADERS]; size_t prepass_twin_count;
+    struct { idx program; } patch_programs[MAX_SHADERS]; size_t patch_program_count;
 };
 
 // ---- lifetime ----
@@ -602,6 +745,14 @@ PIXDEF idx load_shader(pix_renderer& renderer, const char* vsrc, const char* fsr
 // the whole lighting library (shade_surface, sky_env, apply_fog, uTime...)
 // spliced in. Assign the result to material.shader.
 PIXDEF idx load_surface_shader(pix_renderer& renderer, const char* fsrc, const char* vsrc = nullptr);
+// The same with every programmable stage: a geometry shader (`gsrc`) and/or
+// tessellation (`tcsrc` control + `tesrc` evaluation, drawn as triangle
+// patches). Each stage receives what the one before it outputs and must pass
+// on vNormal, vUV, vWorld and vTint to the fragment stage (the tessellation
+// evaluation or geometry stage sets gl_Position). Null stages are skipped.
+// Shadows and the prepass run the vertex stage only.
+PIXDEF idx load_surface_shader_stages(pix_renderer& renderer, const char* fsrc, const char* vsrc,
+                                      const char* gsrc, const char* tcsrc = nullptr, const char* tesrc = nullptr);
 // `vsrc`, when given, replaces VSHDER_BASIC: same attribute layout (0 pos,
 // 1 normal, 2 uv, 3..6 instance matrix, 7 instance tint), same outputs
 // (vNormal, vUV, vWorld, vTint), scene block available - for wind, waves,
@@ -764,6 +915,11 @@ PIXDEF bool pix_world_to_screen(const pix_renderer& renderer, vec3 world, vec2* 
 // Window pixel -> normalised world-space ray from the camera, for picking.
 PIXDEF vec3 pix_screen_to_ray(const pix_renderer& renderer, float x, float y);
 
+// A colour-grading cube from a PNG laid out as N slices of N x N side by side
+// (the usual 256 x 16 or 1024 x 32 strip): red across each slice, green down,
+// blue from slice to slice. Assign the result to r.post.lut.
+PIXDEF idx pix_load_color_lut(const char* path);
+
 // ---- timing ----
 PIXDEF void   pix_enable_gpu_timing(pix_renderer& renderer, bool on);
 PIXDEF double pix_gpu_pass_ms(const pix_renderer& renderer, int pass);
@@ -797,6 +953,31 @@ static idx pix__compile_skinned(const char* vs, const char* fs, bool lit) {
     pix_free(f);
     return p;
 }
+// a skinned vertex stage with an unlit fragment stage that still wants the scene block
+static idx pix__compile_skinned_common(const char* vs, const char* fs) {
+    const char* vchunks[] = { GLSL_SCENE, GLSL_COMMON, GLSL_SKINNING };
+    char* v = pix_shader_splice(vs, vchunks, 3);
+    char* fr = shader_with_common(fs);
+    idx p = (v && fr) ? opengl_create_shader(v, fr) : 0;
+    pix_free(v);
+    pix_free(fr);
+    return p;
+}
+
+// Every pix sampler on its own unit. A program whose samplers of different
+// types share a unit (the default, 0) fails to draw at all, so any program
+// built with the lighting library gets this once.
+static void pix__scene_sampler_units(GLuint p) {
+    static const char* names[] = { "uShadowMap", "uEnvMap", "uPlanarMap", "uRefractMap", "uSceneDepth",
+                                   "uScreenFx", "uLocalShadow", "uShadowRaw" };
+    static const int units[] = { 1, 2, 3, 4, 5, 10, 11, 12 };
+    glUseProgram(p);
+    for (int i = 0; i < 8; i++) {
+        GLint loc = glGetUniformLocation(p, names[i]);
+        if (loc >= 0) glUniform1i(loc, units[i]);
+    }
+}
+
 static pix__program_uniforms* pix__uniforms_for(pix_renderer& r, GLuint program) {
     for (int i = 0; i < r.uniform_cache_count; i++)
         if (r.uniform_cache[i].program == program) return &r.uniform_cache[i];
@@ -827,6 +1008,15 @@ static pix__program_uniforms* pix__uniforms_for(pix_renderer& r, GLuint program)
     u.params0     = glGetUniformLocation(program, "uParams0");
     u.params1     = glGetUniformLocation(program, "uParams1");
     u.toon        = glGetUniformLocation(program, "uToon");
+    u.screen_fx   = glGetUniformLocation(program, "uScreenFx");
+    u.local_shadow = glGetUniformLocation(program, "uLocalShadow");
+    u.shadow_raw  = glGetUniformLocation(program, "uShadowRaw");
+    u.outline_group = glGetUniformLocation(program, "uOutlineGroup");
+    u.outline_width = glGetUniformLocation(program, "uOutlineWidth");
+    u.outline_color = glGetUniformLocation(program, "uOutlineColor");
+    u.patches = false;
+    for (size_t i = 0; i < r.patch_program_count; i++)
+        if (r.patch_programs[i].program == program) u.patches = true;
     const char* extra[4] = { "uTex1", "uTex2", "uTex3", "uTex4" };
     for (int i = 0; i < 4; i++) u.extra_tex[i] = glGetUniformLocation(program, extra[i]);
     u.clips = 0;
@@ -964,16 +1154,153 @@ static void pix__mesh_bounds(mesh& m, const void* vertices, size_t count, size_t
 
 // Everything screen sized. The optional ones (LDR ping-pong, bloom) are made
 // on demand by pix__sync_settings, so a resize only has to drop them.
+static void pix__destroy_prepass(pix_renderer& r) {
+    if (r.prepass_fbo) glDeleteFramebuffers(1, &r.prepass_fbo);
+    if (r.normal_tex) glDeleteTextures(1, &r.normal_tex);
+    r.prepass_fbo = r.normal_tex = 0;
+}
+
 static void pix__destroy_screen_targets(pix_renderer& r) {
-    framebuffer* all[] = { &r.scene_target, &r.ldr_a, &r.ldr_b, &r.bloom_a, &r.bloom_b };
+    framebuffer* all[] = { &r.scene_target, &r.ldr_a, &r.ldr_b, &r.bloom_a, &r.bloom_b,
+                           &r.fx_a, &r.fx_b, &r.vol_a, &r.vol_b, &r.hdr_a, &r.hdr_b, &r.dof_half };
     for (size_t i = 0; i < PIX_ARRAY_COUNT(all); i++)
         if (all[i]->fbo) pix_destroy_framebuffer(*all[i]);
+    pix__destroy_prepass(r);
+}
+
+// A colour-only target of any format, for the passes whose format the
+// render-target helper does not offer (RGBA16F with alpha, mipmapped R16F).
+static framebuffer pix__color_target(int w, int h, GLint internal, GLenum format, GLenum type, bool linear) {
+    framebuffer t = {};
+    t.width = w; t.height = h; t.hdr = true;
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, format, type, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    t.fbo = fbo; t.color = tex;
+    return t;
+}
+
+// Does anything this frame read the prepass buffers?
+static bool pix__wants_prepass(const pix_renderer& r) {
+    if (r.prepass == PIX_PREPASS_OFF) return false;
+    if (r.prepass == PIX_PREPASS_ON) return true;
+    if (r.ao.enabled || r.shadows.contact > 0.0f) return true;
+    const pix_outline_settings& o = r.outline;
+    if (o.enabled && (o.normal_threshold > 0.0f || o.object_edges || o.groups_only)) return true;
+    for (int i = 0; i < r.post_effect_count; i++)
+        if (r.post_effects[i].enabled && r.post_effects[i].program && r.post_effects[i].u_normal >= 0) return true;
+    return false;
+}
+
+static void pix__sync_extras(pix_renderer& r) {
+    // ---- prepass: normals beside the scene depth ----
+    bool pre = pix__wants_prepass(r);
+    if (pre && !r.prepass_fbo) {
+        glGenTextures(1, &r.normal_tex);
+        glBindTexture(GL_TEXTURE_2D, r.normal_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r.width, r.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &r.prepass_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, r.prepass_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r.normal_tex, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, r.scene_target.depth, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    } else if (!pre && r.prepass_fbo) {
+        pix__destroy_prepass(r);
+    }
+
+    // ---- screen AO / contact shadows ----
+    bool fx = pre && (r.ao.enabled || r.shadows.contact > 0.0f);
+    int div = r.ao.half_resolution ? 2 : 1;
+    int fw = r.width / div > 1 ? r.width / div : 1, fh = r.height / div > 1 ? r.height / div : 1;
+    if (r.fx_a.fbo && (!fx || r.fx_a.width != fw)) { pix_destroy_framebuffer(r.fx_a); pix_destroy_framebuffer(r.fx_b); }
+    if (fx && !r.fx_a.fbo) {
+        r.fx_a = pix_create_render_target(fw, fh, false, false, false);
+        r.fx_b = pix_create_render_target(fw, fh, false, false, false);
+    }
+
+    // ---- volumetric light ----
+    bool vol = r.volumetrics.enabled;
+    if (vol && !r.vol_a.fbo) {
+        int vw = r.width / 2 > 1 ? r.width / 2 : 1, vh = r.height / 2 > 1 ? r.height / 2 : 1;
+        r.vol_a = pix_create_render_target(vw, vh, true, false, false);
+        r.vol_b = pix_create_render_target(vw, vh, true, false, false);
+    } else if (!vol && r.vol_a.fbo) {
+        pix_destroy_framebuffer(r.vol_a);
+        pix_destroy_framebuffer(r.vol_b);
+    }
+
+    // ---- HDR ping-pong for motion blur and depth of field ----
+    int hdr_need = (r.motion_blur.enabled ? 1 : 0) + (r.dof.enabled ? 1 : 0);
+    if (hdr_need >= 1 && !r.hdr_a.fbo) r.hdr_a = pix_create_render_target(r.width, r.height, true, false, false);
+    if (hdr_need >= 2 && !r.hdr_b.fbo) r.hdr_b = pix_create_render_target(r.width, r.height, true, false, false);
+    if (hdr_need < 2 && r.hdr_b.fbo) pix_destroy_framebuffer(r.hdr_b);
+    if (hdr_need < 1 && r.hdr_a.fbo) pix_destroy_framebuffer(r.hdr_a);
+    if (r.dof.enabled && !r.dof_half.fbo) {
+        int dw = r.width / 2 > 1 ? r.width / 2 : 1, dh = r.height / 2 > 1 ? r.height / 2 : 1;
+        r.dof_half = pix__color_target(dw, dh, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, true);
+    } else if (!r.dof.enabled && r.dof_half.fbo) {
+        pix_destroy_framebuffer(r.dof_half);
+    }
+
+    // ---- auto exposure ----
+    if (r.post.auto_exposure && !r.lum_tex) {
+        glGenTextures(1, &r.lum_tex);
+        glBindTexture(GL_TEXTURE_2D, r.lum_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F, 256, 256, 0, GL_RED, GL_FLOAT, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glGenFramebuffers(1, &r.lum_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, r.lum_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r.lum_tex, 0);
+        for (int i = 0; i < 2; i++) {
+            glGenTextures(1, &r.adapt_tex[i]);
+            glBindTexture(GL_TEXTURE_2D, r.adapt_tex[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 1, 1, 0, GL_RED, GL_FLOAT, 0);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glGenFramebuffers(1, &r.adapt_fbo[i]);
+            glBindFramebuffer(GL_FRAMEBUFFER, r.adapt_fbo[i]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r.adapt_tex[i], 0);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        r.adapt_fresh = true;
+    } else if (!r.post.auto_exposure && r.lum_tex) {
+        glDeleteTextures(1, &r.lum_tex); glDeleteFramebuffers(1, &r.lum_fbo);
+        glDeleteTextures(2, r.adapt_tex); glDeleteFramebuffers(2, r.adapt_fbo);
+        r.lum_tex = r.lum_fbo = 0;
+        r.adapt_tex[0] = r.adapt_tex[1] = r.adapt_fbo[0] = r.adapt_fbo[1] = 0;
+    }
+
+    // ---- local light shadow atlas ----
+    pix_shadow_settings& s = r.shadows;
+    int lres = s.local_resolution < 512 ? 512 : (s.local_resolution > 8192 ? 8192 : s.local_resolution);
+    if (r.local_shadow.fbo && (!s.local || r.local_shadow.width != lres)) pix_destroy_framebuffer(r.local_shadow);
+    if (s.local && !r.local_shadow.fbo) r.local_shadow = pix_create_shadow_map(lres, lres);
 }
 
 static void pix__cache_uniforms(pix_renderer& r) {
     const char* post[] = { "uScene", "uBloom", "uTexel", "uExposure", "uSaturation", "uContrast",
-                           "uVignette", "uSharpen", "uBloomStrength", "uTonemap", "uColorFilter", "uDither" };
-    for (int i = 0; i < 12; i++) r.u_post[i] = glGetUniformLocation(r.post_shader, post[i]);
+                           "uVignette", "uSharpen", "uBloomStrength", "uTonemap", "uColorFilter", "uDither",
+                           "uOutlineColor", "uOutlineParams", "uOutlineMode", "uAutoExposure", "uGrade" };
+    for (int i = 0; i < 17; i++) r.u_post[i] = glGetUniformLocation(r.post_shader, post[i]);
+    glUseProgram(r.post_shader);
+    const char* units[] = { "uDepthTex", "uNormalTex", "uExposureTex", "uLut", "uVolumetric" };
+    for (int i = 0; i < 5; i++) glUniform1i(glGetUniformLocation(r.post_shader, units[i]), 2 + i);
+    glUseProgram(0);
     r.u_bloom[0] = glGetUniformLocation(r.bloom_prefilter_shader, "uScene");
     r.u_bloom[1] = glGetUniformLocation(r.bloom_prefilter_shader, "uTexel");
     r.u_bloom[2] = glGetUniformLocation(r.bloom_prefilter_shader, "uThreshold");
@@ -1075,6 +1402,7 @@ static void pix__sync_settings(pix_renderer& r) {
     if (rs.planar && !r.planar_target.fbo)
         r.planar_target = pix_create_render_target(pw, ph, true, true, true);   // mipmapped: rough mirrors blur
 
+    pix__sync_extras(r);
 }
 
 // Matches the scene target's format so the copy is a raw GPU-side memcpy.
@@ -1157,6 +1485,32 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     }
     r.bloom_prefilter_shader = opengl_create_shader(VSHDER_POST, FSHDER_BLOOM_PREFILTER);
     r.bloom_blur_shader      = opengl_create_shader(VSHDER_POST, FSHDER_BLOOM_BLUR);
+    r.prepass_shader         = pix__compile(VSHDER_BASIC, FSHDER_PREPASS, false);
+    r.prepass_skinned_shader = pix__compile_skinned_common(VSHDER_SKINNED, FSHDER_PREPASS);
+    r.fx_shader              = pix__compile(VSHDER_POST, FSHDER_SCREEN_FX, false);
+    r.bilateral_shader       = pix__compile(VSHDER_POST, FSHDER_BILATERAL, false);
+    r.outline_shader         = pix__compile(VSHDER_OUTLINE, FSHDER_OUTLINE, false);
+    r.outline_skinned_shader = pix__compile_skinned_common(VSHDER_OUTLINE_SKINNED, FSHDER_OUTLINE);
+    r.volumetric_shader      = pix__compile(VSHDER_POST, FSHDER_VOLUMETRIC, true);
+    r.motion_blur_shader     = pix__compile(VSHDER_POST, FSHDER_MOTION_BLUR, false);
+    r.dof_blur_shader        = pix__compile(VSHDER_POST, FSHDER_DOF_BLUR, false);
+    r.dof_composite_shader   = opengl_create_shader(VSHDER_POST, FSHDER_DOF_COMPOSITE);
+    r.luminance_shader       = opengl_create_shader(VSHDER_POST, FSHDER_LUMINANCE);
+    r.adapt_shader           = opengl_create_shader(VSHDER_POST, FSHDER_ADAPT);
+    r.wire_shader            = pix__compile(VSHDER_BASIC, FSHDER_OUTLINE, false);
+    {
+        idx lit[] = { r.shader, r.skinned_shader, r.volumetric_shader };
+        for (int i = 0; i < 3; i++) if (lit[i]) pix__scene_sampler_units((GLuint)lit[i]);
+        glUseProgram(0);
+    }
+    glGenSamplers(1, &r.shadow_raw_sampler);
+    glSamplerParameteri(r.shadow_raw_sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glSamplerParameteri(r.shadow_raw_sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glSamplerParameteri(r.shadow_raw_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glSamplerParameteri(r.shadow_raw_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glSamplerParameteri(r.shadow_raw_sampler, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glPatchParameteri(GL_PATCH_VERTICES, 3);
+    r.draw_mode = GL_TRIANGLES;
     pix__cache_uniforms(r);
 
     unsigned char white[4] = { 255, 255, 255, 255 };
@@ -1267,6 +1621,56 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     r.reflections.plane                 = v4(0.0f, 1.0f, 0.0f, 0.0f);
     r.reflections.planar_scale          = 0.5f;
     r.reflections.planar_distance       = 200.0f;
+
+    r.shadows.penumbra = 0.0f;
+    r.shadows.contact = 0.0f;
+    r.shadows.local = false;
+    r.shadows.local_resolution = 2048;
+    r.prepass = PIX_PREPASS_AUTO;
+    r.ao.enabled = false;
+    r.ao.radius = 0.6f;
+    r.ao.intensity = 1.5f;
+    r.ao.samples = 12;
+    r.ao.half_resolution = true;
+    r.outline.enabled = false;
+    r.outline.color = v3(0.0f, 0.0f, 0.0f);
+    r.outline.thickness = 1.0f;
+    r.outline.depth_threshold = 0.1f;
+    r.outline.normal_threshold = 0.4f;
+    r.outline.object_edges = true;
+    r.outline.groups_only = false;
+    r.outline.fade_distance = 0.0f;
+    r.fog.height = 0.0f;
+    r.fog.height_falloff = 0.0f;
+    r.fog.sun_scatter = 0.0f;
+    r.fog.max_opacity = 1.0f;
+    r.volumetrics.enabled = false;
+    r.volumetrics.density = 0.02f;
+    r.volumetrics.anisotropy = 0.6f;
+    r.volumetrics.intensity = 1.0f;
+    r.volumetrics.light_intensity = 1.0f;
+    r.volumetrics.max_distance = 80.0f;
+    r.volumetrics.steps = 24;
+    r.volumetrics.lights = true;
+    r.dof.enabled = false;
+    r.dof.focus_distance = 10.0f;
+    r.dof.focus_range = 8.0f;
+    r.dof.max_blur = 8.0f;
+    r.dof.auto_focus = false;
+    r.motion_blur.enabled = false;
+    r.motion_blur.strength = 1.0f;
+    r.motion_blur.samples = 8;
+    r.motion_blur.max_length = 0.05f;
+    r.post.auto_exposure = false;
+    r.post.exposure_key = 0.18f;
+    r.post.exposure_speed = 1.5f;
+    r.post.exposure_min = 0.25f;
+    r.post.exposure_max = 4.0f;
+    r.post.lut = 0;
+    r.post.lut_strength = 1.0f;
+    r.post.grain = 0.0f;
+    r.wireframe = false;
+    r.wireframe_color = pix_rgba(235, 235, 235);
     pix__sync_settings(r);
 
     pix_lights_clear(*r.lights);
@@ -1311,9 +1715,16 @@ uniform sampler2D uDepth;   // scene depth, 0..1
 uniform vec2 uTexel;        // one pixel in uv
 uniform vec4 uParams;       // the effect's params
 uniform vec2 uNearFar;
+uniform sampler2D uNormal;  // view-space normal + outline group (reading it turns the prepass on)
 float linear_depth(vec2 uv) {
     float z = texture(uDepth, uv).r * 2.0 - 1.0;
     return 2.0 * uNearFar.x * uNearFar.y / (uNearFar.y + uNearFar.x - z * (uNearFar.y - uNearFar.x));
+}
+vec3 view_normal(vec2 uv) { return normalize(texture(uNormal, uv).xyz * 2.0 - 1.0); }
+float outline_group(vec2 uv) { return floor(texture(uNormal, uv).a * 255.0 + 0.5); }
+vec3 world_position(vec2 uv) {
+    vec4 p = bInvViewProj * vec4(uv * 2.0 - 1.0, texture(uDepth, uv).r * 2.0 - 1.0, 1.0);
+    return p.xyz / p.w;
 }
 )";
 
@@ -1338,6 +1749,7 @@ int pix_add_post_effect(pix_renderer& r, const char* body, vec4 params) {
     e.u_texel    = glGetUniformLocation(prog, "uTexel");
     e.u_params   = glGetUniformLocation(prog, "uParams");
     e.u_near_far = glGetUniformLocation(prog, "uNearFar");
+    e.u_normal   = glGetUniformLocation(prog, "uNormal");
     return r.post_effect_count++;
 }
 
@@ -1361,7 +1773,14 @@ void pix_destory_renderer(pix_renderer& r) {
     glDeleteVertexArrays((GLsizei)PIX_ARRAY_COUNT(vaos), vaos);
     idx progs[] = { r.shader, r.skinned_shader, r.sky_shader, r.post_shader, r.fxaa_shader, r.line_shader,
                     r.particle_shader, r.depth_shader, r.depth_skinned_shader,
-                    r.bloom_prefilter_shader, r.bloom_blur_shader };
+                    r.bloom_prefilter_shader, r.bloom_blur_shader, r.prepass_shader, r.prepass_skinned_shader,
+                    r.fx_shader, r.bilateral_shader, r.outline_shader, r.outline_skinned_shader,
+                    r.volumetric_shader, r.motion_blur_shader, r.dof_blur_shader, r.dof_composite_shader,
+                    r.luminance_shader, r.adapt_shader, r.wire_shader };
+    if (r.local_shadow.fbo) pix_destroy_framebuffer(r.local_shadow);
+    if (r.shadow_raw_sampler) glDeleteSamplers(1, &r.shadow_raw_sampler);
+    if (r.lum_tex) { glDeleteTextures(1, &r.lum_tex); glDeleteFramebuffers(1, &r.lum_fbo);
+                     glDeleteTextures(2, r.adapt_tex); glDeleteFramebuffers(2, r.adapt_fbo); }
     for (size_t i = 0; i < PIX_ARRAY_COUNT(progs); i++) opengl_destroy_shader(progs[i]);
     for (size_t i = 0; i < r.shader_count; i++) opengl_destroy_shader(r.shaders[i]);
     for (int i = 0; i < r.post_effect_count; i++) opengl_destroy_shader(r.post_effects[i].program);
@@ -1662,6 +2081,9 @@ material pix_material_default(void) {
     m.toon_bands = 3.0f;
     m.rim = 0.0f;
     m.toon_specular = 0.0f;
+    m.outline_width = 0.0f;
+    m.outline_color = v3(0.0f, 0.0f, 0.0f);
+    m.outline_group = 0;
     return m;
 }
 
@@ -1755,7 +2177,41 @@ idx load_surface_shader(pix_renderer& r, const char* fsrc, const char* vsrc) {
         } else {
             pix_log("pix: the vertex shader has no shadow-pass twin; its shadows stay static");
         }
+        // and a prepass twin, so what the vertex stage moves has matching normals and depth
+        if (r.prepass_twin_count < MAX_SHADERS) {
+            const char* pchunks[] = { GLSL_SCENE, GLSL_COMMON };
+            char* pv = pix_shader_splice(vsrc, pchunks, 2);
+            char* pf = shader_with_common(FSHDER_PREPASS);
+            idx pre = (pv && pf) ? opengl_create_shader(pv, pf) : 0;
+            pix_free(pv);
+            pix_free(pf);
+            if (pre) {
+                r.prepass_twins[r.prepass_twin_count].surface = prog;
+                r.prepass_twins[r.prepass_twin_count++].prepass = pre;
+                if (clips && r.clip_program_count < MAX_SHADERS) r.clip_programs[r.clip_program_count++] = { pre, clips };
+                if (r.shader_count < MAX_SHADERS) r.shaders[r.shader_count++] = pre;
+            }
+        }
     }
+    if (prog) pix__scene_sampler_units((GLuint)prog);
+    return prog;
+}
+
+idx load_surface_shader_stages(pix_renderer& r, const char* fsrc, const char* vsrc, const char* gsrc,
+                               const char* tcsrc, const char* tesrc) {
+    if (!gsrc && !tcsrc && !tesrc) return load_surface_shader(r, fsrc, vsrc);
+    const char* chunks[] = { GLSL_SCENE, GLSL_COMMON };
+    char* v  = pix_shader_splice(vsrc ? vsrc : VSHDER_BASIC, chunks, 2);
+    char* g  = gsrc  ? pix_shader_splice(gsrc, chunks, 2)  : 0;
+    char* tc = tcsrc ? pix_shader_splice(tcsrc, chunks, 2) : 0;
+    char* te = tesrc ? pix_shader_splice(tesrc, chunks, 2) : 0;
+    char* fr = shader_with_pbr(fsrc);
+    idx prog = (v && fr) ? opengl_create_program(v, tc, te, g, fr) : 0;
+    pix_free(v); pix_free(g); pix_free(tc); pix_free(te); pix_free(fr);
+    if (!prog) return 0;
+    if (r.shader_count < MAX_SHADERS) r.shaders[r.shader_count++] = prog;
+    if ((tcsrc || tesrc) && r.patch_program_count < MAX_SHADERS) r.patch_programs[r.patch_program_count++].program = prog;
+    pix__scene_sampler_units((GLuint)prog);
     return prog;
 }
 
@@ -1902,6 +2358,7 @@ void begin_frame(pix_renderer& r, camera& cam) {
     r.frame_camera = cam;
     pix__set_current_view(r, cam, (float)r.width / (float)r.height);
     r.frame_view_proj = r.view_proj;
+    if (r.frame_number == 0) r.prev_view_proj = r.view_proj;
     r.frame_prepared = false;
     r.renderable_count = 0;
     r.animated_count = 0;
@@ -1974,17 +2431,13 @@ idx pix_create_scene_shader(pix_renderer& r, const char* vs, const char* fs, boo
 }
 
 void pix_setup_scene_program(idx p) {
-    glUseProgram(p);
-    const char* names[5] = { "uShadowMap", "uEnvMap", "uPlanarMap", "uRefractMap", "uSceneDepth" };
-    for (int i = 0; i < 5; i++) {
-        GLint loc = glGetUniformLocation(p, names[i]);
-        if (loc >= 0) glUniform1i(loc, 1 + i);
-    }
+    pix__scene_sampler_units((GLuint)p);
 }
 
 idx load_skinned_surface_shader(pix_renderer& r, const char* fsrc) {
     idx prog = pix__compile_skinned(VSHDER_SKINNED, fsrc, true);
     if (prog && r.shader_count < MAX_SHADERS) r.shaders[r.shader_count++] = prog;
+    if (prog) pix__scene_sampler_units((GLuint)prog);
     return prog;
 }
 
@@ -2296,7 +2749,8 @@ static vec3 pix__lin(vec3 c) { return v3(powf(c.x, 2.2f), powf(c.y, 2.2f), powf(
 // The scene block for the current view (pix__set_current_view). `planar` and
 // `probe` say which reflection sources this view may sample - a probe face must
 // never sample the probe it is being drawn into.
-static void pix__upload_scene(pix_renderer& r, bool planar, bool probe, vec4 clip, int target_w, int target_h) {
+static void pix__upload_scene(pix_renderer& r, bool planar, bool probe, vec4 clip, int target_w, int target_h,
+                              bool screen_fx = false) {
     pix_scene_block b;
     memset(&b, 0, sizeof(b));
     memcpy(b.view_proj, r.view_proj.data, sizeof(b.view_proj));
@@ -2345,19 +2799,76 @@ static void pix__upload_scene(pix_renderer& r, bool planar, bool probe, vec4 cli
     // cascades are fitted around the frame camera, whichever view is drawing
     pix__put4(b.shadow_eye, r.frame_camera.position, 0.0f);
     pix__put4(b.shadow_dir, v3norm(r.frame_camera.direction), 0.0f);
+    mat4 inv = mat4_inverse(r.view_proj);
+    memcpy(b.inv_view_proj, inv.data, sizeof(b.inv_view_proj));
+    memcpy(b.prev_view_proj, r.prev_view_proj.data, sizeof(b.prev_view_proj));
+    memcpy(b.proj, r.projection_matrix.data, sizeof(b.proj));
+    b.fog_height[0] = r.fog.height;
+    b.fog_height[1] = r.fog.height_falloff > 0.0f ? r.fog.height_falloff : 0.0f;
+    b.fog_height[2] = r.fog.sun_scatter;
+    b.fog_height[3] = r.fog.max_opacity > 0.0f ? r.fog.max_opacity : 1.0f;
+    b.screen_fx[0] = screen_fx ? 1.0f : 0.0f;
+    b.screen_fx[3] = (float)(r.frame_number & 0xFFFF);
+    b.shadow_soft[0] = shadows ? r.shadows.penumbra : 0.0f;
+    // texels per radian of a 90-degree tile, the angle one texel spans
+    float tile = r.local_shadow.width > 0 ? (float)r.local_shadow.width / 4.0f : 512.0f;
+    b.shadow_soft[1] = 2.0f / tile;
+    b.shadow_soft[2] = r.cascade_depth;
+    b.shadow_soft[3] = 4.0f;
     glBindBuffer(GL_UNIFORM_BUFFER, r.scene_ubo);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)sizeof(b), &b);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
 }
 
+// The nearest shadow-casting lights get atlas tiles until there are none
+// left: a spot one, a point light six (one per cube face).
+static void pix__assign_local_shadows(pix_renderer& r) {
+    for (int i = 0; i < MAX_SHADER_LIGHTS; i++) {
+        r.local_info[i * 4 + 0] = -1.0f;
+        r.local_info[i * 4 + 1] = r.local_info[i * 4 + 2] = r.local_info[i * 4 + 3] = 0.0f;
+    }
+    r.local_tiles = 0;
+    if (!r.shadows.local || !r.local_shadow.fbo) return;
+    const pix_light_list& L = *r.lights;
+    static const vec3 dirs[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+    static const vec3 ups[6]  = { { 0, -1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 }, { 0, -1, 0 }, { 0, -1, 0 } };
+    for (int i = 0; i < L.packed_count; i++) {
+        const pix_light& l = L.lights[L.packed_index[i]];
+        if (!l.cast_shadows) continue;
+        bool spot = l.cos_outer > -1.0f;
+        int need = spot ? 1 : 6;
+        if (r.local_tiles + need > PIX_MAX_SHADOW_TILES) continue;
+        r.local_info[i * 4 + 0] = (float)r.local_tiles;
+        r.local_info[i * 4 + 1] = (float)need;
+        float near_p = 0.05f, far_p = l.radius > 0.1f ? l.radius : 0.1f;
+        for (int k = 0; k < need; k++) {
+            vec3 dir = spot ? v3norm(l.direction) : dirs[k];
+            vec3 up = spot ? (fabsf(dir.y) > 0.99f ? v3(1, 0, 0) : v3(0, 1, 0)) : ups[k];
+            // a spot's tile frames its outer cone; a cube face is a little over 90
+            // degrees so filtering at a face's border still has texels to read
+            float fov = spot ? clampf(2.0f * acosf(clampf(l.cos_outer, -1.0f, 1.0f)) + 0.08f, 0.2f, 2.9f)
+                             : 1.6f;
+            mat4 proj = mat4_perspective(fov, 1.0f, near_p, far_p);
+            int t = r.local_tiles++;
+            r.local_tile_vp[t] = mat4_mul(proj, mat4_lookat(l.position, v3add(l.position, dir), up));
+            r.local_tile_eye[t] = l.position;
+            r.local_tile_far[t] = far_p;
+        }
+    }
+}
+
 static void pix__upload_lights(pix_renderer& r) {
     pix_lights_pack(*r.lights, r.frame_camera.position);
+    pix__assign_local_shadows(r);
     pix_light_block lb;
     memcpy(lb.pos_radius, r.lights->pos_radius, sizeof(lb.pos_radius));
     memcpy(lb.color_inner, r.lights->color_inner, sizeof(lb.color_inner));
     memcpy(lb.dir_outer, r.lights->dir_outer, sizeof(lb.dir_outer));
     lb.meta[0] = (float)r.lights->packed_count;
     lb.meta[1] = lb.meta[2] = lb.meta[3] = 0.0f;
+    memcpy(lb.shadow, r.local_info, sizeof(lb.shadow));
+    for (int t = 0; t < PIX_MAX_SHADOW_TILES; t++)
+        memcpy(lb.tiles + t * 16, (t < r.local_tiles ? r.local_tile_vp[t] : mat4_identity()).data, sizeof(float) * 16);
     glBindBuffer(GL_UNIFORM_BUFFER, r.lights_ubo);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)sizeof(lb), &lb);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
@@ -2377,6 +2888,13 @@ static void pix__bind_frame_textures(pix_renderer& r, bool shadows, bool env, bo
     glBindTexture(GL_TEXTURE_2D, (refract && r.refract_tex) ? r.refract_tex : r.white_texture);
     glActiveTexture(GL_TEXTURE0 + 5);
     glBindTexture(GL_TEXTURE_2D, (refract && r.refract_depth) ? r.refract_depth : r.white_texture);
+    glActiveTexture(GL_TEXTURE0 + 10);
+    glBindTexture(GL_TEXTURE_2D, r.fx_a.color ? r.fx_a.color : r.white_texture);
+    glActiveTexture(GL_TEXTURE0 + 11);
+    glBindTexture(GL_TEXTURE_2D, r.local_shadow.depth ? r.local_shadow.depth : r.dummy_shadow);
+    glActiveTexture(GL_TEXTURE0 + 12);
+    glBindTexture(GL_TEXTURE_2D, (shadows && r.shadow_map.depth) ? r.shadow_map.depth : r.dummy_shadow);
+    glBindSampler(12, r.shadow_raw_sampler);
     glActiveTexture(GL_TEXTURE0);
 }
 
@@ -2427,6 +2945,11 @@ static void pix__use_program(pix_renderer& r, pix__pass_state& st, GLuint progra
     if (st.u->refract_map >= 0) glUniform1i(st.u->refract_map, 4);
     if (st.u->scene_depth >= 0) glUniform1i(st.u->scene_depth, 5);
     for (int i = 0; i < 4; i++) if (st.u->extra_tex[i] >= 0) glUniform1i(st.u->extra_tex[i], 6 + i);
+    // 10 screen AO / contact shadows, 11 local light shadows, 12 the sun atlas unfiltered (PCSS)
+    if (st.u->screen_fx >= 0) glUniform1i(st.u->screen_fx, 10);
+    if (st.u->local_shadow >= 0) glUniform1i(st.u->local_shadow, 11);
+    if (st.u->shadow_raw >= 0) glUniform1i(st.u->shadow_raw, 12);
+    r.draw_mode = st.u->patches ? GL_PATCHES : GL_TRIANGLES;
 }
 
 static void pix__bind_material(pix_renderer& r, pix__pass_state& st, idx material_id, bool blended) {
@@ -2482,7 +3005,7 @@ static void pix__draw_run(pix_renderer& r, const mesh& me, GLuint base_instance,
     r.frame_draws++;
     r.frame_instances += (int)count;
     glDrawElementsInstancedBaseVertexBaseInstance(
-        GL_TRIANGLES, (GLsizei)me.index_count, GL_UNSIGNED_INT,
+        r.draw_mode, (GLsizei)me.index_count, GL_UNSIGNED_INT,
         (void*)(size_t)(me.index_offset * sizeof(uint32_t)), (GLsizei)count,
         (GLint)me.vertex_offset, base_instance);
 }
@@ -2535,8 +3058,29 @@ static bool pix__cutout_prepass(pix_renderer& r, const pix__draw_list& list, pix
     return any;
 }
 
+// Is this material drawn by the scene-buffer prepass? Everything opaque is,
+// except a custom vertex stage that has no prepass twin.
+static bool pix__in_prepass(const pix_renderer& r, const material& m) {
+    if (!m.shader) return true;
+    bool custom_vs = false;
+    for (size_t i = 0; i < r.depth_twin_count; i++) if (r.depth_twins[i].surface == m.shader) custom_vs = true;
+    if (!custom_vs) return true;
+    for (size_t i = 0; i < r.prepass_twin_count; i++) if (r.prepass_twins[i].surface == m.shader) return true;
+    return false;
+}
+
+static GLuint pix__prepass_program(const pix_renderer& r, const material& m) {
+    if (m.shader)
+        for (size_t i = 0; i < r.prepass_twin_count; i++)
+            if (r.prepass_twins[i].surface == m.shader) return (GLuint)r.prepass_twins[i].prepass;
+    return (GLuint)r.prepass_shader;
+}
+
+// `full_prepass`: the scene-buffer prepass already laid down this list's
+// depth, so its surfaces only colour in (depth tested, not written) - which
+// also keeps early depth testing on for shaders that may discard.
 static void pix__draw_sorted(pix_renderer& r, const pix__draw_list& list, pix__pass_state& st, bool blended,
-                             idx override_program = 0, bool prepassed = false) {
+                             idx override_program = 0, bool prepassed = false, bool full_prepass = false) {
     if (!list.count) return;
     glBindVertexArray(r.pool.vao);
     bool writes = true, querying = false;
@@ -2553,7 +3097,7 @@ static void pix__draw_sorted(pix_renderer& r, const pix__draw_list& list, pix__p
         }
         const material& m = r.materials[a.material];
         // a cut-out surface whose depth is already down only colours it in
-        bool write = !(prepassed && m.cutout && m.texture);
+        bool write = full_prepass ? !pix__in_prepass(r, m) : !(prepassed && m.cutout && m.texture);
         if (write != writes) { glDepthMask(write ? GL_TRUE : GL_FALSE); writes = write; }
         if (r.mirror_tracking) {
             // each run of mirror surfaces counted on its own (up to four runs;
@@ -2578,8 +3122,11 @@ static void pix__draw_sorted(pix_renderer& r, const pix__draw_list& list, pix__p
 // Skinned instances for one view or cascade: culled (`fr`, null = none),
 // filtered by `layers`, sorted by (material, mesh), their record indices
 // streamed into the list buffer, then one instanced draw per run.
+#define PIX__SKIN_COLOR   0
+#define PIX__SKIN_PREPASS 1
+#define PIX__SKIN_OUTLINE 2
 static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* light_vp,
-                              const frustum* fr, uint32_t layers) {
+                              const frustum* fr, uint32_t layers, int mode = PIX__SKIN_COLOR) {
     if (!r.animated_count) return;
     size_t count = 0;
     for (size_t k = 0; k < r.animated_count; k++) {
@@ -2625,7 +3172,21 @@ static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* 
             j++;
         }
         const material& m = r.materials[a.material];
-        if (depth_only) {
+        if (mode == PIX__SKIN_OUTLINE && m.outline_width <= 0.0f) { i = j; continue; }
+        if (mode == PIX__SKIN_PREPASS) {
+            pix__use_program(r, st, r.prepass_skinned_shader);
+            if (a.material != bound) {
+                glUniform1f(st.u->cutoff, m.texture ? m.alpha_cutoff : 0.0f);
+                if (st.u->outline_group >= 0) glUniform1f(st.u->outline_group, (float)m.outline_group / 255.0f);
+                glBindTexture(GL_TEXTURE_2D, m.texture ? m.texture : r.white_texture);
+                pix__set_cull(st, !m.double_sided);
+                bound = a.material;
+            }
+        } else if (mode == PIX__SKIN_OUTLINE) {
+            pix__use_program(r, st, r.outline_skinned_shader);
+            glUniform1f(st.u->outline_width, m.outline_width);
+            glUniform3f(st.u->outline_color, m.outline_color.x, m.outline_color.y, m.outline_color.z);
+        } else if (depth_only) {
             pix__use_program(r, st, r.depth_skinned_shader);
             if (bound == PIX_INVALID) glUniformMatrix4fv(st.u->light_view_proj, 1, GL_FALSE, light_vp->data);
             if (a.material != bound) {
@@ -2641,7 +3202,7 @@ static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* 
         const mesh& me = r.skinned_meshes[a.mesh];
         r.frame_draws++;
         r.frame_instances += (int)(j - i);
-        glDrawElementsInstancedBaseVertex(GL_TRIANGLES, (GLsizei)me.index_count, GL_UNSIGNED_INT,
+        glDrawElementsInstancedBaseVertex(r.draw_mode, (GLsizei)me.index_count, GL_UNSIGNED_INT,
                                           (void*)(size_t)(me.index_offset * sizeof(uint32_t)),
                                           (GLsizei)(j - i), (GLint)me.vertex_offset);
         i = j;
@@ -2670,6 +3231,152 @@ static void pix__run_hooks(pix_renderer& r, pix__pass_state& st, int pass, int k
         glBindVertexArray(0);
     }
 }
+enum { PIX__KIND_USER, PIX__KIND_PROBE, PIX__KIND_MIRROR };
+
+// The scene-buffer prepass: every opaque surface's depth, view-space normal
+// and outline group, drawn with the surfaces' own vertex stages and pushed
+// back a hair so the lit pass, with another program, always passes.
+static void pix__prepass(pix_renderer& r, const pix_view& v, pix__pass_state& st, int kind) {
+    glBindFramebuffer(GL_FRAMEBUFFER, r.prepass_fbo);
+    glClearColor(0.5f, 0.5f, 1.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+    const pix__draw_list& list = r.list_opaque;
+    if (list.count) glBindVertexArray(r.pool.vao);
+    size_t i = 0;
+    while (i < list.count) {
+        const pix_render_instance& a = r.instances[list.items[i]];
+        size_t j = i + 1;
+        while (j < list.count && r.instances[list.items[j]].mesh == a.mesh && r.instances[list.items[j]].material == a.material) j++;
+        const material& m = r.materials[a.material];
+        if (pix__in_prepass(r, m)) {
+            pix__use_program(r, st, pix__prepass_program(r, m));
+            glUniform1f(st.u->cutoff, m.texture ? m.alpha_cutoff : 0.0f);
+            if (st.u->outline_group >= 0) glUniform1f(st.u->outline_group, (float)m.outline_group / 255.0f);
+            if (st.u->params0 >= 0) glUniform4f(st.u->params0, m.params0.x, m.params0.y, m.params0.z, m.params0.w);
+            if (st.u->params1 >= 0) glUniform4f(st.u->params1, m.params1.x, m.params1.y, m.params1.z, m.params1.w);
+            glBindTexture(GL_TEXTURE_2D, m.texture ? m.texture : r.white_texture);
+            pix__set_cull(st, !m.double_sided);
+            pix__draw_run(r, r.meshes[a.mesh], list.base + (GLuint)i, j - i);
+        }
+        i = j;
+    }
+    pix__set_clip(r, 0);
+    if (v.skinned && r.animated_count)
+        pix__draw_skinned(r, st, 0, kind == PIX__KIND_MIRROR ? 0 : &r.view_frustum, v.layers, PIX__SKIN_PREPASS);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    st.program = 0; st.material = PIX_INVALID;
+}
+
+// Screen AO and contact shadows from the prepass, then an edge-aware blur
+// across and down.
+static void pix__screen_fx_pass(pix_renderer& r) {
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    pix_bind_framebuffer(r.fx_a);
+    GLuint p = (GLuint)r.fx_shader;
+    glUseProgram(p);
+    mat4 inv_proj = mat4_inverse(r.projection_matrix);
+    glUniform1i(glGetUniformLocation(p, "uDepth"), 0);
+    glUniform1i(glGetUniformLocation(p, "uNormal"), 1);
+    glUniformMatrix4fv(glGetUniformLocation(p, "uInvProj"), 1, GL_FALSE, inv_proj.data);
+    int samples = r.ao.samples < 4 ? 4 : (r.ao.samples > 32 ? 32 : r.ao.samples);
+    glUniform4f(glGetUniformLocation(p, "uParams"), r.ao.enabled ? r.ao.radius : 0.0f, r.ao.intensity,
+                (float)samples, r.shadows.enabled && r.shadows.strength > 0.0f ? r.shadows.contact : 0.0f);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, r.normal_tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r.scene_target.depth);
+    pix_draw_fullscreen();
+
+    GLuint b = (GLuint)r.bilateral_shader;
+    glUseProgram(b);
+    glUniform1i(glGetUniformLocation(b, "uSource"), 0);
+    glUniform1i(glGetUniformLocation(b, "uDepth"), 1);
+    GLint dir = glGetUniformLocation(b, "uDirection");
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, r.scene_target.depth);
+    glActiveTexture(GL_TEXTURE0);
+    pix_bind_framebuffer(r.fx_b);
+    glUniform2f(dir, 1.0f / (float)r.fx_a.width, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, r.fx_a.color);
+    pix_draw_fullscreen();
+    pix_bind_framebuffer(r.fx_a);
+    glUniform2f(dir, 0.0f, 1.0f / (float)r.fx_a.height);
+    glBindTexture(GL_TEXTURE_2D, r.fx_b.color);
+    pix_draw_fullscreen();
+    glEnable(GL_DEPTH_TEST);
+}
+
+// Ink: every outlined opaque surface again, grown along its normals, front
+// faces culled so only the shell behind the surface shows.
+static void pix__hull_outlines(pix_renderer& r, const pix_view& v, pix__pass_state& st, int kind) {
+    const pix__draw_list& list = r.list_opaque;
+    bool any = false;
+    for (size_t k = 0; k < list.count && !any; k++) any = r.materials[r.instances[list.items[k]].material].outline_width > 0.0f;
+    bool any_skinned = false;
+    for (size_t k = 0; k < r.animated_count && !any_skinned; k++)
+        any_skinned = r.materials[r.animated_instances[k].material].outline_width > 0.0f;
+    if (!any && !any_skinned) return;
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_FRONT);
+    st.cull = -1;
+    if (any) {
+        glBindVertexArray(r.pool.vao);
+        pix__use_program(r, st, r.outline_shader);
+        size_t i = 0;
+        while (i < list.count) {
+            const pix_render_instance& a = r.instances[list.items[i]];
+            size_t j = i + 1;
+            while (j < list.count && r.instances[list.items[j]].mesh == a.mesh && r.instances[list.items[j]].material == a.material) j++;
+            const material& m = r.materials[a.material];
+            if (m.outline_width > 0.0f) {
+                glUniform1f(st.u->outline_width, m.outline_width);
+                glUniform3f(st.u->outline_color, m.outline_color.x, m.outline_color.y, m.outline_color.z);
+                pix__draw_run(r, r.meshes[a.mesh], list.base + (GLuint)i, j - i);
+            }
+            i = j;
+        }
+    }
+    if (any_skinned && v.skinned)
+        pix__draw_skinned(r, st, 0, kind == PIX__KIND_MIRROR ? 0 : &r.view_frustum, v.layers, PIX__SKIN_OUTLINE);
+    glCullFace(GL_BACK);
+    glEnable(GL_CULL_FACE);
+    st.cull = 1;
+    st.program = 0; st.material = PIX_INVALID;
+}
+
+// Every opaque mesh's edges over the shaded image.
+static void pix__wireframe_pass(pix_renderer& r, pix__pass_state& st) {
+    const pix__draw_list& list = r.list_opaque;
+    if (!list.count) return;
+    glBindVertexArray(r.pool.vao);
+    pix__use_program(r, st, r.wire_shader);
+    pix_color c = r.wireframe_color;
+    glUniform3f(st.u->outline_color, c.r / 255.0f, c.g / 255.0f, c.b / 255.0f);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glEnable(GL_POLYGON_OFFSET_LINE);
+    glPolygonOffset(-1.0f, -1.0f);
+    glDisable(GL_CULL_FACE);
+    st.cull = 0;
+    size_t i = 0;
+    while (i < list.count) {
+        const pix_render_instance& a = r.instances[list.items[i]];
+        size_t j = i + 1;
+        while (j < list.count && r.instances[list.items[j]].mesh == a.mesh && r.instances[list.items[j]].material == a.material) j++;
+        pix__draw_run(r, r.meshes[a.mesh], list.base + (GLuint)i, j - i);
+        i = j;
+    }
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDisable(GL_POLYGON_OFFSET_LINE);
+    st.program = 0; st.material = PIX_INVALID;
+}
+
 // Drawn after the opaque geometry, on the far plane with the depth test on:
 // only the pixels nothing else covered pay for the sky.
 static void pix__sky_pass(pix_renderer& r, const mat4& view_proj) {
@@ -2739,7 +3446,6 @@ pix_view pix_view_default(pix_renderer& r, const camera& cam) {
     return v;
 }
 
-enum { PIX__KIND_USER, PIX__KIND_PROBE, PIX__KIND_MIRROR };
 
 // Renders `v` into whatever framebuffer is bound by the caller (`fbo`, sized
 // fb_w x fb_h). `color_tex`/`depth_tex` are that framebuffer's attachments,
@@ -2769,11 +3475,16 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     bool shadows = v.shadows && r.shadows.enabled && r.shadow_map.fbo && r.shadows.strength > 0.0f;
     bool planar = v.reflections && kind == PIX__KIND_USER;
     bool probe  = v.reflections && kind != PIX__KIND_PROBE;
-    pix__upload_scene(r, planar, probe, v.clip_plane, fb_w, fb_h);
+    bool partial = vx != 0 || vy != 0 || vw != fb_w || vh != fb_h;
+    // the scene buffers belong to the screen-sized main view
+    bool pre = kind == PIX__KIND_USER && v.opaque && !v.override_shader && !partial && v.scissor.w <= 0.0f
+            && r.prepass_fbo && depth_tex && depth_tex == r.scene_target.depth && fb_w == r.width && fb_h == r.height;
+    bool fx = pre && r.fx_a.fbo && (r.ao.enabled || (r.shadows.contact > 0.0f && shadows));
+    if (kind == PIX__KIND_USER) { r.prepass_done = pre; r.fx_valid = fx; }
+    pix__upload_scene(r, planar, probe, v.clip_plane, fb_w, fb_h, fx);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glViewport(vx, vy, vw, vh);
-    bool partial = vx != 0 || vy != 0 || vw != fb_w || vh != fb_h;
     int sx = vx, sy = vy, sw = vw, sh = vh;
     if (v.scissor.w > 0.0f && v.scissor.h > 0.0f) {
         // intersect with the scissor, flipped to GL's bottom-left rows
@@ -2796,12 +3507,27 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
 
-    pix__bind_frame_textures(r, shadows, probe, planar, false);
     pix__pass_state st = { 0, 0, PIX_INVALID, -1, -1 };
-    bool prepassed = v.opaque && !v.override_shader && kind == PIX__KIND_USER && pix__cutout_prepass(r, r.list_opaque, st);
-    if (v.opaque) pix__draw_sorted(r, r.list_opaque, st, false, v.override_shader, prepassed);
-    if (v.skinned && r.animated_count)
+    if (pre) {
+        pix__prepass(r, v, st, kind);
+        if (fx) pix__screen_fx_pass(r);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(vx, vy, vw, vh);
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        st.cull = -1;
+    }
+    pix__bind_frame_textures(r, shadows, probe, planar, false);
+    bool prepassed = pre || (v.opaque && !v.override_shader && kind == PIX__KIND_USER && pix__cutout_prepass(r, r.list_opaque, st));
+    if (v.opaque) pix__draw_sorted(r, r.list_opaque, st, false, v.override_shader, prepassed, pre);
+    if (v.skinned && r.animated_count) {
+        if (pre) glDepthMask(GL_FALSE);
         pix__draw_skinned(r, st, 0, kind == PIX__KIND_MIRROR ? 0 : &r.view_frustum, v.layers);
+        glDepthMask(GL_TRUE);
+    }
+    if (v.opaque && !v.override_shader && kind != PIX__KIND_PROBE) pix__hull_outlines(r, v, st, kind);
+    if (r.wireframe && kind == PIX__KIND_USER && v.opaque) pix__wireframe_pass(r, st);
     pix__run_hooks(r, st, PIX_HOOK_OPAQUE, kind, -1, r.view_proj, v.layers, fb_w, fb_h);
     if (v.sky) { pix__sky_pass(r, r.view_proj); st.program = 0; st.cull = -1; }
     if (v.lines) pix__line_pass(r);
@@ -2852,8 +3578,81 @@ void pix_render_view(pix_renderer& r, const pix_view& v) {
 // Faces are not culled so single-sided geometry still casts; a slope-scaled
 // polygon offset plus the shader's normal offset keep surfaces from shadowing
 // themselves.
+// A culled depth list drawn with each material's depth program, from `vp`.
+static void pix__draw_depth_list(pix_renderer& r, pix__pass_state& st, const pix__draw_list& list, const mat4& vp) {
+    if (!list.count) return;
+    glBindVertexArray(r.pool.vao);
+    idx bound = PIX_INVALID;
+    size_t i = 0;
+    while (i < list.count) {
+        const pix_render_instance& a = r.instances[list.items[i]];
+        size_t j = i + 1;
+        while (j < list.count && r.instances[list.items[j]].mesh == a.mesh
+               && r.instances[list.items[j]].material == a.material) j++;
+        if (a.material != bound) {
+            const material& m = r.materials[a.material];
+            GLuint prog = (GLuint)pix__depth_program(r, m);
+            if (st.program != prog) {
+                pix__use_program(r, st, prog);
+                glUniformMatrix4fv(st.u->light_view_proj, 1, GL_FALSE, vp.data);
+            }
+            glUniform1f(st.u->cutoff, m.texture ? m.alpha_cutoff : 0.0f);
+            if (st.u->params0 >= 0) glUniform4f(st.u->params0, m.params0.x, m.params0.y, m.params0.z, m.params0.w);
+            if (st.u->params1 >= 0) glUniform4f(st.u->params1, m.params1.x, m.params1.y, m.params1.z, m.params1.w);
+            glBindTexture(GL_TEXTURE_2D, m.texture ? m.texture : r.white_texture);
+            bound = a.material;
+        }
+        pix__draw_run(r, r.meshes[a.mesh], list.base + (GLuint)i, j - i);
+        i = j;
+    }
+    pix__set_clip(r, 0);
+}
+
+// Spot and point light shadows: each tile of the local atlas gets its own
+// culled caster list - only what lies inside that light's frustum and reach.
+static void pix__render_local_shadows(pix_renderer& r) {
+    if (!r.local_tiles || !r.local_shadow.fbo) return;
+    pix_bind_framebuffer(r.local_shadow);
+    glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.5f, 2.0f);
+    int tile = r.local_shadow.width / 4;
+    pix__pass_state st = { 0, 0, PIX_INVALID, 0, -1 };
+    pix__draw_list& list = r.list_cascade[0];
+    for (int t = 0; t < r.local_tiles; t++) {
+        frustum fr = frustum_from_viewproj(r.local_tile_vp[t]);
+        vec3 eye = r.local_tile_eye[t];
+        float reach = r.local_tile_far[t];
+        size_t count = 0;
+        for (size_t i = 0; i < r.renderable_count; i++) {
+            if (!(r.flags[i] & PIX__CASTER)) continue;
+            vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
+            float rad = r.bounds[i].w;
+            if (v3len(v3sub(c, eye)) - rad > reach || !frustum_test_sphere(fr, c, rad)) continue;
+            r.sort_keys[count] = pix__batch_key(r.instances[i]);
+            r.sort_vals[count++] = (uint32_t)i;
+        }
+        pix__radix_sort(r, count);
+        memcpy(list.items, r.sort_vals, count * sizeof(uint32_t));
+        list.count = count;
+        pix__stream_list(r, list);
+        glViewport((t % 4) * tile, (t / 4) * tile, tile, tile);
+        st.program = 0;
+        pix__draw_depth_list(r, st, list, r.local_tile_vp[t]);
+        if (r.animated_count && r.shadows.skinned) pix__draw_skinned(r, st, &r.local_tile_vp[t], &fr, 0xFFFFFFFFu);
+    }
+    list.count = 0;
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glBindVertexArray(0);
+}
+
 void pix_render_shadows(pix_renderer& r) {
     pix__prepare_frame(r);
+    pix__render_local_shadows(r);
     if (!r.shadows.enabled || !r.shadow_map.fbo || r.shadows.strength <= 0.0f) return;
     pix__gpu_begin(r, PIX_GPU_SHADOW);
 
@@ -2909,34 +3708,7 @@ void pix_render_shadows(pix_renderer& r) {
         int size = (int)((float)tile * (r.cascade_scale[c] > 0.0f ? r.cascade_scale[c] : 1.0f));
         glViewport(c * tile, 0, size, size);
         st.program = 0;                  // each cascade re-sends its light matrix to whichever program runs first
-        const pix__draw_list& list = r.list_cascade[c];
-        if (list.count) {
-            glBindVertexArray(r.pool.vao);
-            idx bound = PIX_INVALID;
-            size_t i = 0;
-            while (i < list.count) {
-                const pix_render_instance& a = r.instances[list.items[i]];
-                size_t j = i + 1;
-                while (j < list.count && r.instances[list.items[j]].mesh == a.mesh
-                       && r.instances[list.items[j]].material == a.material) j++;
-                if (a.material != bound) {
-                    const material& m = r.materials[a.material];
-                    GLuint prog = (GLuint)pix__depth_program(r, m);
-                    if (st.program != prog) {
-                        pix__use_program(r, st, prog);
-                        glUniformMatrix4fv(st.u->light_view_proj, 1, GL_FALSE, r.light_space[c].data);
-                    }
-                    glUniform1f(st.u->cutoff, m.texture ? m.alpha_cutoff : 0.0f);
-                    if (st.u->params0 >= 0) glUniform4f(st.u->params0, m.params0.x, m.params0.y, m.params0.z, m.params0.w);
-                    if (st.u->params1 >= 0) glUniform4f(st.u->params1, m.params1.x, m.params1.y, m.params1.z, m.params1.w);
-                    glBindTexture(GL_TEXTURE_2D, m.texture ? m.texture : r.white_texture);
-                    bound = a.material;
-                }
-                pix__draw_run(r, r.meshes[a.mesh], list.base + (GLuint)i, j - i);
-                i = j;
-            }
-            pix__set_clip(r, 0);
-        }
+        pix__draw_depth_list(r, st, r.list_cascade[c], r.light_space[c]);
         // skinned casters: instanced and culled per cascade, so every cascade can afford them
         if (r.animated_count && r.shadows.skinned && c < r.shadows.skinned_cascades) {
             frustum cf = frustum_from_viewproj(r.light_space[c]);
@@ -3114,7 +3886,115 @@ static void pix__bind_dest(pix_renderer& r, const framebuffer* dest) {
 // then FXAA last so it smooths their edges too. Stages ping-pong between two
 // LDR targets and the final stage writes the destination directly, so with
 // nothing enabled after the tonemap the whole chain is one fullscreen pass.
-void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer* dest) {
+// The HDR passes that run before the tonemap, each reading the image so far
+// and the scene depth: motion blur, depth of field, volumetric light, and the
+// luminance measurement auto exposure adapts to. Returns the image to tonemap.
+static const framebuffer* pix__hdr_stages(pix_renderer& r, const framebuffer& src, bool* volumetric) {
+    *volumetric = false;
+    const framebuffer* cur = &src;
+    if (!src.depth) return cur;
+    framebuffer* next = &r.hdr_a;
+
+    if (r.motion_blur.enabled && r.hdr_a.fbo) {
+        pix_bind_framebuffer(*next);
+        GLuint p = (GLuint)r.motion_blur_shader;
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "uScene"), 0);
+        glUniform1i(glGetUniformLocation(p, "uDepth"), 1);
+        int n = r.motion_blur.samples < 2 ? 2 : (r.motion_blur.samples > 32 ? 32 : r.motion_blur.samples);
+        glUniform4f(glGetUniformLocation(p, "uParams"), r.motion_blur.strength, (float)n, r.motion_blur.max_length, 0.0f);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, src.depth);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cur->color);
+        pix_draw_fullscreen();
+        cur = next;
+        next = r.hdr_b.fbo ? &r.hdr_b : 0;
+    }
+    if (r.dof.enabled && r.dof_half.fbo && next) {
+        pix_bind_framebuffer(r.dof_half);
+        GLuint p = (GLuint)r.dof_blur_shader;
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "uScene"), 0);
+        glUniform1i(glGetUniformLocation(p, "uDepth"), 1);
+        glUniform4f(glGetUniformLocation(p, "uParams"), r.dof.focus_distance, r.dof.focus_range,
+                    clampf(r.dof.max_blur, 1.0f, 32.0f), r.dof.auto_focus ? 1.0f : 0.0f);
+        glUniform2f(glGetUniformLocation(p, "uTexel"), 1.0f / (float)r.width, 1.0f / (float)r.height);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, src.depth);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cur->color);
+        pix_draw_fullscreen();
+        pix_bind_framebuffer(*next);
+        GLuint c = (GLuint)r.dof_composite_shader;
+        glUseProgram(c);
+        glUniform1i(glGetUniformLocation(c, "uScene"), 0);
+        glUniform1i(glGetUniformLocation(c, "uBlur"), 1);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, r.dof_half.color);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cur->color);
+        pix_draw_fullscreen();
+        cur = next;
+    }
+    if (r.volumetrics.enabled && r.vol_a.fbo) {
+        pix_bind_framebuffer(r.vol_a);
+        GLuint p = (GLuint)r.volumetric_shader;
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "uDepth"), 0);
+        glUniform1i(glGetUniformLocation(p, "uShadowMap"), 1);
+        glUniform1i(glGetUniformLocation(p, "uLocalShadow"), 11);
+        int steps = r.volumetrics.steps < 4 ? 4 : (r.volumetrics.steps > 128 ? 128 : r.volumetrics.steps);
+        glUniform4f(glGetUniformLocation(p, "uParams"), r.volumetrics.density, clampf(r.volumetrics.anisotropy, -0.95f, 0.95f),
+                    r.volumetrics.max_distance, (float)steps);
+        glUniform4f(glGetUniformLocation(p, "uParams2"), r.volumetrics.intensity, r.volumetrics.lights ? 1.0f : 0.0f,
+                    r.volumetrics.light_intensity, 0.0f);
+        bool sh = r.shadows.enabled && r.shadow_map.fbo && r.shadows.strength > 0.0f;
+        pix__bind_frame_textures(r, sh, false, false, false);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, src.depth);
+        pix_draw_fullscreen();
+        GLuint b = (GLuint)r.bilateral_shader;
+        glUseProgram(b);
+        glUniform1i(glGetUniformLocation(b, "uSource"), 0);
+        glUniform1i(glGetUniformLocation(b, "uDepth"), 1);
+        GLint dir = glGetUniformLocation(b, "uDirection");
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, src.depth);
+        glActiveTexture(GL_TEXTURE0);
+        pix_bind_framebuffer(r.vol_b);
+        glUniform2f(dir, 1.0f / (float)r.vol_a.width, 0.0f);
+        glBindTexture(GL_TEXTURE_2D, r.vol_a.color);
+        pix_draw_fullscreen();
+        pix_bind_framebuffer(r.vol_a);
+        glUniform2f(dir, 0.0f, 1.0f / (float)r.vol_a.height);
+        glBindTexture(GL_TEXTURE_2D, r.vol_b.color);
+        pix_draw_fullscreen();
+        *volumetric = true;
+    }
+    if (r.post.auto_exposure && r.lum_tex) {
+        glBindFramebuffer(GL_FRAMEBUFFER, r.lum_fbo);
+        glViewport(0, 0, 256, 256);
+        glUseProgram(r.luminance_shader);
+        glUniform1i(glGetUniformLocation(r.luminance_shader, "uScene"), 0);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, cur->color);
+        pix_draw_fullscreen();
+        glBindTexture(GL_TEXTURE_2D, r.lum_tex);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        float dt = r.time - r.last_time;
+        if (dt <= 0.0f || dt > 0.5f) dt = 1.0f / 60.0f;
+        r.last_time = r.time;
+        int to = r.adapt_index ^ 1;
+        glBindFramebuffer(GL_FRAMEBUFFER, r.adapt_fbo[to]);
+        glViewport(0, 0, 1, 1);
+        GLuint a = (GLuint)r.adapt_shader;
+        glUseProgram(a);
+        glUniform1i(glGetUniformLocation(a, "uLuminance"), 0);
+        glUniform1i(glGetUniformLocation(a, "uPrevious"), 1);
+        glUniform4f(glGetUniformLocation(a, "uParams"), 8.0f, 1.0f - expf(-dt * r.post.exposure_speed),
+                    r.adapt_fresh ? 1.0f : 0.0f, 0.0f);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, r.adapt_tex[r.adapt_index]);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, r.lum_tex);
+        pix_draw_fullscreen();
+        r.adapt_index = to;
+        r.adapt_fresh = false;
+    }
+    return cur;
+}
+
+void pix_post_process(pix_renderer& r, const framebuffer& src_in, const framebuffer* dest) {
     pix__prepare_frame(r);
     pix__gpu_begin(r, PIX_GPU_POST);
     glDisable(GL_DEPTH_TEST);
@@ -3122,7 +4002,9 @@ void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     const pix_post_settings& p = r.post;
-    bool full = src.width == r.width && src.height == r.height;
+    bool full = src_in.width == r.width && src_in.height == r.height;
+    bool volumetric = false;
+    const framebuffer& src = full ? *pix__hdr_stages(r, src_in, &volumetric) : src_in;
     bool bloom = full && p.bloom && p.bloom_strength > 0.0f && r.bloom_a.fbo;
     if (bloom) pix__bloom_pass(r, src.color);
 
@@ -3147,6 +4029,24 @@ void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer
     glUniform1i(r.u_post[9], p.tonemap);
     glUniform3f(r.u_post[10], p.color_filter.x, p.color_filter.y, p.color_filter.z);
     glUniform1f(r.u_post[11], p.dither ? 1.0f : 0.0f);
+    {
+        // outlines, eye adaptation, grading cube, grain, light shafts
+        const pix_outline_settings& o = r.outline;
+        bool outline = full && o.enabled && src_in.depth;
+        vec3 oc = pix__lin(o.color);
+        glUniform4f(r.u_post[12], oc.x, oc.y, oc.z, outline ? 1.0f : 0.0f);
+        glUniform4f(r.u_post[13], o.thickness, o.depth_threshold > 1e-4f ? o.depth_threshold : 1e-4f,
+                    o.normal_threshold, o.fade_distance);
+        glUniform4f(r.u_post[14], o.object_edges ? 1.0f : 0.0f, r.prepass_done ? 1.0f : 0.0f, o.groups_only ? 1.0f : 0.0f, 0.0f);
+        bool ae = full && p.auto_exposure && r.lum_tex;
+        glUniform4f(r.u_post[15], ae ? 1.0f : 0.0f, p.exposure_key, p.exposure_min, p.exposure_max);
+        glUniform4f(r.u_post[16], p.lut ? p.lut_strength : 0.0f, 0.0f, p.grain, volumetric ? 1.0f : 0.0f);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, src_in.depth ? src_in.depth : r.white_texture);
+        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, r.prepass_done && r.normal_tex ? r.normal_tex : r.white_texture);
+        glActiveTexture(GL_TEXTURE0 + 4); glBindTexture(GL_TEXTURE_2D, ae ? r.adapt_tex[r.adapt_index] : r.white_texture);
+        glActiveTexture(GL_TEXTURE0 + 5); glBindTexture(GL_TEXTURE_3D, p.lut);
+        glActiveTexture(GL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, volumetric ? r.vol_a.color : r.white_texture);
+    }
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, bloom ? r.bloom_a.color : r.white_texture);
     glActiveTexture(GL_TEXTURE0);
@@ -3166,8 +4066,13 @@ void pix_post_process(pix_renderer& r, const framebuffer& src, const framebuffer
         glUniform2f(e.u_texel, 1.0f / (float)r.width, 1.0f / (float)r.height);
         glUniform4f(e.u_params, e.params.x, e.params.y, e.params.z, e.params.w);
         glUniform2f(e.u_near_far, r.camera_near, r.camera_far);
+        if (e.u_normal >= 0) {
+            glUniform1i(e.u_normal, 2);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, r.prepass_done && r.normal_tex ? r.normal_tex : r.white_texture);
+        }
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, src.depth ? src.depth : r.white_texture);
+        glBindTexture(GL_TEXTURE_2D, src_in.depth ? src_in.depth : r.white_texture);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, ping[at]->color);
         pix_draw_fullscreen();
@@ -3275,6 +4180,8 @@ void pix_fullscreen_pass(pix_renderer& r, idx program, const idx* textures, int 
 
 void pix_finish_frame(pix_renderer& r, bool clear_instances) {
     if (r.gpu_timing) r.gpu_slot ^= 1;
+    r.prev_view_proj = r.frame_view_proj;     // motion blur's "where it was"
+    r.frame_number++;
     // back to the frame camera, so picking and world_to_screen answer for it
     pix__set_current_view(r, r.frame_camera, (float)r.width / (float)r.height);
     glUseProgram(0);
@@ -3290,6 +4197,38 @@ void pix_finish_frame(pix_renderer& r, bool clear_instances) {
         r.line_count = 0;
     }
     r.frame_prepared = false;
+}
+
+idx pix_load_color_lut(const char* path) {
+    int w = 0, h = 0;
+    unsigned char* px = pix_load_image_rgba(path, &w, &h);
+    if (!px) { pix_log("pix: could not load colour LUT '%s'", path); return 0; }
+    int n = h;
+    if (n < 2 || w != n * n) {
+        pix_log("pix: colour LUT '%s' should be %d slices of %dx%d side by side (got %dx%d)", path, n, n, n, w, h);
+        pix_free(px);
+        return 0;
+    }
+    // slice b, row g, column r -> cube texel (r, g, b)
+    unsigned char* cube = pix_alloc<unsigned char>((size_t)n * n * n * 4);
+    for (int b = 0; b < n; b++)
+        for (int g = 0; g < n; g++)
+            memcpy(cube + ((size_t)(b * n + g) * n) * 4, px + ((size_t)g * w + (size_t)b * n) * 4, (size_t)n * 4);
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_3D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, n, n, n, 0, GL_RGBA, GL_UNSIGNED_BYTE, cube);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    pix_free(cube);
+    pix_free(px);
+    return tex;
 }
 
 void end_frame(pix_renderer& r, bool clear_instances) {

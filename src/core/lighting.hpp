@@ -44,6 +44,9 @@ struct pix_light {
     float cos_inner;   // spot: cosine of the cone the light is at full strength in
     vec3  direction;   // spot only, normalised, pointing the way the light shines
     float cos_outer;   // spot: cosine of the cone it has faded out by. < -1 = point
+    // Casts shadows (needs r.shadows.local): a spot takes one tile of the local
+    // shadow atlas, a point light six. The nearest shadowed lights win the tiles.
+    bool  cast_shadows;
 };
 
 // a point light: falls off to nothing at `radius`, shines in every direction
@@ -55,6 +58,7 @@ static inline pix_light pix_point_light(vec3 position, float radius, vec3 color)
     l.cos_inner = 1.0f;
     l.direction = v3(0.0f, -1.0f, 0.0f);
     l.cos_outer = -2.0f;          // the sentinel that means "not a spot"
+    l.cast_shadows = false;
     return l;
 }
 
@@ -69,6 +73,7 @@ static inline pix_light pix_spot_light(vec3 position, vec3 direction, float radi
     l.cos_inner = cosf(inner);
     l.cos_outer = cosf(outer);
     if (l.cos_outer >= l.cos_inner) l.cos_outer = l.cos_inner - 0.001f;
+    l.cast_shadows = false;
     return l;
 }
 
@@ -196,6 +201,7 @@ struct pix_light_list {
     float color_inner[MAX_SHADER_LIGHTS * 4];
     float dir_outer[MAX_SHADER_LIGHTS * 4];
     int   packed_count;
+    int   packed_index[MAX_SHADER_LIGHTS];   // which of `lights` each packed slot holds
 };
 
 static inline void pix_lights_clear(pix_light_list& list) {
@@ -262,6 +268,7 @@ static inline void pix_lights_pack(pix_light_list& list, vec3 eye) {
         list.dir_outer[o + 1] = l.direction.y;
         list.dir_outer[o + 2] = l.direction.z;
         list.dir_outer[o + 3] = l.cos_outer;
+        list.packed_index[list.packed_count] = order[a];
         list.packed_count++;
     }
 }

@@ -37,6 +37,12 @@ layout(std140, binding = 0) uniform SceneBlock {
     vec4 bScreen;         // xy one pixel of the render target in uv
     vec4 bShadowEye;      // xyz the main camera, which the cascades are fitted around
     vec4 bShadowDir;      // xyz its forward
+    mat4 bInvViewProj;    // the current view's inverse: positions back from depth
+    mat4 bPrevViewProj;   // the main camera one frame ago (motion blur)
+    mat4 bProj;           // the current view's projection
+    vec4 bFogHeight;      // x height the fog thins from, y falloff per metre (0 = even), z sun scatter, w max opacity
+    vec4 bScreenFx;       // x screen AO / contact shadow texture ready for this view, w frame number
+    vec4 bShadowSoft;     // x sun penumbra (0 = plain PCF), y local shadow texel angle, z cascade depth range, w local tiles per row
 };
 #define uViewProj       bViewProj
 #define uSunDir         bSunDir.xyz
@@ -77,11 +83,40 @@ vec3 sky_env(vec3 dir) {
     return sky;
 }
 
-vec3 apply_fog(vec3 color, vec3 world) {
-    float d = length(uCameraPos - world);
-    float fog = 1.0 - exp(-d * d * uFogDensity * uFogDensity);
-    return mix(color, uFogColor, clamp(fog, 0.0, 1.0));
+// How much fog lies between the camera and `world`, 0..1. Even fog keeps
+// pix's original exp2 falloff; height fog (bFogHeight.y > 0) is exponential in
+// height and integrated exactly along the ray (Quilez, "better fog"), so
+// valleys fill and peaks poke out.
+float fog_amount(vec3 world) {
+    if (uFogDensity <= 0.0) return 0.0;
+    vec3 ray = world - uCameraPos;
+    float d = length(ray);
+    float fog;
+    if (bFogHeight.y > 0.0) {
+        float b = bFogHeight.y;
+        float h0 = uCameraPos.y - bFogHeight.x;
+        float dy = b * ray.y;
+        float k = abs(dy) > 1e-4 ? (1.0 - exp(-dy)) / dy : 1.0;
+        fog = 1.0 - exp(-uFogDensity * exp(-b * h0) * d * k);
+    } else {
+        fog = 1.0 - exp(-d * d * uFogDensity * uFogDensity);
+    }
+    return clamp(fog, 0.0, bFogHeight.w > 0.0 ? bFogHeight.w : 1.0);
 }
+// the fog's colour along a view direction: brighter toward the sun
+vec3 fog_color(vec3 dir) {
+    vec3 c = uFogColor;
+    if (bFogHeight.z > 0.0) c += uSunColor * pow(max(dot(dir, normalize(uSunDir)), 0.0), 8.0) * bFogHeight.z * 0.25;
+    return c;
+}
+vec3 apply_fog(vec3 color, vec3 world) {
+    float fog = fog_amount(world);
+    if (fog <= 0.0) return color;
+    return mix(color, fog_color(normalize(world - uCameraPos)), fog);
+}
+// interleaved gradient noise (Jimenez 2014): a per-pixel offset that breaks
+// sampling patterns into fine noise
+float ign(vec2 px) { return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715)))); }
 )";
 
 // ---- shared BRDF ----
@@ -156,8 +191,41 @@ layout(std140, binding = 1) uniform LightBlock {
     vec4 uLightColorInner[32];   // rgb linear radiance, w cos(inner cone)
     vec4 uLightDirOuter[32];     // xyz direction, w cos(outer cone), < -1 = point
     vec4 uLightMeta;             // x: how many of the above are live
+    vec4 uLightShadow[32];       // x first tile in the local shadow atlas (-1 = none), y tiles (1 spot, 6 point)
+    mat4 uShadowTile[16];        // each atlas tile's light view-projection
 };
 #define uLightCount int(uLightMeta.x)
+uniform sampler2DShadow uLocalShadow;
+
+// A shadowed spot or point light: one perspective tile (spot) or six, one per
+// cube face (point, the face picked by the dominant axis), in one atlas.
+float local_shadow(int i, vec3 world, vec3 n) {
+    int first = int(uLightShadow[i].x);
+    if (first < 0) return 1.0;
+    vec3 to = world - uLightPosRadius[i].xyz;
+    float dist = length(to);
+    int tile = first;
+    if (uLightShadow[i].y > 1.5) {
+        vec3 a = abs(to);
+        if (a.x >= a.y && a.x >= a.z) tile += to.x > 0.0 ? 0 : 1;
+        else if (a.y >= a.z)          tile += to.y > 0.0 ? 2 : 3;
+        else                          tile += to.z > 0.0 ? 4 : 5;
+    }
+    // normal offset grows with distance, like the texels it hides
+    vec4 lp = uShadowTile[tile] * vec4(world + n * dist * bShadowSoft.y * 1.5, 1.0);
+    vec3 p = lp.xyz / lp.w * 0.5 + 0.5;
+    if (p.z >= 1.0) return 1.0;
+    float per_row = bShadowSoft.w;
+    vec2 cell = vec2(mod(float(tile), per_row), floor(float(tile) / per_row));
+    float texel = 1.0 / float(textureSize(uLocalShadow, 0).x);
+    float inset = 1.5 * texel * per_row;
+    vec2 uv = (cell + clamp(p.xy, inset, 1.0 - inset)) / per_row;
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            sum += texture(uLocalShadow, vec3(uv + vec2(x, y) * texel, p.z - 0.0005));
+    return sum / 9.0;
+}
 
 vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, float a) {
     vec3 sum = vec3(0.0);
@@ -175,6 +243,7 @@ vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, floa
             atten *= t * t;
         }
         if (atten <= 0.0) continue;
+        atten *= local_shadow(i, world, n);
         sum += surface_brdf(n, v, l, diff_albedo, f0, a, uLightColorInner[i].rgb * atten);
     }
     return sum;
@@ -189,6 +258,37 @@ vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, floa
 // cross-fades into the next so the resolution change is not a visible line.
 static const char* const GLSL_SHADOW = R"(
 uniform sampler2DShadow uShadowMap;
+uniform sampler2D uShadowRaw;   // the same atlas without comparison: the PCSS blocker search
+
+const vec2 PIX_POISSON[16] = vec2[16](
+    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725), vec2(-0.09418410, -0.92938870), vec2(0.34495938, 0.29387760),
+    vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464), vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
+    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420), vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
+    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590), vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790));
+
+// Percentage-closer soft shadows (Fernando 2005): find the average depth of
+// what blocks the sun near this point, size the filter by how far behind it
+// the receiver is, then filter. Contact points stay sharp, long shadows blur.
+float shadow_pcss(int c, vec2 uv, float z, vec2 lo, vec2 hi) {
+    float world_per_texel = uCascadeTexel[c];
+    float angle = bShadowSoft.x;
+    float search = clamp(angle * bShadowSoft.z * 0.5 / world_per_texel, 2.0, 24.0);
+    float rot = ign(gl_FragCoord.xy) * 6.2831853;
+    mat2 R = mat2(cos(rot), sin(rot), -sin(rot), cos(rot));
+    float blockers = 0.0, blocker_z = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        vec2 q = clamp(uv + R * PIX_POISSON[i] * uShadowTexel * search, lo, hi);
+        float d = texture(uShadowRaw, q).r;
+        if (d < z) { blockers += 1.0; blocker_z += d; }
+    }
+    if (blockers < 1.0) return 1.0;
+    blocker_z /= blockers;
+    float penumbra = clamp((z - blocker_z) * bShadowSoft.z * angle / world_per_texel, 1.0, 24.0);
+    float sum = 0.0;
+    for (int i = 0; i < 16; ++i)
+        sum += texture(uShadowMap, vec3(clamp(uv + R * PIX_POISSON[i] * uShadowTexel * penumbra, lo, hi), z));
+    return sum / 16.0;
+}
 
 float shadow_cascade(int c, vec3 world, vec3 n, float ndl) {
     float slope = clamp(1.0 - ndl, 0.0, 1.0);
@@ -200,6 +300,11 @@ float shadow_cascade(int c, vec3 world, vec3 n, float ndl) {
     p.x = clamp(p.x, inset, 1.0 - inset) / 3.0 + float(c) / 3.0;
     p.y = clamp(p.y, uShadowTexel.y * 2.0, 1.0 - uShadowTexel.y * 2.0);
     float bias = 0.0004;
+    if (bShadowSoft.x > 0.0) {
+        vec2 lo = vec2(float(c) / 3.0 + uShadowTexel.x * 2.0, uShadowTexel.y * 2.0);
+        vec2 hi = vec2(float(c + 1) / 3.0 - uShadowTexel.x * 2.0, 1.0 - uShadowTexel.y * 2.0);
+        return shadow_pcss(c, p.xy, p.z - bias, lo, hi);
+    }
     // radius 0 is one hardware-filtered tap (2x2 PCF for free); 1 and 2 widen the kernel
     int k = int(bShadow.w);
     float sum = 0.0;
@@ -226,6 +331,20 @@ float sun_shadow(vec3 world, vec3 n, float ndl) {
     float t = clamp((depth - (far_edge - band)) / band, 0.0, 1.0);
     if (t > 0.0) s = mix(s, c < 2 ? shadow_cascade(c + 1, world, n, ndl) : 1.0, t);
     return mix(1.0, s, uShadowStrength);
+}
+
+// Is this point in the open air lit by the sun? One hardware tap, no normal
+// offset: what a volumetric ray march asks at every step.
+float sun_visibility(vec3 world) {
+    if (uShadowStrength <= 0.0) return 1.0;
+    float depth = dot(world - bShadowEye.xyz, bShadowDir.xyz);
+    if (depth > uCascadeFar.z || depth < 0.0) return 1.0;
+    int c = depth < uCascadeFar.x ? 0 : (depth < uCascadeFar.y ? 1 : 2);
+    vec4 lp = uLightSpace[c] * vec4(world, 1.0);
+    vec3 p = lp.xyz / lp.w * 0.5 + 0.5;
+    if (p.z > 1.0 || p.z < 0.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
+    p.x = p.x / 3.0 + float(c) / 3.0;
+    return mix(1.0, texture(uShadowMap, vec3(p.xy, p.z - 0.001)), uShadowStrength);
 }
 )";
 
@@ -266,6 +385,7 @@ uniform samplerCube uEnvMap;
 uniform sampler2D   uPlanarMap;
 uniform sampler2D   uRefractMap;
 uniform sampler2D   uSceneDepth;   // depth of the opaque scene, for see-through surfaces
+uniform sampler2D   uScreenFx;     // r screen-space AO, g contact shadow (when bScreenFx.x)
 
 // view-space distance from a 0..1 depth-buffer value (perspective cameras)
 float linearize_depth(float d) {
@@ -277,6 +397,8 @@ float linearize_depth(float d) {
 float scene_depth_at(vec2 uv) { return linearize_depth(texture(uSceneDepth, uv).r); }
 float fragment_depth() { return linearize_depth(gl_FragCoord.z); }
 vec2  screen_uv() { return gl_FragCoord.xy * bScreen.xy; }
+// this pixel's screen AO (x) and contact shadow (y); 1, 1 when neither runs
+vec2  screen_fx() { return bScreenFx.x > 0.5 ? texture(uScreenFx, screen_uv()).rg : vec2(1.0); }
 // the mirror pass renders only what lies on the visible side of the mirror
 void clip_test(vec3 world) {
     if (dot(bClipPlane.xyz, bClipPlane.xyz) > 0.0 && dot(bClipPlane.xyz, world) + bClipPlane.w < 0.0) discard;
@@ -304,8 +426,12 @@ vec3 refraction_color(vec3 n, float strength) {
     return texture(uRefractMap, clamp(uv + vn.xy * strength, vec2(0.001), vec2(0.999))).rgb;
 }
 
-vec3 shade_surface_ex(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive, float planar) {
+// The whole model with every input: `occlusion` is the material's own ambient
+// occlusion (an AO map), multiplied with the screen AO when that runs.
+vec3 shade_surface_full(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive,
+                        float planar, float occlusion) {
     vec3 v = normalize(uCameraPos - world);
+    vec2 fx = screen_fx();
     float ndv = max(dot(n, v), 1e-4);
     rough = clamp(rough, 0.02, 1.0);
     metal = clamp(metal, 0.0, 1.0);
@@ -316,7 +442,7 @@ vec3 shade_surface_ex(vec3 world, vec3 n, vec3 albedo, float metal, float rough,
     vec3  l = normalize(uSunDir);
     float ndl = max(dot(n, l), 0.0);
     vec3 direct = vec3(0.0);
-    if (ndl > 0.0) direct = surface_brdf(n, v, l, diff_albedo, f0, a, uSunColor) * sun_shadow(world, n, ndl);
+    if (ndl > 0.0) direct = surface_brdf(n, v, l, diff_albedo, f0, a, uSunColor) * (sun_shadow(world, n, ndl) * fx.y);
     direct += punctual_lights(world, n, v, diff_albedo, f0, a);
 
     float hemi = n.y * 0.5 + 0.5;
@@ -330,9 +456,13 @@ vec3 shade_surface_ex(vec3 world, vec3 n, vec3 albedo, float metal, float rough,
     if (planar > 0.0 && bReflect.x > 0.5) env = mix(env, planar_reflection(world, n, rough), planar);
     float horizon = clamp(1.0 + dot(reflect(-v, n), n), 0.0, 1.0);   // Frostbite horizon occlusion
     vec3 amb_spec = env * env_brdf(f0, rough, ndv) * (horizon * horizon);
-    float ao = mix(0.45, 1.0, hemi);   // down-facing crevices see less sky
+    float ao = mix(0.45, 1.0, hemi) * occlusion * fx.x;   // down-facing crevices see less sky
 
     return apply_fog(direct + amb_diffuse * ao + amb_spec * mix(ao, 1.0, planar) + emissive, world);
+}
+
+vec3 shade_surface_ex(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive, float planar) {
+    return shade_surface_full(world, n, albedo, metal, rough, emissive, planar, 1.0);
 }
 
 vec3 shade_surface(vec3 world, vec3 n, vec3 albedo, float metal, float rough, vec3 emissive) {
@@ -355,8 +485,9 @@ vec3 shade_toon(vec3 world, vec3 n, vec3 albedo, vec4 params, vec3 emissive) {
     vec3 v = normalize(uCameraPos - world);
     vec3 l = normalize(uSunDir);
     float ndl = max(dot(n, l), 0.0);
-    float lit = toon_step(ndl * sun_shadow(world, n, ndl), params.y);
-    vec3 light = uSunColor * lit / PI + mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5);
+    vec2 fx = screen_fx();
+    float lit = toon_step(ndl * sun_shadow(world, n, ndl) * fx.y, params.y);
+    vec3 light = uSunColor * lit / PI + mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5) * fx.x;
 
     for (int i = 0; i < uLightCount; ++i) {
         vec3  to = uLightPosRadius[i].xyz - world;
@@ -369,6 +500,7 @@ vec3 shade_toon(vec3 world, vec3 n, vec3 albedo, vec4 params, vec3 emissive) {
         if (cos_outer > -1.0)
             atten *= clamp((dot(-pl, uLightDirOuter[i].xyz) - cos_outer)
                            / max(uLightColorInner[i].w - cos_outer, 1e-4), 0.0, 1.0);
+        atten *= local_shadow(i, world, n);
         light += uLightColorInner[i].rgb * toon_step(max(dot(n, pl), 0.0) * atten, params.y) * 0.25;
     }
     vec3 color = albedo * light;
@@ -682,6 +814,310 @@ void main() {
 }
 )";
 
+// ---- the scene-buffer prepass ----
+// Depth plus a view-space normal (rgb) and the material's outline group (a),
+// for everything opaque - the base AO, contact shadows, outlines and effects
+// that read uNormal build on. Runs with the surfaces' own vertex stages.
+static const char* const FSHDER_PREPASS = R"(#version 440 core
+in vec3 vNormal;
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uTex;
+uniform float uAlphaCutoff;
+uniform float uOutlineGroup;
+void main() {
+    if (uAlphaCutoff > 0.0 && texture(uTex, vUV).a < uAlphaCutoff) discard;
+    vec3 n = normalize(vNormal);
+    if (!gl_FrontFacing) n = -n;
+    frag = vec4(normalize(mat3(bView) * n) * 0.5 + 0.5, uOutlineGroup);
+}
+)";
+
+// Screen-space ambient occlusion and sun contact shadows in one pass, from the
+// prepass depth and normals. AO: a cosine-weighted hemisphere around the
+// normal (normal-oriented SSAO), each sample tested against the depth
+// buffer, rotated per pixel by interleaved gradient noise and later blurred
+// edge-aware. Contact shadows: a short ray march toward the sun through the
+// depth buffer, for the small occluders the shadow map is too coarse to see.
+static const char* const FSHDER_SCREEN_FX = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uDepth;
+uniform sampler2D uNormal;
+uniform mat4 uInvProj;
+uniform vec4 uParams;      // x AO radius (0 = no AO), y AO power, z samples, w contact length (0 = none)
+vec3 view_pos(vec2 uv) {
+    vec4 p = uInvProj * vec4(uv * 2.0 - 1.0, texture(uDepth, uv).r * 2.0 - 1.0, 1.0);
+    return p.xyz / p.w;
+}
+vec2 project(vec3 p) { vec4 c = bProj * vec4(p, 1.0); return c.xy / c.w * 0.5 + 0.5; }
+void main() {
+    if (texture(uDepth, vUV).r >= 1.0) { frag = vec4(1.0); return; }
+    vec3 P = view_pos(vUV);
+    vec3 N = normalize(texture(uNormal, vUV).xyz * 2.0 - 1.0);
+    float ao = 1.0;
+    if (uParams.x > 0.0) {
+        float rot = ign(gl_FragCoord.xy) * 6.2831853;
+        vec3 t = normalize(cross(N, abs(N.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+        vec3 b = cross(N, t);
+        int count = int(uParams.z);
+        float occ = 0.0, bias = 0.002 * -P.z + 0.01;
+        for (int i = 0; i < count; ++i) {
+            float f = (float(i) + 0.5) / float(count);
+            float phi = float(i) * 2.39996323 + rot;
+            float r = sqrt(f);
+            vec3 dir = t * (cos(phi) * r) + b * (sin(phi) * r) + N * sqrt(1.0 - f);
+            float scale = mix(0.15, 1.0, f * f);           // more samples close in
+            vec3 S = P + dir * uParams.x * scale;
+            vec2 suv = project(S);
+            if (suv.x < 0.0 || suv.y < 0.0 || suv.x > 1.0 || suv.y > 1.0) continue;
+            float sz = view_pos(suv).z;
+            float range = smoothstep(0.0, 1.0, uParams.x / max(abs(P.z - sz), 1e-4));
+            occ += (sz >= S.z + bias ? 1.0 : 0.0) * range;
+        }
+        ao = pow(clamp(1.0 - occ / float(count), 0.0, 1.0), uParams.y);
+    }
+    float contact = 1.0;
+    if (uParams.w > 0.0) {
+        vec3 L = normalize(mat3(bView) * uSunDir);
+        if (dot(N, L) > 0.0) {
+            const int steps = 16;
+            float jitter = ign(gl_FragCoord.xy + 17.0);
+            float bias = 0.001 * -P.z + 0.005;
+            for (int i = 0; i < steps; ++i) {
+                vec3 S = P + L * ((float(i) + jitter) / float(steps)) * uParams.w;
+                vec2 suv = project(S);
+                if (suv.x < 0.0 || suv.y < 0.0 || suv.x > 1.0 || suv.y > 1.0) break;
+                float diff = view_pos(suv).z - S.z;
+                if (diff > bias && diff < uParams.w) { contact = 0.0; break; }
+            }
+            // far away the march covers too few pixels to mean anything
+            contact = mix(contact, 1.0, smoothstep(30.0, 60.0, -P.z));
+        }
+    }
+    frag = vec4(ao, contact, 0.0, 1.0);
+}
+)";
+
+// Edge-aware blur: neighbours at a different depth weigh nothing, so AO and
+// light shafts stay inside the objects they belong to.
+static const char* const FSHDER_BILATERAL = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uSource;
+uniform sampler2D uDepth;
+uniform vec2 uDirection;     // one source texel along the blur axis
+float lin(float d) { float n = bScreen.z, f = bScreen.w; return 2.0 * n * f / (f + n - (d * 2.0 - 1.0) * (f - n)); }
+void main() {
+    float z0 = lin(texture(uDepth, vUV).r);
+    vec4 sum = texture(uSource, vUV);
+    float wsum = 1.0;
+    for (int i = -3; i <= 3; ++i) {
+        if (i == 0) continue;
+        vec2 uv = vUV + uDirection * float(i);
+        float z = lin(texture(uDepth, uv).r);
+        float w = exp(-float(i * i) / 8.0) * exp(-abs(z - z0) / (0.03 * z0 + 0.02));
+        sum += texture(uSource, uv) * w;
+        wsum += w;
+    }
+    frag = sum / wsum;
+}
+)";
+
+// Inverted-hull outlines: the mesh again, pushed out along its normals, back
+// faces only - the classic cartoon ink line, per material.
+static const char* const VSHDER_OUTLINE = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=3) in mat4 aModel;
+uniform float uOutlineWidth;
+out vec3 vWorld;
+void main() {
+    vec4 world = aModel * vec4(aPos, 1.0);
+    world.xyz += normalize(mat3(aModel) * aNormal) * uOutlineWidth;
+    vWorld = world.xyz;
+    gl_Position = uViewProj * world;
+}
+)";
+static const char* const VSHDER_OUTLINE_SKINNED = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=3) in vec4 aBoneIds;
+layout(location=4) in vec4 aWeights;
+uniform float uOutlineWidth;
+out vec3 vWorld;
+void main() {
+    SkinInstance si = skin_instance();
+    mat4 skin = skin_matrix(si, aBoneIds, aWeights);
+    vec4 world = si.model * (skin * vec4(aPos, 1.0));
+    world.xyz += normalize(mat3(si.model) * (mat3(skin) * aNormal)) * uOutlineWidth;
+    vWorld = world.xyz;
+    gl_Position = uViewProj * world;
+}
+)";
+static const char* const FSHDER_OUTLINE = R"(#version 440 core
+in vec3 vWorld;
+out vec4 frag;
+uniform vec3 uOutlineColor;   // sRGB
+void main() { frag = vec4(apply_fog(srgb_to_linear(uOutlineColor), vWorld), 1.0); }
+)";
+
+// Volumetric light: a ray march from the eye to the scene behind each pixel,
+// gathering sunlight wherever the shadow map says it reaches (god rays), and
+// light from the spot and point lights (their shadows too, when they cast
+// them), with Henyey-Greenstein forward scattering. Half resolution, jittered
+// and blurred.
+static const char* const FSHDER_VOLUMETRIC = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uDepth;
+uniform vec4 uParams;    // x density, y anisotropy, z max distance, w steps
+uniform vec4 uParams2;   // x sun intensity, y point/spot lights on, z their intensity
+float hg(float c, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+void main() {
+    vec4 wp = bInvViewProj * vec4(vUV * 2.0 - 1.0, texture(uDepth, vUV).r * 2.0 - 1.0, 1.0);
+    vec3 end = wp.xyz / wp.w;
+    vec3 rd = end - uCameraPos;
+    float len = length(rd);
+    rd /= max(len, 1e-4);
+    len = min(len, uParams.z);
+    int steps = int(uParams.w);
+    float jitter = ign(gl_FragCoord.xy);
+    float g = uParams.y;
+    float ph_sun = hg(dot(rd, normalize(uSunDir)), g);
+    vec3 sum = vec3(0.0);
+    float trans = 1.0;
+    for (int i = 0; i < steps; ++i) {
+        // samples bunch up near the eye (t grows with the square of the step),
+        // where a shaft between two pillars is many pixels wide
+        float u = (float(i) + jitter) / float(steps);
+        vec3 p = uCameraPos + rd * (u * u * len);
+        float dt = 2.0 * u * len / float(steps);
+        float dens = uParams.x;
+        if (bFogHeight.y > 0.0) dens *= exp(-bFogHeight.y * max(p.y - bFogHeight.x, 0.0));
+        vec3 light = uSunColor * (ph_sun * sun_visibility(p) * uParams2.x);
+        if (uParams2.y > 0.5) {
+            for (int k = 0; k < uLightCount; ++k) {
+                vec3 to = uLightPosRadius[k].xyz - p;
+                float d2 = dot(to, to);
+                float rad = uLightPosRadius[k].w;
+                if (d2 > rad * rad) continue;
+                vec3 l = to * inversesqrt(max(d2, 1e-6));
+                float atten = light_falloff(d2, rad);
+                float cos_outer = uLightDirOuter[k].w;
+                if (cos_outer > -1.0) {
+                    float t = clamp((dot(-l, uLightDirOuter[k].xyz) - cos_outer) / max(uLightColorInner[k].w - cos_outer, 1e-4), 0.0, 1.0);
+                    atten *= t * t;
+                }
+                if (atten <= 0.0) continue;
+                atten *= local_shadow(k, p, vec3(0.0));
+                light += uLightColorInner[k].rgb * atten * hg(dot(rd, -l), g) * uParams2.z;
+            }
+        }
+        sum += trans * dens * light * dt;
+        trans *= exp(-dens * dt);
+    }
+    frag = vec4(min(sum, vec3(64.0)), 1.0);
+}
+)";
+
+// Camera motion blur: where each pixel was on screen last frame, from its
+// depth and the previous camera, and a blur along that path.
+static const char* const FSHDER_MOTION_BLUR = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uScene;
+uniform sampler2D uDepth;
+uniform vec4 uParams;    // x strength, y samples, z max length (uv)
+void main() {
+    vec4 wp = bInvViewProj * vec4(vUV * 2.0 - 1.0, texture(uDepth, vUV).r * 2.0 - 1.0, 1.0);
+    vec4 prev = bPrevViewProj * vec4(wp.xyz / wp.w, 1.0);
+    vec2 v = (vUV - (prev.xy / prev.w * 0.5 + 0.5)) * uParams.x;
+    float l = length(v);
+    if (l > uParams.z) v *= uParams.z / l;
+    int n = int(uParams.y);
+    vec3 sum = vec3(0.0);
+    float jitter = ign(gl_FragCoord.xy) - 0.5;
+    for (int i = 0; i < n; ++i) {
+        float t = (float(i) + 0.5 + jitter) / float(n) - 0.5;
+        sum += texture(uScene, vUV + v * t).rgb;
+    }
+    frag = vec4(sum / float(n), 1.0);
+}
+)";
+
+// Depth of field. Each pixel's circle of confusion from its distance to the
+// focus plane; a half-resolution gather over a golden-angle disc where every
+// sample counts only as far as its own circle reaches, then a composite that
+// fades from sharp to blurred by the circle size.
+static const char* const FSHDER_DOF_BLUR = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uScene;
+uniform sampler2D uDepth;
+uniform vec4 uParams;    // x focus distance, y focus range, z max blur (pixels), w auto focus
+uniform vec2 uTexel;     // one full-resolution pixel
+float lin(float d) { float n = bScreen.z, f = bScreen.w; return 2.0 * n * f / (f + n - (d * 2.0 - 1.0) * (f - n)); }
+float coc(vec2 uv, float focus) {
+    return clamp(abs(lin(texture(uDepth, uv).r) - focus) / max(uParams.y, 1e-3), 0.0, 1.0) * uParams.z;
+}
+void main() {
+    float focus = uParams.w > 0.5 ? lin(texture(uDepth, vec2(0.5)).r) : uParams.x;
+    float c0 = coc(vUV, focus);
+    vec3 sum = texture(uScene, vUV).rgb;
+    float wsum = 1.0;
+    const int taps = 24;
+    for (int i = 0; i < taps; ++i) {
+        float f = (float(i) + 0.5) / float(taps);
+        float r = sqrt(f) * uParams.z;
+        float a = float(i) * 2.39996323;
+        vec2 uv = vUV + vec2(cos(a), sin(a)) * r * uTexel;
+        float cs = coc(uv, focus);
+        float w = smoothstep(r - 1.0, r + 1.0, max(cs, min(c0, cs + 2.0)));
+        sum += texture(uScene, uv).rgb * w;
+        wsum += w;
+    }
+    frag = vec4(sum / wsum, c0);
+}
+)";
+static const char* const FSHDER_DOF_COMPOSITE = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uScene;
+uniform sampler2D uBlur;
+void main() {
+    vec4 b = texture(uBlur, vUV);
+    frag = vec4(mix(texture(uScene, vUV).rgb, b.rgb, smoothstep(0.5, 2.0, b.a)), 1.0);
+}
+)";
+
+// Auto exposure: the scene's log luminance at a small size, averaged by the
+// mip chain, then eased toward over time like an eye adapting.
+static const char* const FSHDER_LUMINANCE = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uScene;
+void main() {
+    vec3 c = texture(uScene, vUV).rgb;
+    frag = vec4(log2(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4)), 0.0, 0.0, 1.0);
+}
+)";
+static const char* const FSHDER_ADAPT = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uLuminance;    // mipmapped log2 luminance
+uniform sampler2D uPrevious;     // last frame's adapted luminance (1x1)
+uniform vec4 uParams;            // x mip level holding the average, y blend toward it, z first frame
+void main() {
+    float target = exp2(textureLod(uLuminance, vec2(0.5), uParams.x).r);
+    float prev = texture(uPrevious, vec2(0.5)).r;
+    frag = vec4(uParams.z > 0.5 ? target : mix(prev, target, uParams.y), 0.0, 0.0, 1.0);
+}
+)";
+
 // ---- fullscreen passes ----
 // One triangle larger than the screen from gl_VertexID, no vertex buffer: no
 // diagonal seam and every pixel shaded exactly once.
@@ -712,9 +1148,14 @@ void main() {
     vec4 far = uInvViewProj * vec4(vNDC, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - uCameraPos);
     vec3 col = sky_env(dir);
+    if (bFogHeight.y > 0.0) {
+        // height fog: as much as a ray that never hits anything gathers
+        frag = vec4(mix(col, fog_color(dir), fog_amount(uCameraPos + dir * bScreen.w)), 1.0);
+        return;
+    }
     // settle the lower sky into the fog so the horizon is not a hard seam
     float haze = smoothstep(0.10, -0.05, dir.y) * clamp(uFogDensity * 400.0, 0.0, 1.0);
-    frag = vec4(mix(col, uFogColor, haze * 0.85), 1.0);
+    frag = vec4(mix(col, fog_color(dir), haze * 0.85), 1.0);
 }
 )";
 
@@ -773,6 +1214,16 @@ uniform float uBloomStrength;
 uniform int   uTonemap;       // 0 ACES, 1 Reinhard, 2 none
 uniform vec3  uColorFilter;
 uniform float uDither;
+uniform sampler2D uDepthTex;       // 2
+uniform sampler2D uNormalTex;      // 3: prepass normals + outline group
+uniform sampler2D uExposureTex;    // 4: adapted luminance
+uniform sampler3D uLut;            // 5
+uniform sampler2D uVolumetric;     // 6
+uniform vec4  uOutlineColor;       // linear rgb, a on
+uniform vec4  uOutlineParams;      // x thickness px, y depth threshold, z normal threshold, w fade distance
+uniform vec4  uOutlineMode;        // x object edges, y normals valid, z groups only
+uniform vec4  uAutoExposure;       // x on, y key, z min, w max
+uniform vec4  uGrade;              // x LUT strength, y LUT size, z grain, w volumetrics on
 
 vec3 tonemap(vec3 x) {
     if (uTonemap == 1) return x / (1.0 + x);                  // Reinhard
@@ -782,8 +1233,41 @@ vec3 tonemap(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+float lin_depth(vec2 uv) { float n = bScreen.z, f = bScreen.w; return 2.0 * n * f / (f + n - (texture(uDepthTex, uv).r * 2.0 - 1.0) * (f - n)); }
+
+// Ink where depth jumps, where the surface turns (normals) and where one
+// object or material group meets another - judged from the prepass buffers.
+float outline_edge() {
+    vec2 o = uTexel * max(uOutlineParams.x, 1.0);
+    vec2 offs[4] = vec2[4](vec2(o.x, 0.0), vec2(-o.x, 0.0), vec2(0.0, o.y), vec2(0.0, -o.y));
+    float z = lin_depth(vUV);
+    float e = 0.0;
+    float dz = 0.0;
+    for (int i = 0; i < 4; ++i) dz = max(dz, abs(lin_depth(vUV + offs[i]) - z));
+    float rel = dz / max(z, 1e-3);
+    if (uOutlineMode.z < 0.5) e = smoothstep(uOutlineParams.y, uOutlineParams.y * 1.5, rel);
+    if (uOutlineMode.y > 0.5) {
+        vec4 c = texture(uNormalTex, vUV);
+        vec3 n = c.xyz * 2.0 - 1.0;
+        for (int i = 0; i < 4; ++i) {
+            vec4 q = texture(uNormalTex, vUV + offs[i]);
+            float id_differs = abs(q.a - c.a) > 0.002 ? 1.0 : 0.0;
+            if (uOutlineMode.z > 0.5) {
+                // selection: only around groups other than 0
+                e = max(e, id_differs * step(0.002, max(q.a, c.a)));
+                continue;
+            }
+            if (uOutlineMode.x > 0.5) e = max(e, id_differs);
+            if (uOutlineParams.z > 0.0) e = max(e, smoothstep(uOutlineParams.z, uOutlineParams.z * 1.5, 1.0 - dot(n, q.xyz * 2.0 - 1.0)));
+        }
+    }
+    if (uOutlineParams.w > 0.0) e *= 1.0 - smoothstep(uOutlineParams.w * 0.7, uOutlineParams.w, z);
+    return e;
+}
+
 void main() {
     vec3 color = texture(uScene, vUV).rgb;
+    if (uGrade.w > 0.5) color += texture(uVolumetric, vUV).rgb;
     if (uSharpen > 0.0) {
         vec3 blur = texture(uScene, vUV + vec2( uTexel.x, 0.0)).rgb
                   + texture(uScene, vUV + vec2(-uTexel.x, 0.0)).rgb
@@ -792,14 +1276,28 @@ void main() {
         color = max(color + (color - blur * 0.25) * uSharpen, vec3(0.0));
     }
     if (uBloomStrength > 0.0) color += texture(uBloom, vUV).rgb * uBloomStrength;
-    color = tonemap(color * uExposure);
+    float exposure = uExposure;
+    if (uAutoExposure.x > 0.5) exposure *= clamp(uAutoExposure.y / max(texture(uExposureTex, vec2(0.5)).r, 1e-4), uAutoExposure.z, uAutoExposure.w);
+    color = tonemap(color * exposure);
     color = mix(color, color * color * (3.0 - 2.0 * color), uContrast);   // midtone S-curve
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     color = mix(vec3(luma), color, uSaturation);
     vec2 d = vUV - 0.5;
     color *= 1.0 - uVignette * smoothstep(0.16, 0.62, dot(d, d));
     color *= uColorFilter;
+    if (uOutlineColor.a > 0.5) color = mix(color, uOutlineColor.rgb, outline_edge());
     color = linear_to_srgb(clamp(color, 0.0, 1.0));
+    if (uGrade.x > 0.0) {
+        // a colour cube, sampled at texel centres
+        float n = float(textureSize(uLut, 0).x);
+        vec3 graded = texture(uLut, color * ((n - 1.0) / n) + 0.5 / n).rgb;
+        color = mix(color, graded, uGrade.x);
+    }
+    if (uGrade.z > 0.0) {
+        float g = fract(sin(dot(gl_FragCoord.xy + fract(uTime * 7.31) * 113.0, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        float luma_g = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color += g * uGrade.z * (1.0 - luma_g * 0.6);
+    }
     // half an 8-bit step of noise: invisible, but it stops smooth gradients banding
     float n = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
     color += (n - 0.5) / 255.0 * uDither;

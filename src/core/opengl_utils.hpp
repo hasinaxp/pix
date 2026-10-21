@@ -14,6 +14,9 @@
 // Compiles and links a program. On failure the log goes to stderr, to
 // shader_error.txt and to a message box, and 0 is returned.
 PIXDEF idx opengl_create_shader(const char* vsrc, const char* fsrc);
+// any of the optional stages may be null
+PIXDEF idx opengl_create_program(const char* vsrc, const char* tcsrc, const char* tesrc,
+                                 const char* gsrc, const char* fsrc);
 PIXDEF void opengl_destroy_shader(idx program);
 // Shader errors always go to stderr and shader_error.txt; this controls the
 // message box as well (on by default - turn it off for tools and tests, where
@@ -75,25 +78,34 @@ static GLuint opengl__compile(GLenum type, const char* src, bool* ok_out) {
         char log[2048] = {};
         glGetShaderInfoLog(s, sizeof(log), 0, log);
         opengl__shader_failed(type == GL_VERTEX_SHADER ? "vertex shader compile error"
-                                                       : "fragment shader compile error", log);
+                              : type == GL_GEOMETRY_SHADER ? "geometry shader compile error"
+                              : type == GL_TESS_CONTROL_SHADER ? "tessellation control shader compile error"
+                              : type == GL_TESS_EVALUATION_SHADER ? "tessellation evaluation shader compile error"
+                              : "fragment shader compile error", log);
         *ok_out = false;
     }
     return s;
 }
 
 idx opengl_create_shader(const char* vsrc, const char* fsrc) {
+    return opengl_create_program(vsrc, 0, 0, 0, fsrc);
+}
+
+idx opengl_create_program(const char* vsrc, const char* tcsrc, const char* tesrc,
+                          const char* gsrc, const char* fsrc) {
     bool ok = true;
-    GLuint v = opengl__compile(GL_VERTEX_SHADER, vsrc, &ok);
-    GLuint f = opengl__compile(GL_FRAGMENT_SHADER, fsrc, &ok);
-    if (!ok) { glDeleteShader(v); glDeleteShader(f); return 0; }
+    const char* srcs[5] = { vsrc, tcsrc, tesrc, gsrc, fsrc };
+    const GLenum types[5] = { GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER,
+                              GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER };
+    GLuint st[5] = {};
+    for (int i = 0; i < 5; i++) if (srcs[i]) st[i] = opengl__compile(types[i], srcs[i], &ok);
+    if (!ok) { for (int i = 0; i < 5; i++) if (st[i]) glDeleteShader(st[i]); return 0; }
     GLuint p = glCreateProgram();
-    glAttachShader(p, v);
-    glAttachShader(p, f);
+    for (int i = 0; i < 5; i++) if (st[i]) glAttachShader(p, st[i]);
     glLinkProgram(p);
     GLint linked = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &linked);
-    glDeleteShader(v);
-    glDeleteShader(f);
+    for (int i = 0; i < 5; i++) if (st[i]) glDeleteShader(st[i]);
     if (!linked) {
         char log[2048] = {};
         glGetProgramInfoLog(p, sizeof(log), 0, log);
