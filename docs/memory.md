@@ -196,7 +196,9 @@ Define any of these before including pix:
 | `PIX_MAX_MESHES`, `PIX_MAX_MATERIALS` | 8192 each | |
 | `PIX_MAX_PARTICLES` | 16384 | per frame |
 | `PIX_MAX_LINES` | 32768 | debug lines per frame |
-| `PHYS_MAX_BODIES`, `PHYS_MAX_STATICS` | 2048, 32768 | physics world |
+| `PHYS3D_FLAT_MAX_BODIES`, `PHYS3D_FLAT_MAX_STATICS` | 2048, 32768 | flat 3D physics world |
+| `PHYS2D_MAX_BODIES`, `PHYS2D_MAX_JOINTS` | 4096 each | 2D physics world |
+| `PHYS3D_MAX_BODIES`, `PHYS3D_MAX_JOINTS` | 4096 each | 3D physics world |
 | `PIX_SCOPE_RESERVE` | 256 MB (64-bit) | the largest a single thread's scope stack can grow |
 | `PIX_SCOPE_KEEP` | 8 MB | how much a scope stack keeps after its outermost scope ends, to stay warm |
 | `PIX_SCOPE_THREADS` | 64 | threads that can hold a scope stack at once |

@@ -556,7 +556,7 @@ if (ray_vs_plane(cam.position, dir, plane_make(v3(0, 1, 0), 0), 1000.0f, false, 
 ```
 
 Call it after `pix_begin_3d`, so it uses this frame's camera.
-`ray_vs_sphere`, `ray_vs_aabb` and the physics world's raycasts work the same
+`ray_vs_sphere`, `ray_vs_aabb` and the physics worlds' raycasts work the same
 way. See [Physics](physics.md#shape-tests-without-a-world).
 
 The other direction, from world to screen, places 2D labels over 3D objects:

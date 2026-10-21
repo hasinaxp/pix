@@ -41,7 +41,10 @@ full set is in [`docs/`](docs/index.md):
 | [2D rendering](docs/2d-rendering.md) | shapes, images, sprites, text, 2D cameras |
 | [Tilemaps](docs/tilemaps.md) | Tiled maps, autotiling, animated tiles, objects, parallax |
 | [3D rendering](docs/3d-rendering.md) | cameras, meshes, materials, models, lights, shadows, post-processing |
-| [Physics](docs/physics.md) | the physics world and shape tests |
+| [3D physics](docs/physics-3d.md) | 3D rigid bodies, meshes, joints, ragdolls, sleeping, queries |
+| [2D physics](docs/physics-2d.md) | 2D rigid bodies, joints, sleeping, triggers, events, queries |
+| [Physics](docs/physics.md) | which world to use, what they share, shape tests |
+| [Flat 3D physics](docs/physics-3d-flat.md) | characters and crowds on the ground |
 | [Math](docs/math.md) | conventions, helpers, rotations, colour, easing and curves, fast approximations |
 | [Memory](docs/memory.md) | optional: scoped memory, stack buffers, arenas, limits, a custom heap |
 | [Cheatsheet](docs/cheatsheet.md) | the common calls on one page |
@@ -369,7 +372,7 @@ pix_draw_model_animated(knight, anim.pose, transform);
 | `renderer`, `shader_sources`, `lighting`, `framebuffer`, `animation` | 3D |
 | `platform_audio`, `sound` | waveOut device, mixer, voices with pitch and pan |
 | `loader/*` | PNG, OBJ/MTL, glTF 2.0 (skins, animation), WAV |
-| `colliders`, `physics` | shape tests; character-scale physics world |
+| `physics` | all physics in one include: `colliders` (shape tests), `physics_common` (layers), `physics2d`, `physics3d` (rigid bodies: joints, sleeping, queries), `physics3d_flat` (characters and crowds on the ground); `physics_debug` draws them |
 | `jobs`, `profile` | thread pool / parallel-for, section profiler |
 | `compute` | compute shaders, GPU buffers, indirect draws, storage images |
 | `meshops` | weld, normals, simplify, subdivide, merge, transform |
@@ -377,9 +380,7 @@ pix_draw_model_animated(knight, anim.pose, transform);
 
 ## Current limits
 
-* **Physics** is a 2.5D character/prop world (upright cylinders and boxes over
-  ground). A general 3D rigid-body engine and a 2D physics module are the next
-  big pieces.
+* **Physics** has no convex hulls or compound bodies yet, and runs on one thread.
 * Images are PNG only (no JPEG yet, so glTF files with JPEG textures load untextured); audio is WAV only.
 * No automatic mesh-LOD switching in the renderer yet: generate LODs with pix_mesh_simplify and pick one by distance.
 * No normal maps yet, because the vertex format has no tangents.

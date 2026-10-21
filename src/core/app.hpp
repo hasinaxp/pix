@@ -30,6 +30,7 @@
 #include "draw2d.hpp"
 #include "atlas.hpp"
 #include "tilemap.hpp"
+#include "physics_debug.hpp"
 #include "font.hpp"
 #include "sound.hpp"
 #include "animation.hpp"
@@ -160,6 +161,11 @@ PIXDEF void pix_draw_sprite_anim(const pix_atlas& atlas, const pix_sprite_player
                                  float scale = 1.0f, float rotation_deg = 0.0f, pix_color tint = PIX_WHITE,
                                  int flags = 0);
 
+// ---- 2D physics debug view (see physics2d.hpp) ----
+// Shapes, bounds, contacts and grid cells, through the current 2D camera.
+PIXDEF void pix_draw_physics2d(const phys2d_world& world, unsigned flags = PHYS2D_DRAW_DEFAULT,
+                               float thickness = 1.0f);
+
 // ---- tilemaps and parallax (see tilemap.hpp) ----
 // Through the current 2D camera, culled to the view; animated tiles run on pix_time.
 PIXDEF void pix_draw_tilemap(pix_tilemap& map);
@@ -216,6 +222,9 @@ PIXDEF void pix_draw_model(const pix_model& model, const mat4& transform, pix_co
 PIXDEF void pix_draw_model_animated(const pix_model& model, const animation& pose, const mat4& transform,
                                     pix_color tint = PIX_WHITE);
 PIXDEF void pix_draw_line3d(vec3 a, vec3 b, pix_color color);
+// the 3D physics world's shapes, contacts and joints as lines (see physics3d.hpp)
+PIXDEF void pix_draw_physics3d(const phys3d_world& world, unsigned flags = PHYS3D_DRAW_DEFAULT);
+PIXDEF void pix_draw_physics3d_flat(const phys3d_flat_world& world);
 PIXDEF void pix_draw_grid(float size, int cells, pix_color color = PIX_GRAY);
 PIXDEF void pix_draw_bounds(vec3 min, vec3 max, pix_color color);
 PIXDEF void pix_add_light(const pix_light& light);
@@ -604,6 +613,9 @@ void pix_draw_sprite_anim(const pix_atlas& a, const pix_sprite_player& p, vec2 p
 // ---- tilemaps ----
 
 void pix_draw_tilemap(pix_tilemap& map) { pix_batch_tilemap(pix__ctx->batch, map, (float)pix_time()); }
+void pix_draw_physics2d(const phys2d_world& world, unsigned flags, float thickness) {
+    phys2d_debug_draw(pix__ctx->batch, world, flags, thickness);
+}
 void pix_draw_tilemap_layer(pix_tilemap& map, int layer) {
     pix_batch_tilemap_layer(pix__ctx->batch, map, layer, (float)pix_time());
 }
@@ -808,6 +820,8 @@ void pix_draw_model_animated(const pix_model& m, const animation& pose, const ma
 }
 
 void pix_draw_line3d(vec3 a, vec3 b, pix_color c)      { push_line(pix_get_renderer(), a, b, c); }
+void pix_draw_physics3d(const phys3d_world& w, unsigned flags) { phys3d_debug_draw(pix_get_renderer(), w, flags); }
+void pix_draw_physics3d_flat(const phys3d_flat_world& w)         { phys3d_flat_debug_draw(pix_get_renderer(), w); }
 void pix_draw_grid(float size, int cells, pix_color c) { push_grid_lines(pix_get_renderer(), v3(0, 0, 0), size, cells, c); }
 void pix_draw_bounds(vec3 lo, vec3 hi, pix_color c)    { push_aabb_lines(pix_get_renderer(), lo, hi, c); }
 void pix_add_light(const pix_light& l)                 { push_light(pix_get_renderer(), l); }

@@ -216,34 +216,72 @@ hash2_float(x, y, seed)                 // the same value for the same cell, eve
 value_noise2(x, y, seed)   fbm2(x, y, octaves, seed)    // smooth noise, 0..1
 ```
 
-## Physics ([Physics](physics.md))
+## 2D physics ([2D physics](physics-2d.md))
 
 ```cpp
-static phys_world world;
-phys_create_world(world);                         // gravity (0,-22,0), ground_y 0
-world.ground_at = my_height_fn;                   // optional uneven ground
-phys_add_static_box(world, min, max);             // walls
-phys_add_static_prop(world, base, yaw, half_xz, height);
-phys_build_statics(world);                        // after adding statics
+phys2d_world w;  phys2d_create_world(w);                 // gravity (0, 980): pixels, y down
+phys2d_add(w, PHYS2D_STATIC, phys2d_box(800, 40), v2(400, 600));
+idx id = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(16), v2(400, 0));
+// shapes: phys2d_circle(r)  phys2d_box(w, h)  phys2d_aabb(w, h)  phys2d_capsule(r, h)
+// types:  PHYS2D_STATIC  PHYS2D_DYNAMIC  PHYS2D_KINEMATIC
 
-phys_body b = {};
-b.shape = PHYS_CYLINDER;  b.radius = 0.4f;  b.height = 1.8f;   // or PHYS_BOX: half, yaw
-b.position = feet;  b.inv_mass = 1;  b.gravity = true;
-b.group = PHYS_LAYER_PLAYER;  b.collides = PHYS_LAYER_ALL;
-idx id = phys_add_body(world, b);
+phys2d_body b = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_capsule(16, 64), pos);
+b.fixed_rotation = true;  b.restitution = 0.5f;  b.trigger = false;
+b.layer = PHYS_LAYER_0;   b.mask = PHYS_LAYER_ALL;
+idx player = phys2d_add_body(w, b);
+
+phys2d_update(w, pix_dt());                               // fixed 1/60 steps
+phys2d_body* p = phys2d_get_body(w, player);              // p->velocity, p->on_ground
+for (size_t i = 0; i < w.event_count; i++) w.events[i];   // CONTACT_BEGIN/END, TRIGGER_ENTER/EXIT
+phys2d_raycast(w, from, dir, max, &hit);
+phys2d_shape_cast(w, shape, pos, angle, dir, max, &hit);
+phys2d_overlap(w, shape, pos, angle, out, capacity);
+pix_draw_physics2d(w);                                    // debug view
+// joints: phys2d_add_revolute / _distance / _prismatic / _weld / _mouse (w, a, b, anchor...)
+phys2d_get_joint(w, j)->enable_limit = true;              // lower/upper; enable_motor, motor_speed
+```
+
+## 3D physics ([3D physics](physics-3d.md))
+
+```cpp
+phys3d_world w;  phys3d_create_world(w);                 // metres, y up, gravity 9.81
+phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+idx crate = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 3, 0));
+// shapes: phys3d_sphere(r)  phys3d_box(size)  phys3d_capsule(r, h)  phys3d_plane(n)  phys3d_mesh_shape(mesh)
+phys3d_mesh terrain;  phys3d_create_heightfield(terrain, heights, cols, rows, 1.0f);
+
+phys3d_update(w, pix_dt());
+pix_draw_mesh(cube, mat, phys3d_body_transform(w, *phys3d_get_body(w, crate)));
+// joints: phys3d_add_ball / _hinge / _slider / _fixed / _distance / _mouse
+phys3d_raycast(w, from, dir, max, &hit);   phys3d_overlap_sphere(w, c, r, out, cap);
+pix_draw_physics3d(w);                                    // debug view
+```
+
+## Flat 3D physics ([Flat 3D physics](physics-3d-flat.md))
+
+```cpp
+static phys3d_flat_world world;
+phys3d_flat_create_world(world);                         // gravity (0,-22,0), ground_y 0
+world.ground_at = my_height_fn;                          // optional uneven ground
+phys3d_flat_add_static_box(world, min, max);             // walls
+phys3d_flat_add_static_prop(world, base, yaw, half_xz, height);
+phys3d_flat_build_statics(world);                        // after adding statics
+
+phys3d_flat_body b = phys3d_flat_make_cylinder(feet, 0.4f, 1.8f);   // or phys3d_flat_make_box(base, half, height, yaw)
+b.layer = PHYS_LAYER_PLAYER;                             // mask: PHYS_LAYER_ALL by default
+idx id = phys3d_flat_add_body(world, b);
 
 // each frame
-phys_body* p = phys_get_body(world, id);
+phys3d_flat_body* p = phys3d_flat_get_body(world, id);
 p->velocity.x = ...;  p->velocity.z = ...;
 if (p->on_ground && jump) p->velocity.y = 8;
-phys_step(world, dt);
-// draw at p->position (feet)
+phys3d_flat_update(world, pix_dt());
+// draw at phys3d_flat_lerp_position(world, *p) (feet)
 
-phys_raycast(world, from, dir, max, &dist)                               // statics
-phys_raycast_bodies(world, from, dir, max, mask, ignore, &dist)          // bodies -> id
-phys_query_neighbours(world, centre, radius, out, capacity)
-phys_point_blocked(world, pos, radius, height)
-phys_remove_body(world, id);    phys_destroy_world(world);
+phys3d_flat_raycast(world, from, dir, max, &hit, mask, ignore)    // walls and bodies; hit.body PIX_INVALID = wall
+phys3d_flat_query_neighbours(world, centre, radius, out, capacity)
+phys3d_flat_point_blocked(world, pos, radius, height)
+phys3d_flat_remove_body(world, id);    phys3d_flat_destroy_world(world);
 ```
 
 Shape tests (`contact` pointer required):

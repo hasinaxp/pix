@@ -22,7 +22,10 @@ and how pix reports errors.
 | [2D rendering](2d-rendering.md) | shapes, images, sprites and animation (Aseprite, atlases), text, cameras, shake, blend modes, canvases, pixel-art resolution, screen effects |
 | [Tilemaps](tilemaps.md) | Tiled maps, layers, autotiling, animated tiles, objects, parallax |
 | [3D rendering](3d-rendering.md) | cameras, transforms, meshes, materials, models, animation, lights, shadows, post-processing, picking |
-| [Physics](physics.md) | the physics world (walls, bodies, raycasts) and shape tests for 2D and 3D: boxes, oriented boxes, capsules, triangles |
+| [3D physics](physics-3d.md) | rigid bodies: boxes, balls, capsules, planes, triangle meshes and terrain; stacking, joints (ball, hinge, slider, fixed, rope, spring), ragdolls, triggers, events, layers, sleeping, raycasts, shape casts, overlaps, debug view |
+| [2D physics](physics-2d.md) | the same for 2D games: circles, boxes, capsules, joints, sleeping, triggers, events, queries |
+| [Physics](physics.md) | start here: which physics world to use, what they all share (one include, layers, the same API shape), and shape tests without a world |
+| [Flat 3D physics](physics-3d-flat.md) | the cheapest world: characters, crowds and vehicles pushing each other and walls on the ground |
 | [Math](math.md) | conventions, everyday helpers, rotations, colour, easing and curves, trajectories, `mat3`, fast approximations |
 | [Memory](memory.md) | optional: scoped temporary memory, stack buffers, arenas, statistics, limits, a custom heap |
 | [Cheatsheet](cheatsheet.md) | the common calls on one page, including math, random numbers and audio |

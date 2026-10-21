@@ -8,7 +8,7 @@ bottom once.
 
 pix is a C++ library for making games on Windows. It opens a window, reads the
 keyboard, mouse and gamepads, draws 2D and 3D graphics with OpenGL, plays
-sounds, loads images, models and audio files, and has a small physics world.
+sounds, loads images, models and audio files, and simulates physics in 2D and 3D.
 
 It is **header-only**. There is no `.lib` to build and nothing to install. You
 include one header and compile your game as usual.
@@ -186,7 +186,7 @@ the size you draw in: the window's, unless you fix a resolution with
 
 **3D** uses **Y up**. The ground is the XZ plane. Distances are in whatever
 unit you choose, but the defaults (fog, shadow distance, light falloff,
-gravity in the physics world) are tuned for **1 unit = 1 metre**.
+gravity in the 3D physics worlds) are tuned for **1 unit = 1 metre**.
 
 ## The basic types
 
@@ -358,6 +358,8 @@ build debug city      build without optimisation, with debug info
 | example | shows |
 |---|---|
 | `hello_2d` | shapes, text, a 2D camera that follows the player, keyboard/gamepad movement |
+| `physics_2d` | 2D physics: a walking, jumping player, stacked crates, bouncing balls, a moving platform, a bridge and a wrecking ball on joints, a trigger, mouse dragging |
+| `physics_3d` | 3D physics: stacks, a wrecking ball on a chain, a ragdoll, a seesaw, a lift, a door, a heightfield hill, a trigger, a walking player, mouse dragging |
 | `hello_3d` | 3D primitives, a model, an animated character, shadows, lights, particles, post effects |
 | `animation` | animated characters, blending between animations, footstep sounds, gamepad rumble |
 | `reflections` | reflections, water, glass |
@@ -373,7 +375,10 @@ build debug city      build without optimisation, with debug info
 - [Input](inputs.md): keyboard, mouse, gamepads, text entry
 - [2D rendering](2d-rendering.md): shapes, images, sprites, text, 2D cameras
 - [3D rendering](3d-rendering.md): cameras, meshes, materials, models, lights, shadows
-- [Physics](physics.md): the physics world and collision tests
+- [3D physics](physics-3d.md): rigid bodies, joints and ragdolls
+- [2D physics](physics-2d.md): rigid bodies for 2D games
+- [Physics](physics.md): which physics world to use, what they share, and shape tests
+- [Flat 3D physics](physics-3d-flat.md): characters and crowds on the ground
 - [Memory](memory.md): optional control over where memory comes from
 - [Cheatsheet](cheatsheet.md): every common call on one page
 

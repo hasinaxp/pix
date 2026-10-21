@@ -234,37 +234,63 @@ int main() {
         check(n >= 2 && n <= 5, "rng_int stays in range");
     }
 
-    // ---- physics ----
-    static phys_world w;
-    phys_create_world(w);
-    phys_add_static_box(w, v3(-20, -1, -20), v3(20, 0, 20));   // floor slab
-    phys_add_static_box(w, v3(2, 0, -20), v3(3, 4, 20));       // wall across x = 2..3
-    phys_build_statics(w);
+    // ---- flat 3D world ----
+    static phys3d_flat_world w;
+    phys3d_flat_create_world(w);
+    phys3d_flat_add_static_box(w, v3(-20, -1, -20), v3(20, 0, 20));   // floor slab
+    phys3d_flat_add_static_box(w, v3(2, 0, -20), v3(3, 4, 20));       // wall across x = 2..3
+    phys3d_flat_build_statics(w);
 
-    phys_body body = {};
-    body.position = v3(0, 5, 0);
-    body.shape = PHYS_CYLINDER; body.radius = 0.3f; body.height = 1.8f;
-    body.inv_mass = 1.0f; body.gravity = true; body.active = true;
-    body.friction = 0.4f;
-    body.group = PHYS_LAYER_PLAYER; body.collides = PHYS_LAYER_ALL;
-    idx id_body = phys_add_body(w, body);
+    phys3d_flat_body body = phys3d_flat_make_cylinder(v3(0, 5, 0), 0.3f, 1.8f);
+    body.layer = PHYS_LAYER_PLAYER;
+    idx id_body = phys3d_flat_add_body(w, body);
 
-    for (int i = 0; i < 240; i++) phys_step(w, 1.0f / 60.0f);
-    phys_body* bp = phys_get_body(w, id_body);
+    for (int i = 0; i < 240; i++) phys3d_flat_step(w, 1.0f / 60.0f);
+    phys3d_flat_body* bp = phys3d_flat_get_body(w, id_body);
     check(bp->on_ground, "body came to rest on the ground");
     near_eq(bp->position.y, 0.0f, 1e-3f, "body rests at ground height");
 
     for (int i = 0; i < 240; i++) {                 // drive it into the wall
-        phys_get_body(w, id_body)->velocity.x = 6.0f;
-        phys_step(w, 1.0f / 60.0f);
+        phys3d_flat_get_body(w, id_body)->velocity.x = 6.0f;
+        phys3d_flat_step(w, 1.0f / 60.0f);
     }
-    bp = phys_get_body(w, id_body);
+    bp = phys3d_flat_get_body(w, id_body);
     check(bp->position.x < 2.0f, "body stopped by the wall");
     check(bp->position.x > 1.4f, "body stopped against the wall, not short of it");
 
-    check(phys_raycast(w, v3(0, 1, 0), v3(1, 0, 0), 50.0f, &t), "raycast finds the wall");
-    near_eq(t, 2.0f, 0.05f, "raycast distance to the wall");
-    phys_destroy_world(w);
+    phys3d_flat_ray_hit fh;
+    check(phys3d_flat_raycast(w, v3(0, 1, 0), v3(1, 0, 0), 50.0f, &fh, PHYS_LAYER_ALL, id_body), "raycast finds the wall");
+    check(fh.body == PIX_INVALID, "flat raycast reports static geometry as PIX_INVALID");
+    near_eq(fh.distance, 2.0f, 0.05f, "raycast distance to the wall");
+    near_eq(fh.normal.x, -1.0f, 1e-4f, "flat raycast normal faces the ray");
+    check(phys3d_flat_raycast(w, v3(-5, 1, 0), v3(1, 0, 0), 50.0f, &fh) && fh.body == id_body,
+          "flat raycast hits the body before the wall");
+    near_eq(fh.normal.x, -1.0f, 0.05f, "flat raycast body normal");
+    check(!phys3d_flat_raycast(w, v3(-5, 1, 0), v3(1, 0, 0), 50.0f, &fh, PHYS_LAYER_1) || fh.body == PIX_INVALID,
+          "flat raycast mask skips the body");
+
+    // layers under the shared rule: both must accept
+    phys3d_flat_body crate = phys3d_flat_make_box(v3(-5, 0, 0), v2(0.5f, 0.5f), 1.0f, 0.3f);
+    crate.layer = PHYS_LAYER_3;
+    crate.mask = PHYS_LAYER_ALL & ~PHYS_LAYER_PLAYER;      // the player walks through it
+    idx id_crate = phys3d_flat_add_body(w, crate);
+    phys3d_flat_get_body(w, id_body)->position = v3(-7, 0, 0);
+    for (int i = 0; i < 90; i++) {
+        phys3d_flat_get_body(w, id_body)->velocity.x = 4.0f;
+        phys3d_flat_step(w, 1.0f / 60.0f);
+    }
+    check(phys3d_flat_get_body(w, id_body)->position.x > -3.5f, "flat layers: one side refusing is enough to pass");
+    check(phys_layers_collide(PHYS_LAYER_0, PHYS_LAYER_ALL, PHYS_LAYER_1, PHYS_LAYER_0) &&
+          !phys_layers_collide(PHYS_LAYER_0, PHYS_LAYER_ALL, PHYS_LAYER_1, PHYS_LAYER_2), "shared layer rule");
+
+    idx near_ids[4];
+    check(phys3d_flat_overlap(w, v3(-5, 0, 0), 0.2f, near_ids, 4) == 1 && near_ids[0] == id_crate, "flat overlap finds the crate");
+    check(phys3d_flat_overlap(w, v3(-5, 0, 0), 0.2f, near_ids, 4, PHYS_LAYER_PLAYER) == 0, "flat overlap mask");
+    check(phys3d_flat_overlap(w, v3(0, 0, 0), 30.0f, near_ids, 1) == 2, "flat overlap counts past its capacity");
+
+    w.accumulator = 0;
+    check(phys3d_flat_update(w, 0.04f) == 2 && w.alpha > 0.35f && w.alpha < 0.45f, "flat update runs fixed steps");
+    phys3d_flat_destroy_world(w);
 
     // ---- jobs ----
     pix_jobs jobs;
@@ -779,6 +805,726 @@ int main() {
         check(e_atan2 < 2.5e-6f, "fast_atan2 error under 2.5e-6");
         vec3 nv = v3norm_fast(v3(3, 4, 12));
         near_eq(v3len(nv), 1.0f, 1e-5f, "v3norm_fast gives unit length");
+    }
+
+    // ---- 2D physics world ----
+    {
+        // narrowphase, every shape pair the one routine handles
+        phys2d__poly pa, pb;
+        phys2d_contact m;
+        phys2d__make_poly(phys2d_circle(10), v2(0, 0), 0, pa);
+        phys2d__make_poly(phys2d_circle(10), v2(15, 0), 0, pb);
+        check(phys2d__collide(pa, pb, 0.5f, 0, m) == 1, "p2d circle/circle one point");
+        near_eq(m.points[0].separation, -5.0f, 1e-4f, "p2d circle/circle depth");
+        near_eq(m.normal.x, 1.0f, 1e-4f, "p2d circle/circle normal a to b");
+
+        phys2d__make_poly(phys2d_box(40, 20), v2(0, 0), 0, pa);           // resting box on box
+        phys2d__make_poly(phys2d_box(20, 20), v2(5, -19), 0, pb);
+        check(phys2d__collide(pa, pb, 0.5f, 0, m) == 2, "p2d box/box face contact has two points");
+        near_eq(m.normal.y, -1.0f, 1e-4f, "p2d box/box normal up toward the top box");
+        near_eq(m.points[0].separation, -1.0f, 1e-4f, "p2d box/box depth");
+
+        phys2d__make_poly(phys2d_box(40, 20), v2(0, 0), 0.5f, pa);        // rotated corner hit
+        phys2d__make_poly(phys2d_circle(5), v2(0, -30), 0, pb);
+        check(phys2d__collide(pa, pb, 0.5f, 0, m) == 0, "p2d circle clear of rotated box");
+
+        phys2d__make_poly(phys2d_capsule(10, 60), v2(0, 0), PIX_PI * 0.5f, pa);   // capsule lying down
+        phys2d__make_poly(phys2d_box(200, 20), v2(0, 19), 0, pb);
+        check(phys2d__collide(pa, pb, 0.5f, 0, m) == 2, "p2d lying capsule on box has two points");
+        near_eq(m.points[0].separation, -1.0f, 1e-3f, "p2d capsule/box depth");
+        near_eq(m.normal.y, 1.0f, 1e-4f, "p2d capsule/box normal down to the box");
+
+        phys2d__make_poly(phys2d_capsule(5, 40), v2(0, 0), 0, pa);       // end to end, collinear
+        phys2d__make_poly(phys2d_capsule(5, 40), v2(0, 38), 0, pb);
+        check(phys2d__collide(pa, pb, 0.5f, 0, m) == 1, "p2d collinear capsules touch at the caps");
+        near_eq(m.points[0].separation, -2.0f, 1e-3f, "p2d capsule cap depth");
+
+        phys2d__make_poly(phys2d_aabb(20, 20), v2(0, 0), 1.0f, pa);       // aabb ignores angle
+        check(fabsf(pa.v[0].x + 10) < 1e-5f && fabsf(pa.v[0].y + 10) < 1e-5f, "p2d aabb never rotates");
+
+        // a stack of boxes settles and stays put
+        phys2d_world w;
+        phys2d_create_world(w);
+        phys2d_add(w, PHYS2D_STATIC, phys2d_box(3000, 40), v2(0, 20));
+        idx stack[8];
+        for (int i = 0; i < 8; i++) stack[i] = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(30, 30), v2(0, -15.0f - i * 30.5f));
+        for (int i = 0; i < 600; i++) phys2d_step(w, 1.0f / 60.0f);
+        phys2d_body* top = phys2d_get_body(w, stack[7]);
+        near_eq(top->position.x, 0.0f, 0.5f, "p2d stack of 8 stays upright");
+        near_eq(top->position.y, -15.0f - 7 * 30.0f, 3.0f, "p2d stack rests at its height");
+        near_eq(top->angle, 0.0f, 0.02f, "p2d stack top did not tip");
+        check(fabsf(top->velocity.y) < 2.0f, "p2d stack is at rest");
+        check(phys2d_get_body(w, stack[0])->on_ground, "p2d bottom box is on the ground");
+
+        // a staggered pyramid (each box resting on two) holds its shape
+        {
+            phys2d_world pw;
+            phys2d_create_world(pw);
+            phys2d_add(pw, PHYS2D_STATIC, phys2d_box(2000, 40), v2(0, 20));
+            idx apex = PIX_INVALID;
+            for (int row = 0; row < 10; row++)
+                for (int i = 0; i < 10 - row; i++)
+                    apex = phys2d_add(pw, PHYS2D_DYNAMIC, phys2d_box(30, 30),
+                                      v2((i - (9 - row) * 0.5f) * 31.0f, -15.0f - row * 30.0f));
+            for (int i = 0; i < 600; i++) phys2d_step(pw, 1.0f / 60.0f);
+            phys2d_body* ap = phys2d_get_body(pw, apex);
+            near_eq(ap->position.x, 0.0f, 1.0f, "p2d pyramid apex stays centred");
+            near_eq(ap->position.y, -15.0f - 9 * 30.0f, 4.0f, "p2d pyramid keeps its height");
+            check(v2len(ap->velocity) < 2.0f, "p2d pyramid is at rest");
+            phys2d_destroy_world(pw);
+        }
+
+        // a fast ball does not pass through a thin wall
+        idx wall = phys2d_add(w, PHYS2D_STATIC, phys2d_box(4, 400), v2(400, -200));
+        phys2d_body bullet = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_circle(3), v2(300, -300));
+        bullet.velocity = v2(6000, 0);
+        bullet.gravity_scale = 0;
+        idx bid = phys2d_add_body(w, bullet);
+        for (int i = 0; i < 30; i++) phys2d_step(w, 1.0f / 60.0f);
+        check(phys2d_get_body(w, bid)->position.x < 400, "p2d speculative contacts stop tunnelling");
+        phys2d_remove_body(w, bid);
+
+        // restitution: a bouncy ball comes back up, a dead one does not
+        phys2d_body ball = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_circle(10), v2(-300, -200));
+        ball.restitution = 0.8f;
+        idx bouncy = phys2d_add_body(w, ball);
+        ball.restitution = 0.0f; ball.position.x = -200;
+        idx dead = phys2d_add_body(w, ball);
+        float peak_after = -1e9f, lowest = -1e9f;
+        bool bounced = false;
+        for (int i = 0; i < 120; i++) {
+            phys2d_step(w, 1.0f / 60.0f);
+            for (size_t e = 0; e < w.event_count; e++)
+                if (w.events[e].type == PHYS2D_CONTACT_BEGIN && (w.events[e].a == bouncy || w.events[e].b == bouncy))
+                    bounced = true;
+            phys2d_body* b = phys2d_get_body(w, bouncy);
+            if (bounced && b->velocity.y < 0) peak_after = maxf(peak_after, -b->position.y);
+            lowest = maxf(lowest, phys2d_get_body(w, dead)->velocity.y < -20 ? 1.0f : -1e9f);
+        }
+        check(bounced, "p2d contact begin event fires on landing");
+        check(peak_after > 100.0f, "p2d restitution bounces the ball back up");
+        check(lowest < 0.0f, "p2d restitution 0 does not bounce");
+
+        // triggers report enter/exit and never push
+        phys2d_body zone = phys2d_make_body(PHYS2D_STATIC, phys2d_aabb(100, 100), v2(600, -50));
+        zone.trigger = true;
+        idx zid = phys2d_add_body(w, zone);
+        phys2d_body walker = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_capsule(10, 40), v2(500, -21));
+        walker.fixed_rotation = true;
+        walker.friction = 0;
+        walker.layer = PHYS_LAYER_1;
+        idx wid = phys2d_add_body(w, walker);
+        int enters = 0, exits = 0;
+        for (int i = 0; i < 120; i++) {
+            phys2d_get_body(w, wid)->velocity.x = 200;
+            phys2d_step(w, 1.0f / 60.0f);
+            for (size_t e = 0; e < w.event_count; e++) {
+                if (w.events[e].type == PHYS2D_TRIGGER_ENTER && w.events[e].a == zid && w.events[e].b == wid) enters++;
+                if (w.events[e].type == PHYS2D_TRIGGER_EXIT  && w.events[e].a == zid && w.events[e].b == wid) exits++;
+            }
+        }
+        check(enters == 1 && exits == 1, "p2d trigger enter and exit fire once each");
+        check(phys2d_get_body(w, wid)->position.x > 800, "p2d trigger does not block");
+        check(phys2d_get_body(w, wid)->on_ground, "p2d capsule walker is grounded");
+        near_eq(phys2d_get_body(w, wid)->angle, 0.0f, 1e-6f, "p2d fixed rotation stays upright");
+
+        // layers: a body that masks out layer 0 falls through the floor
+        phys2d_body ghost = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_circle(10), v2(-100, -100));
+        ghost.mask = PHYS_LAYER_ALL & ~PHYS_LAYER_0;
+        idx gid = phys2d_add_body(w, ghost);
+        for (int i = 0; i < 60; i++) phys2d_step(w, 1.0f / 60.0f);
+        check(phys2d_get_body(w, gid)->position.y > 100, "p2d layer mask lets a ghost through");
+
+        // queries
+        phys2d_ray_hit hit;
+        check(phys2d_raycast(w, v2(0, -1000), v2(0, 1), 2000, &hit), "p2d raycast down hits the stack");
+        check(hit.body == stack[7], "p2d raycast hits the top box first");
+        near_eq(hit.point.y, top->position.y - 15, 1.0f, "p2d raycast hit point on the top face");
+        near_eq(hit.normal.y, -1.0f, 1e-3f, "p2d raycast normal faces the ray");
+        check(phys2d_raycast(w, v2(0, -1000), v2(0, 1), 2000, &hit, PHYS_LAYER_ALL, stack[7]) && hit.body == stack[6],
+              "p2d raycast ignore skips a body");
+        check(!phys2d_raycast(w, v2(-450, -1000), v2(0, 1), 500, &hit), "p2d raycast miss");
+
+        check(phys2d_shape_cast(w, phys2d_circle(10), v2(-400, -100), 0, v2(0, 1), 500, &hit),
+              "p2d circle cast hits the floor");
+        near_eq(hit.distance, 90.0f, 0.5f, "p2d shape cast distance to touch");
+        near_eq(hit.normal.y, -1.0f, 1e-2f, "p2d shape cast normal");
+
+        idx found[16];
+        size_t n = phys2d_overlap(w, phys2d_aabb(40, 100), v2(0, -60), 0, found, 16);
+        check(n == 4, "p2d overlap aabb finds the four bottom boxes");
+        check(phys2d_overlap_point(w, v2(600, -50), found, 16) == 1 && found[0] == zid, "p2d overlap point finds the trigger");
+        check(phys2d_overlap(w, phys2d_circle(5), v2(0, -5), 0, found, 16, PHYS_LAYER_1) == 0, "p2d overlap mask");
+
+        // fixed step bookkeeping
+        w.accumulator = 0;
+        int steps = phys2d_update(w, 0.04f);
+        check(steps == 2, "p2d update runs whole fixed steps");
+        check(w.alpha > 0.35f && w.alpha < 0.45f, "p2d update leaves the remainder as alpha");
+        check(phys2d_update(w, 10.0f) == w.max_steps, "p2d update caps steps after a hitch");
+
+        // removal: slot reuse waits a step and the end event fires
+        phys2d_remove_body(w, stack[0]);
+        check(phys2d_get_body(w, stack[0]) == 0, "p2d removed body is gone");
+        phys2d_step(w, 1.0f / 60.0f);
+        bool ended = false;
+        for (size_t e = 0; e < w.event_count; e++)
+            ended |= w.events[e].type == PHYS2D_CONTACT_END && (w.events[e].a == stack[0] || w.events[e].b == stack[0]);
+        check(ended, "p2d removing a body ends its contacts");
+        phys2d_destroy_world(w);
+    }
+
+    // ---- 2D joints and sleeping ----
+    {
+        const float dt = 1.0f / 60.0f;
+        phys2d_world w;
+        phys2d_create_world(w);
+        w.allow_sleep = false;
+
+        // pendulum: a revolute pin to the world keeps the bob at its radius
+        idx bob = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(10), v2(100, 0));
+        idx pin = phys2d_add_revolute(w, PIX_INVALID, bob, v2(0, 0));
+        float worst = 0, lowest = -1e9f;
+        for (int i = 0; i < 300; i++) {
+            phys2d_step(w, dt);
+            phys2d_body* b = phys2d_get_body(w, bob);
+            worst = maxf(worst, fabsf(v2len(b->position) - 100.0f));
+            lowest = maxf(lowest, b->position.y);
+        }
+        check(worst < 1.5f, "p2d revolute pendulum keeps its length");
+        check(lowest > 95.0f, "p2d pendulum swings down through the bottom");
+        check(phys2d_get_joint(w, pin)->reaction > 0.0f, "p2d joint reports its reaction force");
+
+        // revolute limit: a hinged bar may only swing 0.5 rad either way
+        idx bar = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(100, 10), v2(550, 0));
+        idx hinge = phys2d_add_revolute(w, PIX_INVALID, bar, v2(500, 0));
+        phys2d_get_joint(w, hinge)->enable_limit = true;
+        phys2d_get_joint(w, hinge)->lower = -0.5f;
+        phys2d_get_joint(w, hinge)->upper = 0.5f;
+        float max_angle = 0;
+        for (int i = 0; i < 240; i++) { phys2d_step(w, dt); max_angle = maxf(max_angle, phys2d_get_body(w, bar)->angle); }
+        check(max_angle < 0.56f && max_angle > 0.45f, "p2d revolute limit stops the swing at the upper angle");
+
+        // revolute motor spins a wheel at its set speed
+        idx wheel = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(20), v2(-500, 0));
+        idx axle = phys2d_add_revolute(w, PIX_INVALID, wheel, v2(-500, 0));
+        phys2d_joint* aj = phys2d_get_joint(w, axle);
+        aj->enable_motor = true; aj->motor_speed = 5.0f; aj->max_motor_force = 1e9f;
+        for (int i = 0; i < 60; i++) phys2d_step(w, dt);
+        near_eq(phys2d_get_body(w, wheel)->angular_velocity, 5.0f, 0.05f, "p2d revolute motor reaches its speed");
+        near_eq(phys2d_get_body(w, wheel)->position.x, -500.0f, 0.5f, "p2d motor wheel stays on its axle");
+
+        // prismatic: a block on a vertical rail drops to the lower stop (y down = +)
+        idx car = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(20, 20), v2(1000, 0));
+        idx rail = phys2d_add_prismatic(w, PIX_INVALID, car, v2(1000, 0), v2(0, 1));
+        phys2d_joint* rj = phys2d_get_joint(w, rail);
+        rj->enable_limit = true; rj->lower = -20.0f; rj->upper = 50.0f;
+        for (int i = 0; i < 120; i++) phys2d_step(w, dt);
+        phys2d_body* cb = phys2d_get_body(w, car);
+        near_eq(cb->position.y, 50.0f, 1.0f, "p2d prismatic limit holds the block at its stop");
+        near_eq(cb->position.x, 1000.0f, 0.1f, "p2d prismatic keeps the block on its axis");
+        near_eq(cb->angle, 0.0f, 0.01f, "p2d prismatic keeps the block from rotating");
+        rj->enable_motor = true; rj->motor_speed = -100.0f; rj->max_motor_force = 1e9f;
+        for (int i = 0; i < 20; i++) phys2d_step(w, dt);
+        near_eq(cb->velocity.y, -100.0f, 2.0f, "p2d prismatic motor drives the block");
+
+        // a hanging chain of rigid rods keeps every link length
+        idx prev = PIX_INVALID;
+        vec2 top = v2(2000, -200);
+        idx links[10];
+        for (int i = 0; i < 10; i++) {
+            phys2d_body link = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_circle(4), top + v2(20.0f * (i + 1), 0));
+            link.linear_damping = 1.5f;     // air drag, so the swing settles
+            links[i] = phys2d_add_body(w, link);
+            phys2d_add_distance(w, prev, links[i], i ? top + v2(20.0f * i, 0) : top, top + v2(20.0f * (i + 1), 0));
+            prev = links[i];
+        }
+        float chain_err = 0;
+        for (int i = 0; i < 300; i++) {
+            phys2d_step(w, dt);
+            for (int k = 0; k < 10; k++) {
+                vec2 a = k ? phys2d_get_body(w, links[k - 1])->position : top;
+                chain_err = maxf(chain_err, fabsf(v2dist(a, phys2d_get_body(w, links[k])->position) - 20.0f));
+            }
+        }
+        printf("info  chain worst link error %.3f\n", chain_err);
+        check(chain_err < 2.0f, "p2d distance chain holds its link lengths");
+        for (int i = 0; i < 600; i++) phys2d_step(w, dt);
+        check(phys2d_get_body(w, links[9])->position.y > top.y + 190.0f, "p2d chain settles hanging straight down");
+
+        // spring: settles stretched below its rest length, without exploding
+        idx weight = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(10), v2(3000, 100));
+        idx spring = phys2d_add_distance(w, PIX_INVALID, weight, v2(3000, 0), v2(3000, 100));
+        phys2d_joint* sj = phys2d_get_joint(w, spring);
+        sj->enable_spring = true; sj->hertz = 2.0f; sj->damping_ratio = 0.5f;
+        for (int i = 0; i < 600; i++) phys2d_step(w, dt);
+        float stretch = phys2d_get_body(w, weight)->position.y - 100.0f;
+        check(stretch > 5.0f && stretch < 200.0f, "p2d spring sags under the weight and settles");
+        check(fabsf(phys2d_get_body(w, weight)->velocity.y) < 5.0f, "p2d spring comes to rest");
+
+        // rope: slack inside its length, taut at it
+        idx load = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(10), v2(4000, 30));
+        idx rope = phys2d_add_distance(w, PIX_INVALID, load, v2(4000, 0), v2(4000, 30));
+        phys2d_joint* ro = phys2d_get_joint(w, rope);
+        ro->enable_spring = true; ro->hertz = 0; ro->enable_limit = true; ro->lower = 0; ro->upper = 120;
+        for (int i = 0; i < 10; i++) phys2d_step(w, dt);
+        check(phys2d_get_body(w, load)->velocity.y > 100.0f, "p2d rope is slack inside its length");
+        for (int i = 0; i < 300; i++) phys2d_step(w, dt);
+        near_eq(phys2d_get_body(w, load)->position.y, 120.0f, 2.0f, "p2d rope holds at its length");
+
+        // weld: a cantilever glued to the world barely sags
+        idx beam = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(80, 10), v2(5040, 0));
+        phys2d_add_weld(w, PIX_INVALID, beam, v2(5000, 0));
+        for (int i = 0; i < 120; i++) phys2d_step(w, dt);
+        check(fabsf(phys2d_get_body(w, beam)->angle) < 0.05f && fabsf(phys2d_get_body(w, beam)->position.y) < 2.0f,
+              "p2d weld holds a cantilever");
+
+        // mouse joint drags a body to the target
+        idx toy = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(30, 30), v2(6000, 0));
+        idx grab = phys2d_add_mouse(w, toy, v2(6000, 0));
+        phys2d_get_joint(w, grab)->target = v2(6100, -100);
+        for (int i = 0; i < 180; i++) phys2d_step(w, dt);
+        check(v2dist(phys2d_get_body(w, toy)->position, v2(6100, -100)) < 5.0f, "p2d mouse joint drags to the target");
+        phys2d_remove_joint(w, grab);
+        check(phys2d_get_joint(w, grab) == 0, "p2d removed joint is gone");
+
+        // a weak joint snaps under load and reports it
+        idx heavy = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(40, 40), v2(7000, 40));
+        idx weak = phys2d_add_revolute(w, PIX_INVALID, heavy, v2(7000, 0));
+        phys2d_get_joint(w, weak)->break_force = 1000.0f;
+        bool snapped = false;
+        for (int i = 0; i < 30; i++) {
+            phys2d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++) snapped |= w.events[e].type == PHYS2D_JOINT_BREAK && w.events[e].joint == weak;
+        }
+        check(snapped && phys2d_get_joint(w, weak) == 0, "p2d break_force snaps the joint");
+        check(phys2d_get_body(w, heavy)->position.y > 100.0f, "p2d broken joint lets go");
+
+        // jointed bodies do not collide unless asked to
+        idx ja = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(40, 40), v2(8000, 0));
+        idx jb = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(40, 40), v2(8010, 0));
+        phys2d_add_weld(w, ja, jb, v2(8005, 0));
+        phys2d_step(w, dt);
+        bool pair = false;
+        for (size_t i = 0; i < w.contact_count; i++) pair |= (w.contacts[i].a == ja && w.contacts[i].b == jb);
+        check(!pair, "p2d jointed bodies skip their contact");
+        phys2d_destroy_world(w);
+
+        // ---- sleeping ----
+        phys2d_create_world(w);
+        phys2d_add(w, PHYS2D_STATIC, phys2d_box(2000, 40), v2(0, 20));
+        idx s0 = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(30, 30), v2(0, -15));
+        idx s1 = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(30, 30), v2(0, -45));
+        bool ended_while_asleep = false;
+        for (int i = 0; i < 120; i++) {
+            phys2d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++) ended_while_asleep |= w.events[e].type == PHYS2D_CONTACT_END;
+        }
+        check(phys2d_get_body(w, s0)->sleeping && phys2d_get_body(w, s1)->sleeping, "p2d resting stack falls asleep");
+        check(!ended_while_asleep, "p2d sleeping keeps its contacts (no end events)");
+        check(phys2d_get_body(w, s1)->on_ground, "p2d sleeping body stays grounded");
+        vec2 rest = phys2d_get_body(w, s1)->position;
+        for (int i = 0; i < 60; i++) phys2d_step(w, dt);
+        check(phys2d_get_body(w, s1)->position.x == rest.x && phys2d_get_body(w, s1)->position.y == rest.y, "p2d sleeping body does not drift");
+
+        idx dropper = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_box(30, 30), v2(0, -200));
+        bool woke = false;
+        for (int i = 0; i < 60 && !woke; i++) { phys2d_step(w, dt); woke = !phys2d_get_body(w, s0)->sleeping; }
+        check(woke, "p2d a box landing on a sleeping stack wakes the whole island");
+        for (int i = 0; i < 120; i++) phys2d_step(w, dt);
+        check(phys2d_get_body(w, dropper)->sleeping, "p2d the stack sleeps again");
+        phys2d_get_body(w, s1)->velocity = v2(0, -300);
+        phys2d_step(w, dt);
+        check(!phys2d_get_body(w, s1)->sleeping, "p2d setting a velocity wakes a body");
+        phys2d_get_body(w, s1)->velocity = v2(0, 0);
+        for (int i = 0; i < 180; i++) phys2d_step(w, dt);
+        phys2d_remove_body(w, s0);
+        for (int i = 0; i < 30; i++) phys2d_step(w, dt);
+        check(phys2d_get_body(w, s1)->position.y > -40.0f, "p2d removing the support wakes what rested on it");
+        phys2d_destroy_world(w);
+    }
+
+    // ---- 3D physics world ----
+    {
+        const float dt = 1.0f / 60.0f;
+        quat qi = quat_identity();
+        phys3d__core ca, cb;
+        phys3d_contact m;
+
+        // narrowphase, shape pair by shape pair
+        phys3d__make_core(phys3d_sphere(1), v3(0, 0, 0), qi, ca);
+        phys3d__make_core(phys3d_sphere(1), v3(1.5f, 0, 0), qi, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 1, "p3d sphere/sphere one point");
+        near_eq(m.points[0].separation, -0.5f, 1e-4f, "p3d sphere/sphere depth");
+        near_eq(m.normal.x, 1.0f, 1e-4f, "p3d sphere/sphere normal a to b");
+
+        phys3d__make_core(phys3d_box(v3(2, 2, 2)), v3(0, 0.99f, 0), qi, ca);
+        phys3d__make_core(phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0), qi, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 4, "p3d box on plane has four points");
+        near_eq(m.points[0].separation, -0.01f, 1e-4f, "p3d box/plane depth");
+        near_eq(m.normal.y, -1.0f, 1e-4f, "p3d box/plane normal points into the plane");
+
+        phys3d__make_core(phys3d_box(v3(4, 1, 4)), v3(0, 0, 0), qi, ca);
+        phys3d__make_core(phys3d_box(v3(1, 1, 1)), v3(0.3f, 0.99f, -0.2f), quat_from_axis_angle(v3(0, 1, 0), 0.4f), cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 4, "p3d box resting on box face has four points");
+        near_eq(m.normal.y, 1.0f, 1e-4f, "p3d box/box face normal up");
+        near_eq(m.points[0].separation, -0.01f, 1e-3f, "p3d box/box depth");
+
+        // two boxes meeting edge to edge
+        quat ea = quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.25f);
+        quat eb = quat_from_axis_angle(v3(1, 0, 0), PIX_PI * 0.25f);
+        phys3d__make_core(phys3d_box(v3(1, 1, 1)), v3(0, 0, 0), ea, ca);
+        phys3d__make_core(phys3d_box(v3(1, 1, 1)), v3(0, 1.40f, 0), eb, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 1, "p3d crossed box edges give one point");
+        near_eq(m.normal.y, 1.0f, 1e-3f, "p3d edge/edge normal");
+        near_eq(m.points[0].separation, 1.40f - 2 * 0.70710678f, 1e-3f, "p3d edge/edge depth");
+
+        phys3d__make_core(phys3d_capsule(0.25f, 2.0f), v3(0, 1.24f, 0), quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.5f), ca);
+        phys3d__make_core(phys3d_box(v3(4, 2, 4)), v3(0, 0, 0), qi, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 2, "p3d capsule lying on a box has two points");
+        near_eq(m.points[0].separation, -0.01f, 1e-3f, "p3d capsule/box depth");
+        near_eq(m.normal.y, -1.0f, 1e-3f, "p3d capsule/box normal from capsule to box");
+
+        quat lie = quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.5f);
+        phys3d__make_core(phys3d_capsule(0.25f, 2.0f), v3(0, 0, 0), lie, ca);
+        phys3d__make_core(phys3d_capsule(0.25f, 2.0f), v3(0.5f, 0.45f, 0), lie, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 2, "p3d parallel capsules have two points");
+        near_eq(m.points[0].separation, -0.05f, 1e-3f, "p3d capsule/capsule depth");
+
+        phys3d__make_core(phys3d_sphere(0.2f), v3(0.8f, 0.1f, 0), qi, ca);
+        phys3d__make_core(phys3d_box(v3(2, 2, 2)), v3(0, 0, 0), qi, cb);
+        check(phys3d__collide(ca, cb, 0.005f, 0, m) == 1, "p3d sphere centre inside a box");
+        near_eq(m.normal.x, -1.0f, 1e-3f, "p3d deep sphere leaves through the nearest face");
+        near_eq(m.points[0].separation, -0.4f, 1e-3f, "p3d deep sphere depth");
+
+        phys3d__core tri;
+        phys3d__triangle_core(v3(-5, 0, -5), v3(-5, 0, 5), v3(5, 0, -5), tri);
+        check(tri.axis[0].y > 0.99f, "p3d triangle normal faces up (counter-clockwise from above)");
+        phys3d__make_core(phys3d_box(v3(1, 1, 1)), v3(-1, 0.49f, -1), qi, ca);
+        check(phys3d__collide(ca, tri, 0.005f, 0, m) == 4, "p3d box on a triangle has four points");
+        near_eq(m.normal.y, -1.0f, 1e-3f, "p3d box/triangle normal");
+        phys3d__make_core(phys3d_sphere(0.5f), v3(-1, 0.45f, -1), qi, ca);
+        check(phys3d__collide(ca, tri, 0.005f, 0, m) == 1, "p3d sphere on a triangle");
+        near_eq(m.points[0].separation, -0.05f, 1e-3f, "p3d sphere/triangle depth");
+
+        vec3 gp, gq;
+        phys3d__make_core(phys3d_box(v3(2, 2, 2)), v3(0, 0, 0), quat_from_axis_angle(v3(0, 1, 0), 0.3f), ca);
+        phys3d__make_core(phys3d_sphere(0.1f), v3(0, 4, 0), qi, cb);
+        near_eq(phys3d__gjk(ca, cb, &gp, &gq), 3.0f, 1e-3f, "p3d gjk box to point distance");
+        phys3d__make_core(phys3d_capsule(0.3f, 2.0f), v3(3, 0, 0), qi, cb);
+        // the segment at (3, 0) seen from the box's frame sits at (3 cos 0.3, 3 sin 0.3): in front of the +x face
+        near_eq(phys3d__gjk(ca, cb, &gp, &gq), 3.0f * cosf(0.3f) - 1.0f, 2e-3f, "p3d gjk rotated box to segment distance");
+
+        // ---- simulation ----
+        phys3d_world w;
+        phys3d_create_world(w);
+        w.allow_sleep = false;
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+
+        // a stack of six boxes stands and settles
+        idx stack[6];
+        for (int i = 0; i < 6; i++) stack[i] = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 0.5f + i * 1.01f, 0));
+        for (int i = 0; i < 360; i++) phys3d_step(w, dt);
+        phys3d_body* top = phys3d_get_body(w, stack[5]);
+        printf("info  3d stack top at %.4f %.4f %.4f\n", top->position.x, top->position.y, top->position.z);
+        near_eq(top->position.x, 0.0f, 0.02f, "p3d stack of 6 stays upright (x)");
+        near_eq(top->position.z, 0.0f, 0.02f, "p3d stack of 6 stays upright (z)");
+        near_eq(top->position.y, 5.5f, 0.06f, "p3d stack rests at its height");
+        check(v3len(top->velocity) < 0.02f && v3len(top->angular_velocity) < 0.05f, "p3d stack is at rest");
+        check(phys3d_get_body(w, stack[0])->on_ground, "p3d bottom box is grounded");
+
+        // a pyramid (each box on two) holds its shape
+        idx apex = PIX_INVALID;
+        for (int row = 0; row < 5; row++)
+            for (int i = 0; i < 5 - row; i++)
+                apex = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(10 + (i - (4 - row) * 0.5f) * 1.05f, 0.5f + row * 1.0f, 0));
+        for (int i = 0; i < 360; i++) phys3d_step(w, dt);
+        phys3d_body* ap = phys3d_get_body(w, apex);
+        near_eq(ap->position.x, 10.0f, 0.05f, "p3d pyramid apex stays centred");
+        near_eq(ap->position.y, 4.5f, 0.08f, "p3d pyramid keeps its height");
+
+        // a ball rolls down a ramp: rolling, not sliding, so v ~ w * r
+        phys3d_body ramp = phys3d_make_body(PHYS3D_STATIC, phys3d_box(v3(10, 0.4f, 4)), v3(-20, 2, 0));
+        ramp.rotation = quat_from_axis_angle(v3(0, 0, 1), -0.3f);    // falls toward +x
+        phys3d_add_body(w, ramp);
+        idx ball = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.5f), v3(-23, 3.6f, 0));
+        for (int i = 0; i < 60; i++) phys3d_step(w, dt);
+        phys3d_body* bb = phys3d_get_body(w, ball);
+        float roll = v3len(bb->angular_velocity) * 0.5f, speed = v3len(bb->velocity);
+        printf("info  3d rolling ball: speed %.3f, spin * r %.3f\n", speed, roll);
+        check(speed > 1.0f && fabsf(roll - speed) < 0.1f * speed, "p3d ball rolls without slipping down a ramp");
+        check(bb->velocity.x > 0.5f, "p3d ball rolls downhill");
+
+        // restitution and tunnelling
+        phys3d_body bouncy = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(30, 5, 0));
+        bouncy.restitution = 0.8f;
+        idx bid = phys3d_add_body(w, bouncy);
+        float peak = 0; bool landed = false;
+        for (int i = 0; i < 150; i++) {
+            phys3d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++)
+                landed |= w.events[e].type == PHYS3D_CONTACT_BEGIN && (w.events[e].a == bid || w.events[e].b == bid) && w.events[e].speed > 5.0f;
+            phys3d_body* b = phys3d_get_body(w, bid);
+            if (landed && b->velocity.y < 0) peak = maxf(peak, b->position.y);
+        }
+        check(landed, "p3d contact begin reports the impact speed");
+        check(peak > 2.5f, "p3d restitution bounces back up");
+
+        phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(0.05f, 4, 4)), v3(45, 2, 0));
+        phys3d_body bullet = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.05f), v3(40, 2, 0));
+        bullet.velocity = v3(300, 0, 0);
+        bullet.gravity_scale = 0;
+        idx bul = phys3d_add_body(w, bullet);
+        for (int i = 0; i < 30; i++) phys3d_step(w, dt);
+        check(phys3d_get_body(w, bul)->position.x < 45, "p3d speculative contacts stop a 300 m/s bullet at a thin wall");
+        phys3d_remove_body(w, bul);
+
+        // friction on a slope: grippy stays, icy slides
+        phys3d_body slope = phys3d_make_body(PHYS3D_STATIC, phys3d_box(v3(20, 0.4f, 4)), v3(60, 2, 0));
+        slope.rotation = quat_from_axis_angle(v3(0, 0, 1), -0.35f);
+        phys3d_add_body(w, slope);
+        phys3d_body grip = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(0.6f, 0.6f, 0.6f)), v3(60, 0, -1));
+        grip.rotation = slope.rotation;
+        grip.position = v3(60, 2, -1) + quat_rotate(slope.rotation, v3(0, 0.5f, 0));
+        grip.friction = 1.0f;
+        idx gid = phys3d_add_body(w, grip);
+        grip.friction = 0.0f; grip.position.z = 1;
+        idx iid = phys3d_add_body(w, grip);
+        vec3 g0 = phys3d_get_body(w, gid)->position, i0 = phys3d_get_body(w, iid)->position;
+        for (int i = 0; i < 90; i++) phys3d_step(w, dt);
+        check(v3dist(phys3d_get_body(w, gid)->position, g0) < 0.05f, "p3d high friction holds a box on a slope");
+        check(v3dist(phys3d_get_body(w, iid)->position, i0) > 1.0f, "p3d zero friction lets it slide");
+        phys3d_destroy_world(w);
+
+        // ---- meshes ----
+        phys3d_create_world(w);
+        w.allow_sleep = false;
+        float heights[11 * 11] = {};
+        phys3d_mesh floor_mesh;
+        check(phys3d_create_heightfield(floor_mesh, heights, 11, 11, 1.0f), "p3d heightfield builds");
+        check(floor_mesh.triangle_count == 200, "p3d heightfield triangle count");
+        idx ground = phys3d_add(w, PHYS3D_STATIC, phys3d_mesh_shape(floor_mesh), v3(0, 0, 0));
+        idx mbox = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(3.3f, 2, 3.7f));
+        phys3d_body rolling = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(1, 0.3f, 5.5f));
+        rolling.velocity = v3(4, 0, 0);
+        idx rid = phys3d_add_body(w, rolling);
+        float lowest = 1e9f, highest = -1e9f;
+        for (int i = 0; i < 120; i++) {
+            phys3d_step(w, dt);
+            if (i > 10 && phys3d_get_body(w, rid)->position.x < 9.5f) {
+                lowest = minf(lowest, phys3d_get_body(w, rid)->position.y);
+                highest = maxf(highest, phys3d_get_body(w, rid)->position.y);
+            }
+        }
+        near_eq(phys3d_get_body(w, mbox)->position.y, 0.5f, 0.02f, "p3d box rests on a mesh");
+        check(highest - lowest < 0.02f, "p3d ball rolls across mesh triangles without bumping");
+        phys3d_ray_hit hit;
+        check(phys3d_raycast(w, v3(7.2f, 5, 2.3f), v3(0, -1, 0), 10, &hit) && hit.body == ground, "p3d raycast hits the mesh");
+        near_eq(hit.point.y, 0.0f, 1e-4f, "p3d mesh hit point");
+        near_eq(hit.normal.y, 1.0f, 1e-4f, "p3d mesh hit normal");
+        check(!phys3d_raycast(w, v3(7.2f, -5, 2.3f), v3(0, 1, 0), 10, &hit), "p3d one-sided mesh: rays from below pass");
+        phys3d_destroy_world(w);
+        phys3d_destroy_mesh(floor_mesh);
+
+        // ---- triggers, layers, queries ----
+        phys3d_create_world(w);
+        w.allow_sleep = false;
+        idx floor_id = phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        phys3d_body zone = phys3d_make_body(PHYS3D_STATIC, phys3d_box(v3(2, 2, 2)), v3(5, 1, 0));
+        zone.trigger = true;
+        idx zid = phys3d_add_body(w, zone);
+        phys3d_body walker = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_capsule(0.3f, 1.8f), v3(0, 0.9f, 0));
+        walker.fixed_rotation = true;
+        walker.friction = 0;
+        idx wid = phys3d_add_body(w, walker);
+        int enters = 0, exits = 0;
+        for (int i = 0; i < 180; i++) {
+            phys3d_get_body(w, wid)->velocity.x = 4;
+            phys3d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++) {
+                if (w.events[e].type == PHYS3D_TRIGGER_ENTER && w.events[e].a == zid && w.events[e].b == wid) enters++;
+                if (w.events[e].type == PHYS3D_TRIGGER_EXIT && w.events[e].a == zid && w.events[e].b == wid) exits++;
+            }
+        }
+        check(enters == 1 && exits == 1, "p3d trigger enter and exit fire once each");
+        check(phys3d_get_body(w, wid)->position.x > 10, "p3d trigger does not block");
+        check(phys3d_get_body(w, wid)->on_ground, "p3d capsule walker is grounded");
+        check(v3len(phys3d_get_body(w, wid)->angular_velocity) == 0.0f, "p3d fixed rotation never spins");
+
+        phys3d_body ghost = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(-5, 1, 0));
+        ghost.mask = PHYS_LAYER_ALL & ~PHYS_LAYER_0;
+        idx ghost_id = phys3d_add_body(w, ghost);
+        for (int i = 0; i < 60; i++) phys3d_step(w, dt);
+        check(phys3d_get_body(w, ghost_id)->position.y < -1, "p3d layer mask lets a ghost fall through");
+
+        idx crate = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(-10, 0.5f, 0));
+        for (int i = 0; i < 30; i++) phys3d_step(w, dt);
+        check(phys3d_raycast(w, v3(-10, 5, 0), v3(0, -1, 0), 10, &hit) && hit.body == crate, "p3d raycast hits the crate");
+        near_eq(hit.point.y, 1.0f, 0.01f, "p3d raycast point on the crate top");
+        near_eq(hit.normal.y, 1.0f, 1e-3f, "p3d raycast normal faces the ray");
+        check(phys3d_raycast(w, v3(-10, 5, 0), v3(0, -1, 0), 10, &hit, PHYS_LAYER_ALL, crate) && hit.body == floor_id,
+              "p3d raycast ignore skips the crate");
+        check(phys3d_raycast(w, v3(-30, 0.5f, 0.2f), v3(1, 0, 0), 100, &hit) && hit.body == crate, "p3d long raycast walks the grid");
+        near_eq(hit.point.x, -10.5f, 0.01f, "p3d long raycast hits the near face");
+        check(phys3d_shape_cast(w, phys3d_sphere(0.5f), v3(-10, 5, 0), qi, v3(0, -1, 0), 10, &hit) && hit.body == crate,
+              "p3d sphere cast hits the crate");
+        near_eq(hit.distance, 3.5f, 0.01f, "p3d sphere cast distance to touch");
+        check(phys3d_shape_cast(w, phys3d_box(v3(1, 1, 1)), v3(-20, 5, 0), qi, v3(0, -1, 0), 10, &hit) && hit.body == floor_id,
+              "p3d box cast hits the floor");
+        near_eq(hit.distance, 4.5f, 0.01f, "p3d box cast distance");
+        idx found[16];
+        size_t n = phys3d_overlap_sphere(w, v3(-10, 0.5f, 0), 1.0f, found, 16);
+        check(n == 2, "p3d overlap sphere finds the crate and the floor");
+        check(phys3d_overlap_sphere(w, v3(5, 1, 0), 0.5f, found, 16) == 1 && found[0] == zid, "p3d overlap finds the trigger");
+
+        phys3d_remove_body(w, crate);
+        phys3d_step(w, dt);
+        bool ended = false;
+        for (size_t e = 0; e < w.event_count; e++) ended |= w.events[e].type == PHYS3D_CONTACT_END && (w.events[e].a == crate || w.events[e].b == crate);
+        check(ended, "p3d removing a body ends its contacts");
+        phys3d_destroy_world(w);
+
+        // ---- joints ----
+        phys3d_create_world(w);
+        w.allow_sleep = false;
+        // pendulum on a ball joint
+        idx bob = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.2f), v3(2, 10, 0));
+        phys3d_add_ball(w, PIX_INVALID, bob, v3(0, 10, 0));
+        float worst = 0;
+        for (int i = 0; i < 240; i++) { phys3d_step(w, dt); worst = maxf(worst, fabsf(v3dist(phys3d_get_body(w, bob)->position, v3(0, 10, 0)) - 2.0f)); }
+        check(worst < 0.01f, "p3d ball joint pendulum keeps its length");
+
+        // hinge door: stays on its axis, the limit stops it, a motor drives it
+        idx door = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 2, 0.1f)), v3(10.5f, 1.1f, 0));
+        idx hinge = phys3d_add_hinge(w, PIX_INVALID, door, v3(10, 1.1f, 0), v3(0, 1, 0));
+        phys3d_joint* hj = phys3d_get_joint(w, hinge);
+        hj->enable_motor = true; hj->motor_speed = 1.0f; hj->max_motor_force = 1000;
+        hj->enable_limit = true; hj->lower = -0.5f; hj->upper = 1.2f;
+        for (int i = 0; i < 30; i++) phys3d_step(w, dt);
+        near_eq(phys3d_get_body(w, door)->angular_velocity.y, 1.0f, 0.02f, "p3d hinge motor speed");
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        near_eq(phys3d_hinge_angle(w, *hj), 1.2f, 0.02f, "p3d hinge limit stops the door");
+        phys3d_body* db = phys3d_get_body(w, door);
+        vec3 da, dbp;
+        phys3d_joint_anchors(w, *hj, &da, &dbp);
+        check(v3dist(da, dbp) < 0.005f, "p3d hinge keeps its pivot");
+        vec3 door_up = quat_rotate(db->rotation, v3(0, 1, 0));
+        check(door_up.y > 0.999f, "p3d hinge keeps the door upright (axis held)");
+
+        // a chain of ball joints hangs straight
+        idx prev = PIX_INVALID;
+        vec3 top_p = v3(20, 10, 0);
+        idx links[8];
+        for (int i = 0; i < 8; i++) {
+            phys3d_body l = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_capsule(0.05f, 0.5f), top_p + v3(0.5f * i + 0.25f, 0, 0));
+            l.rotation = quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.5f);
+            l.linear_damping = 0.5f;
+            links[i] = phys3d_add_body(w, l);
+            phys3d_add_ball(w, prev, links[i], top_p + v3(0.5f * i, 0, 0));
+            prev = links[i];
+        }
+        float chain = 0;
+        for (int i = 0; i < 600; i++) {
+            phys3d_step(w, dt);
+            for (int k = 1; k < 8; k++) {
+                const phys3d_joint& j = w.joints[k + 2];
+                vec3 a, b2; phys3d_joint_anchors(w, j, &a, &b2);
+                chain = maxf(chain, v3dist(a, b2));
+            }
+        }
+        printf("info  3d chain worst joint gap %.4f\n", chain);
+        check(chain < 0.02f, "p3d ball chain holds together");
+        check(phys3d_get_body(w, links[7])->position.y < 6.5f, "p3d chain hangs down");
+
+        // swing cone: a rod on a ball joint may not swing past 30 degrees
+        idx rod = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_capsule(0.05f, 1.0f), v3(30, 9.5f, 0));
+        idx cone = phys3d_add_ball(w, PIX_INVALID, rod, v3(30, 10, 0), v3(0, -1, 0));
+        phys3d_get_joint(w, cone)->swing_limit = PIX_PI / 6.0f;
+        phys3d_get_body(w, rod)->velocity = v3(5, 0, 0);
+        float max_swing = 0;
+        for (int i = 0; i < 120; i++) {
+            phys3d_step(w, dt);
+            vec3 down = quat_rotate(phys3d_get_body(w, rod)->rotation, v3(0, -1, 0));
+            max_swing = maxf(max_swing, acosf(clampf(-down.y, -1, 1)));
+        }
+        check(max_swing < PIX_PI / 6.0f + 0.05f, "p3d swing cone limits the rod");
+
+        // slider: a block on a vertical rail drops to its lower stop without turning
+        idx car = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(0.5f, 0.5f, 0.5f)), v3(40, 10, 0));
+        idx rail = phys3d_add_slider(w, PIX_INVALID, car, v3(40, 10, 0), v3(0, 1, 0));
+        phys3d_joint* sj = phys3d_get_joint(w, rail);
+        sj->enable_limit = true; sj->lower = -2.0f; sj->upper = 1.0f;
+        phys3d_get_body(w, car)->angular_velocity = v3(3, 2, 1);
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        phys3d_body* cb2 = phys3d_get_body(w, car);
+        near_eq(cb2->position.y, 8.0f, 0.02f, "p3d slider limit holds the block");
+        check(fabsf(cb2->position.x - 40) < 0.005f && fabsf(cb2->position.z) < 0.005f, "p3d slider keeps the block on its axis");
+        check(fabsf(cb2->rotation.w) > 0.9999f, "p3d slider stops rotation");
+
+        // fixed: a cantilever glued to the world barely sags
+        idx beam = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(2, 0.2f, 0.2f)), v3(51, 10, 0));
+        phys3d_add_fixed(w, PIX_INVALID, beam, v3(50, 10, 0));
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        check(fabsf(phys3d_get_body(w, beam)->position.y - 10) < 0.02f, "p3d fixed joint holds a cantilever");
+
+        // rope: slack inside its length, taut at it
+        idx load = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.2f), v3(60, 9.5f, 0));
+        idx rope = phys3d_add_distance(w, PIX_INVALID, load, v3(60, 10, 0), v3(60, 9.5f, 0));
+        phys3d_joint* rj = phys3d_get_joint(w, rope);
+        rj->enable_spring = true; rj->hertz = 0; rj->enable_limit = true; rj->lower = 0; rj->upper = 3;
+        for (int i = 0; i < 15; i++) phys3d_step(w, dt);
+        check(phys3d_get_body(w, load)->velocity.y < -1.0f, "p3d rope is slack inside its length");
+        for (int i = 0; i < 300; i++) phys3d_step(w, dt);
+        near_eq(phys3d_get_body(w, load)->position.y, 7.0f, 0.03f, "p3d rope holds at its length");
+
+        // mouse joint drags a body to the target
+        idx toy = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(0.5f, 0.5f, 0.5f)), v3(70, 10, 0));
+        idx grab = phys3d_add_mouse(w, toy, v3(70, 10, 0));
+        phys3d_get_joint(w, grab)->target = v3(71, 11, 1);
+        for (int i = 0; i < 180; i++) phys3d_step(w, dt);
+        check(v3dist(phys3d_get_body(w, toy)->position, v3(71, 11, 1)) < 0.05f, "p3d mouse joint drags to the target");
+
+        // a weak joint snaps
+        idx heavy = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(80, 9, 0));
+        idx weak = phys3d_add_ball(w, PIX_INVALID, heavy, v3(80, 10, 0));
+        phys3d_get_joint(w, weak)->break_force = 1000;
+        bool snapped = false;
+        for (int i = 0; i < 30; i++) {
+            phys3d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++) snapped |= w.events[e].type == PHYS3D_JOINT_BREAK && w.events[e].joint == weak;
+        }
+        check(snapped && !phys3d_get_joint(w, weak), "p3d break_force snaps the joint");
+        phys3d_destroy_world(w);
+
+        // ---- sleeping ----
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        idx s0 = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 0.5f, 0));
+        idx s1 = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 1.5f, 0));
+        bool ended_asleep = false;
+        for (int i = 0; i < 120; i++) {
+            phys3d_step(w, dt);
+            for (size_t e = 0; e < w.event_count; e++) ended_asleep |= w.events[e].type == PHYS3D_CONTACT_END;
+        }
+        check(phys3d_get_body(w, s0)->sleeping && phys3d_get_body(w, s1)->sleeping, "p3d resting stack falls asleep");
+        check(!ended_asleep, "p3d sleeping keeps its contacts");
+        vec3 rest = phys3d_get_body(w, s1)->position;
+        for (int i = 0; i < 60; i++) phys3d_step(w, dt);
+        check(v3dist(phys3d_get_body(w, s1)->position, rest) == 0.0f, "p3d sleeping body does not drift");
+        phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(0.2f, 5, 0));
+        bool woke = false;
+        for (int i = 0; i < 90 && !woke; i++) { phys3d_step(w, dt); woke = !phys3d_get_body(w, s0)->sleeping; }
+        check(woke, "p3d a ball landing on a sleeping stack wakes the island");
+
+        // a tall stack settles completely: this is what one solver sweep per
+        // manifold failed (it rocked corner to corner and crept sideways)
+        idx tall[12];
+        for (int i = 0; i < 12; i++) tall[i] = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(20, 0.5f + i * 1.0f, 0));
+        for (int i = 0; i < 600; i++) phys3d_step(w, dt);
+        phys3d_body* tt = phys3d_get_body(w, tall[11]);
+        check(tt->sleeping, "p3d a 12-box stack settles and sleeps");
+        check(fabsf(tt->position.x - 20) < 0.02f && fabsf(tt->position.z) < 0.02f, "p3d the 12-box stack stays straight");
+        phys3d_destroy_world(w);
     }
 
     if (failures == 0) printf("all checks passed\n");

@@ -18,8 +18,9 @@
 //   core/opengl_utils.hpp   shaders, textures
 //   core/jobs.hpp           thread pool: parallel_for and a side task
 //   core/profile.hpp        CPU section profiler
-//   core/colliders.hpp      2D/3D shape tests and contacts
-//   core/physics.hpp        character-scale physics world with broadphase
+//   core/physics.hpp        all of physics: colliders.hpp (shape tests), physics_common.hpp
+//                           (layers), physics2d.hpp, physics3d.hpp, physics3d_flat.hpp
+//   core/physics_debug.hpp  debug drawing for the physics worlds (the renderer bridge)
 //   loader/*                PNG, OBJ, glTF, WAV decoders, JSON reader, asset tables
 //   core/texture.hpp        textures from files
 //   core/font.hpp           TrueType -> SDF atlas
@@ -49,8 +50,6 @@
 #include "core/opengl_utils.hpp"
 #include "core/jobs.hpp"
 #include "core/profile.hpp"
-#include "core/colliders.hpp"
-#include "core/physics.hpp"
 #include "loader/asset_types.hpp"
 #include "loader/png_loader.hpp"
 #include "loader/png_writer.hpp"
@@ -73,6 +72,8 @@
 #include "core/draw2d.hpp"
 #include "core/atlas.hpp"
 #include "core/tilemap.hpp"
+#include "core/physics.hpp"
+#include "core/physics_debug.hpp"
 #include "core/platform_audio.hpp"
 #include "core/sound.hpp"
 #include "core/app.hpp"
