@@ -413,6 +413,9 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
 
     obb2    self_box    = { v2xz(b.position), b.half, b.yaw };
     circle2 self_circle = { v2xz(b.position), b.radius };
+    // the body's square in XZ: a static whose bounds miss it cannot touch it
+    // (a rotated prop sits inside its bounds), so no shape test is needed
+    float sx0 = b.position.x - r, sx1 = b.position.x + r, sz0 = b.position.z - r, sz1 = b.position.z + r;
 
     for (int cz = cz0; cz <= cz1; cz++) {
         if (cz < 0 || cz >= w.grid_h) continue;
@@ -421,6 +424,7 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
             size_t cell = (size_t)cz * w.grid_w + cx;
             for (uint32_t k = w.cell_start[cell]; k < w.cell_start[cell + 1]; k++) {
                 const aabb& s = w.statics[w.cell_items[k]];
+                if (s.max.x < sx0 || s.min.x > sx1 || s.max.z < sz0 || s.min.z > sz1) continue;
 
                 // ledges, steps and doorsteps: low enough to walk straight over
                 if (aabb_height(s) <= w.step_height) continue;
@@ -490,10 +494,12 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
 
 // ---- dynamic broadphase ----
 
-static uint32_t phys3d_flat__dyn_bucket(float x, float z) {
-    int cx = (int)floorf(x / PHYS3D_FLAT_CELL);
-    int cz = (int)floorf(z / PHYS3D_FLAT_CELL);
+static inline int phys3d_flat__dyn_cell(float x) { return (int)floorf(x / PHYS3D_FLAT_CELL); }
+static inline uint32_t phys3d_flat__cell_bucket(int cx, int cz) {
     return (uint32_t)((cx * 73856093) ^ (cz * 19349663)) & (PHYS3D_FLAT_DYN_BUCKETS - 1);
+}
+static uint32_t phys3d_flat__dyn_bucket(float x, float z) {
+    return phys3d_flat__cell_bucket(phys3d_flat__dyn_cell(x), phys3d_flat__dyn_cell(z));
 }
 
 static void phys3d_flat__build_dynamic_grid(phys3d_flat_world& w) {
@@ -516,6 +522,12 @@ static void phys3d_flat__build_dynamic_grid(phys3d_flat_world& w) {
 
 static void phys3d_flat__resolve_pair(phys3d_flat_body& a, phys3d_flat_body& b) {
     if (a.inv_mass == 0.0f && b.inv_mass == 0.0f) return;
+    // most pairs from the nine cells around a body are metres apart: their
+    // bounding circles settle it before any shape is built
+    float dx = b.position.x - a.position.x, dz = b.position.z - a.position.z;
+    float reach = (a.shape == PHYS3D_FLAT_BOX ? phys3d_flat__body_radius(a) : a.radius)
+                + (b.shape == PHYS3D_FLAT_BOX ? phys3d_flat__body_radius(b) : b.radius);
+    if (dx * dx + dz * dz > reach * reach) return;
     if (!phys3d_flat__layers_interact(a, b)) return;
 
     // vertical reject first - it is the cheapest test there is, and in a world
@@ -593,10 +605,10 @@ static void phys3d_flat__resolve_dynamics(phys3d_flat_world& w) {
         phys3d_flat_body& a = w.bodies[i];
         if (!a.active || a.inv_mass == 0.0f) continue;
 
+        int cx = phys3d_flat__dyn_cell(a.position.x), cz = phys3d_flat__dyn_cell(a.position.z);
         for (int oz = -1; oz <= 1; oz++)
             for (int ox = -1; ox <= 1; ox++) {
-                uint32_t bucket = phys3d_flat__dyn_bucket(a.position.x + ox * PHYS3D_FLAT_CELL,
-                                                   a.position.z + oz * PHYS3D_FLAT_CELL);
+                uint32_t bucket = phys3d_flat__cell_bucket(cx + ox, cz + oz);
                 for (uint32_t k = w.dyn_start[bucket]; k < w.dyn_start[bucket + 1]; k++) {
                     uint32_t j = w.dyn_items[k];
                     if (j <= i) continue;
@@ -763,10 +775,10 @@ size_t phys3d_flat_query_neighbours(const phys3d_flat_world& w, vec3 centre, flo
     float r2 = radius * radius;
     // shortcut: neighbouring cells can hash to the same bucket, so a body may
     // be counted twice in a tiny world; harmless for steering, which is the use
+    int cx = phys3d_flat__dyn_cell(centre.x), cz = phys3d_flat__dyn_cell(centre.z);
     for (int oz = -reach; oz <= reach; oz++)
         for (int ox = -reach; ox <= reach; ox++) {
-            uint32_t bucket = phys3d_flat__dyn_bucket(centre.x + ox * PHYS3D_FLAT_CELL,
-                                               centre.z + oz * PHYS3D_FLAT_CELL);
+            uint32_t bucket = phys3d_flat__cell_bucket(cx + ox, cz + oz);
             for (uint32_t k = w.dyn_start[bucket]; k < w.dyn_start[bucket + 1]; k++) {
                 uint32_t i = w.dyn_items[k];
                 const phys3d_flat_body& b = w.bodies[i];

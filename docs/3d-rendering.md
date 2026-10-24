@@ -478,9 +478,10 @@ pix_draw_model(enemy, m, hit ? PIX_RED : PIX_WHITE);
 pix_set_quality(PIX_QUALITY_HIGH);      // LOW, MEDIUM, HIGH (the default), ULTRA
 ```
 
-A preset sets shadow sharpness and size, bloom, anti-aliasing and the
-reflection probe. Offer it as a graphics setting in your menu, and use `LOW`
-on weak laptops.
+A preset sets shadow sharpness and size, bloom, anti-aliasing, the
+reflection probe and how small an object may get before it is skipped
+(`r.cull_pixels`, see [Performance](#performance)). Offer it as a graphics
+setting in your menu, and use `LOW` on weak laptops.
 
 | | `LOW` | `MEDIUM` | `HIGH` | `ULTRA` |
 |---|---|---|---|---|
@@ -489,6 +490,7 @@ on weak laptops.
 | bloom | off | on | on | on |
 | temporal anti-aliasing | off | on | on | on |
 | reflection probe | off | off | 128 px | 256 px |
+| objects skipped below | 1.5 px | 1 px | 0.5 px | 0.25 px |
 
 ### Anti-aliasing
 
@@ -664,7 +666,12 @@ pix is built so that ordinary scenes are fast without any effort on your part:
 - **Draw the same mesh many times freely.** All instances of a mesh with the
   same material go to the GPU in one call. A city of 2,600 objects draws in
   about 40 calls.
-- **Objects outside the view are skipped** automatically.
+- **Objects outside the view are skipped** automatically, and so are objects
+  too small to see: smaller than `r.cull_pixels` pixels across on screen
+  (0.5 by default), or than that many shadow texels in a shadow cascade.
+  Raising it to 1 or 2 drops far more of a large scene's distant clutter;
+  the cost is that a field of thousands of far-off specks, which together
+  do colour the horizon, thins out. 0 draws everything.
 - **Fewer distinct materials help.** Use one material with different tints
   rather than many nearly identical materials.
 - Measure: after `pix_end_3d()`, `r.frame_draws`, `r.frame_instances` and

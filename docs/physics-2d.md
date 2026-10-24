@@ -399,7 +399,7 @@ camera, so call it between `pix_begin_2d` and `pix_end_2d` if you use one.
 | `PHYS2D_DRAW_JOINTS` | each joint's anchors, in purple, joined to the bodies' centres |
 | `PHYS2D_DRAW_CONTACTS` | red dots where bodies touch, with the contact normal. Faint yellow dots are near misses the solver is watching |
 | `PHYS2D_DRAW_AABBS` | the bounding boxes the broadphase uses (stretched along the motion of moving bodies) |
-| `PHYS2D_DRAW_GRID` | the broadphase grid cells that hold moving bodies |
+| `PHYS2D_DRAW_GRID` | the broadphase grid cells that hold moving and sleeping bodies |
 
 The default is shapes, contacts and joints. When using the batch directly, call
 `phys2d_debug_draw(batch, world, flags, thickness)`.
@@ -437,10 +437,15 @@ It's the design Box2D uses, so Box2D's documentation and Erin Catto's
 talks apply directly:
 
 - **Broadphase:** a hashed uniform grid. Static bodies live in their own grid,
-  which is rebuilt only when a static body is added, removed or moved. Moving
-  bodies are rebuilt every step. A pair of bodies that shares several cells is
-  tested only by the cell holding the corner of their overlap, so no pair is
-  tested twice.
+  which is rebuilt only when a static body is added, removed or moved;
+  sleeping bodies in another, rebuilt only when one falls asleep or wakes.
+  Moving bodies are rebuilt every step, and only they look for pairs: among
+  themselves, then each in the static and sleeping grids. A pair where
+  neither body moved keeps last step's contact as it was, so a settled pile
+  costs a copy rather than a search, and a static or sleeping body that
+  hasn't moved keeps its world shape from before. A pair of bodies that
+  shares several cells is tested only by the cell holding the corner of
+  their overlap, so no pair is tested twice.
 - **Narrowphase:** every shape is a core (a point, a segment or a box) plus
   a radius. One routine handles every pair of shapes: SAT when the cores
   overlap, closest points when they don't, and clipping against a

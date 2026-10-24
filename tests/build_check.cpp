@@ -2027,6 +2027,110 @@ int main() {
         check(!hdr_load_memory(file, n + sizeof(line), &w, &h), "hdr rejects a run past the line");
     }
 
+    // ---- shortcuts: inertia fast paths, cached bounds, the sleeping grid, idle pairs ----
+    {
+        // the diagonal and isotropic fast paths agree with R * M * R^T
+        phys3d_body tb = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(0.5f, 2.0f, 1.0f)), v3(0, 0, 0));
+        phys3d__compute_mass(tb);
+        tb.rotation = quat_norm(quat{ 0.3f, -0.5f, 0.2f, 0.8f });
+        phys3d__update_inertia(tb);
+        mat3 rq = mat3_from_quat(tb.rotation);
+        mat3 want = rq * tb.inv_inertia_local * mat3_transpose(rq);
+        float worst = 0.0f;
+        for (int i = 0; i < 9; i++) worst = maxf(worst, fabsf(tb.inv_inertia.data[i] - want.data[i]) / fabsf(want.data[0]));
+        check(worst < 1e-5f, "p3d box inertia fast path matches R M R^T");
+        check(tb.inv_inertia.data[1] == tb.inv_inertia.data[3] && tb.inv_inertia.data[2] == tb.inv_inertia.data[6],
+              "p3d world inertia stays exactly symmetric");
+        phys3d_body sb = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.5f), v3(0, 0, 0));
+        phys3d__compute_mass(sb);
+        sb.rotation = tb.rotation;
+        phys3d__update_inertia(sb);
+        check(!memcmp(&sb.inv_inertia, &sb.inv_inertia_local, sizeof(mat3)), "p3d a sphere's inertia is the same turned");
+
+        phys3d_world w;
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        idx wall = phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(1, 1, 1)), v3(10, 0.5f, 0));
+        idx crate = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 0.5f, 0));
+        for (int i = 0; i < 120; i++) phys3d_step(w, 1.0f / 60.0f);
+        check(w.bodies[crate].sleeping, "p3d crate at rest falls asleep");
+        size_t resting = w.contact_count;
+        int ends = 0;
+        for (int i = 0; i < 60; i++) {
+            phys3d_step(w, 1.0f / 60.0f);
+            for (size_t e = 0; e < w.event_count; e++) ends += w.events[e].type == PHYS3D_CONTACT_END;
+        }
+        check(resting > 0 && w.contact_count == resting && ends == 0, "p3d a sleeping pair keeps its contacts, no end events");
+        check(w.active_count == 0 && w.awake_count == 0, "p3d nothing solved or integrated while all asleep");
+        phys3d_ray_hit hit;
+        check(phys3d_raycast(w, v3(0, 5, 0), v3(0, -1, 0), 10, &hit) && hit.body == crate, "p3d rays find sleeping bodies");
+
+        // a static edited in place, no API call: its bounds follow
+        w.bodies[wall].shape.half = v3(2, 2, 2);
+        phys3d_step(w, 1.0f / 60.0f);
+        near_eq(w.bodies[wall].bounds.max.y, 2.5f, 1e-4f, "p3d a static's new shape reaches its bounds");
+        w.bodies[wall].position = v3(12, 0.5f, 0);
+        phys3d_step(w, 1.0f / 60.0f);
+        near_eq(w.bodies[wall].bounds.min.x, 10.0f, 1e-4f, "p3d a static moved by hand moves its bounds");
+
+        // a ball dropped on the sleeper still hits it and wakes it
+        idx ball = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(0, 3, 0));
+        bool woke = false;
+        for (int i = 0; i < 90; i++) { phys3d_step(w, 1.0f / 60.0f); woke |= !w.bodies[crate].sleeping; }
+        check(woke && w.bodies[ball].position.y > 1.1f, "p3d a ball lands on a sleeping crate and wakes it");
+        phys3d_destroy_world(w);
+
+        phys2d_world w2;
+        phys2d_create_world(w2);
+        idx floor2 = phys2d_add(w2, PHYS2D_STATIC, phys2d_box(800, 40), v2(0, 100));
+        idx box2 = phys2d_add(w2, PHYS2D_DYNAMIC, phys2d_box(40, 40), v2(0, 60));
+        for (int i = 0; i < 120; i++) phys2d_step(w2, 1.0f / 60.0f);
+        check(w2.bodies[box2].sleeping, "p2d box at rest falls asleep");
+        size_t resting2 = w2.contact_count;
+        int ends2 = 0;
+        for (int i = 0; i < 60; i++) {
+            phys2d_step(w2, 1.0f / 60.0f);
+            for (size_t e = 0; e < w2.event_count; e++) ends2 += w2.events[e].type == PHYS2D_CONTACT_END;
+        }
+        check(resting2 == 1 && w2.contact_count == 1 && ends2 == 0, "p2d a sleeping pair keeps its contact, no end events");
+        check(w2.active_count == 0 && w2.awake_count == 0, "p2d nothing solved or integrated while all asleep");
+        idx found = PIX_INVALID;
+        phys2d_ray_hit hit2;
+        if (phys2d_raycast(w2, v2(0, 0), v2(0, 1), 200, &hit2)) found = hit2.body;
+        check(found == box2, "p2d rays find sleeping bodies");
+        w2.bodies[floor2].shape.half = v2(400, 40);
+        phys2d_step(w2, 1.0f / 60.0f);
+        near_eq(w2.bodies[floor2].bounds.min.y, 60.0f, 1e-3f, "p2d a static's new shape reaches its bounds");
+        phys2d_destroy_world(w2);
+    }
+
+    // ---- renderer: the radix sort (CPU only) ----
+    {
+        pix_renderer r;
+        memset(&r, 0, sizeof(r));
+        const size_t n = 3000;
+        r.sort_keys = pix_alloc<uint64_t>(n);  r.sort_keys_tmp = pix_alloc<uint64_t>(n);
+        r.sort_vals = pix_alloc<uint32_t>(n);  r.sort_vals_tmp = pix_alloc<uint32_t>(n);
+        uint32_t seed = 7;
+        for (size_t i = 0; i < n; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            // a material / mesh / depth key like the renderer's: most digits shared
+            r.sort_keys[i] = ((uint64_t)(seed % 5) << 48) | ((uint64_t)((seed >> 8) % 3) << 32) | ((seed >> 4) & 0xFFFF) << 16;
+            r.sort_vals[i] = (uint32_t)i;
+        }
+        uint64_t* keys = pix_alloc<uint64_t>(n);
+        memcpy(keys, r.sort_keys, n * sizeof(uint64_t));
+        const uint32_t* order = pix__radix_sort(r, n);
+        bool sorted = true, stable = true;
+        for (size_t i = 1; i < n; i++) {
+            sorted &= keys[order[i - 1]] <= keys[order[i]];
+            if (keys[order[i - 1]] == keys[order[i]]) stable &= order[i - 1] < order[i];
+        }
+        check(sorted && stable, "radix sort orders keys, stable among equals");
+        pix_free(keys);
+        pix_free(r.sort_keys); pix_free(r.sort_keys_tmp); pix_free(r.sort_vals); pix_free(r.sort_vals_tmp);
+    }
+
     if (failures == 0) printf("all checks passed\n");
     else               printf("%d check(s) failed\n", failures);
     return failures;

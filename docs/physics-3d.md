@@ -489,9 +489,16 @@ The 2D world's design, lifted to 3D. Each part names the method it uses, so
 the literature applies:
 
 - **Broadphase:** a hashed uniform grid, with statics in their own grid that's
-  rebuilt only when one changes. Bodies too big for the grid (planes, level
-  meshes) are kept in a short list tested against everything. A ray walks
-  the grid cells in order (Amanatides & Woo).
+  rebuilt only when one changes, and sleeping bodies in another that's rebuilt
+  only when one falls asleep or wakes. Only moving bodies look for pairs:
+  among themselves, then each in the static and sleeping grids. A pair where
+  neither body moved keeps last step's contacts as they were, copied
+  straight over, so a settled pile costs a copy rather than a search. A
+  static or sleeping body that hasn't moved or changed shape keeps its
+  bounds from before. Bodies too big for the grid (planes, level meshes)
+  are kept in a short list tested against everything - a plane only against
+  bodies whose bounds reach it. A ray walks the grid cells in order
+  (Amanatides & Woo).
 - **Narrowphase:** every shape is a convex core plus a radius: a point
   (sphere), a segment (capsule), a box, or a triangle. Rounded shapes use
   GJK for their closest points, plus a face clip that gives a capsule lying

@@ -1049,7 +1049,14 @@ static inline mat4 mat4_from_mat3(const mat3& m) {
         for (int row = 0; row < 3; row++) r.data[c * 4 + row] = m.data[c * 3 + row];
     return r;
 }
-static inline mat3 mat3_from_quat(quat q) { return mat3_from_mat4(mat4_from_quat(q)); }
+// built directly rather than through a mat4: the same entries as mat4_from_quat
+static inline mat3 mat3_from_quat(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat3 m = { { 1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y + z * w), 2.0f * (x * z - y * w),
+                 2.0f * (x * y - z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z + x * w),
+                 2.0f * (x * z + y * w), 2.0f * (y * z - x * w), 1.0f - 2.0f * (x * x + y * y) } };
+    return m;
+}
 static inline mat3 mat3_rotate(vec3 axis, float radians) { return mat3_from_quat(quat_from_axis_angle(axis, radians)); }
 // What transforms normals correctly through `model` even when it scales
 // unevenly (a squashed sphere): the inverse transpose of its 3x3 part.
@@ -1712,6 +1719,10 @@ typedef ptrdiff_t GLintptr;
 #define GL_COPY_READ_BUFFER     0x8F36
 #define GL_COPY_WRITE_BUFFER    0x8F37
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
+// glMapBufferRange access bits: streaming writes straight into a buffer
+#define GL_MAP_WRITE_BIT              0x0002
+#define GL_MAP_INVALIDATE_RANGE_BIT   0x0004
+#define GL_MAP_UNSYNCHRONIZED_BIT     0x0020
 #define GL_DRAW_INDIRECT_BUFFER  0x8F3F
 #define GL_DISPATCH_INDIRECT_BUFFER 0x90EE
 #define GL_COMPUTE_SHADER        0x91B9
@@ -1821,6 +1832,8 @@ typedef void  (APIENTRY* PFN_glVertexAttrib4f)(GLuint, GLfloat, GLfloat, GLfloat
 typedef void  (APIENTRY* PFN_glVertexAttribDivisor)(GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstanced)(GLenum, GLsizei, GLenum, const void*, GLsizei);
 typedef void  (APIENTRY* PFN_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
+typedef void* (APIENTRY* PFN_glMapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+typedef GLboolean (APIENTRY* PFN_glUnmapBuffer)(GLenum);
 typedef void  (APIENTRY* PFN_glBindBufferBase)(GLenum, GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstancedBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint);
 typedef void  (APIENTRY* PFN_glDrawElementsBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLint);
@@ -1893,7 +1906,7 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glGetShaderInfoLog) E(glCreateProgram) E(glAttachShader) E(glLinkProgram) \
     E(glGetProgramiv) E(glGetProgramInfoLog) E(glDeleteShader) E(glDeleteProgram) E(glUseProgram) \
     E(glGenVertexArrays) E(glBindVertexArray) E(glGenBuffers) E(glBindBuffer) \
-    E(glBufferData) E(glBufferSubData) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
+    E(glBufferData) E(glBufferSubData) E(glMapBufferRange) E(glUnmapBuffer) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
     E(glEnableVertexAttribArray) E(glDisableVertexAttribArray) E(glVertexAttrib4f) \
     E(glVertexAttribDivisor) E(glDrawElementsInstanced) E(glDrawElementsInstancedBaseVertex) \
     E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) E(glDrawArraysInstancedBaseInstance) \
@@ -6140,6 +6153,13 @@ struct pix_renderer {
     pix_mesh_lods* lod_chains;  size_t lod_chain_count;
     float lod_band;   // how far past a switch point (fraction of it) the two levels cross-fade; 0 = hard switch
     float lod_bias;   // multiplies screen sizes: > 1 keeps detail longer, < 1 drops it sooner
+    // Instances smaller on screen than this many pixels across (their bounding
+    // sphere) are not drawn, and casters smaller than this many shadow texels
+    // are left out of a cascade: specks the rasteriser would mostly miss
+    // anyway. 0.5 by default, which changes nothing you can see; 1 to 2 drops
+    // far more of a big scene's distant clutter, but thousands of specks
+    // together do tint a far field, which then thins out. 0 draws everything.
+    float cull_pixels;
     idx       shaders[MAX_SHADERS]; size_t shader_count;
     // Depth-only twins of surface shaders with their own vertex stage, so what
     // a vertex shader moves (wind, waves) casts a shadow that moves with it.
@@ -6252,7 +6272,10 @@ struct pix_renderer {
     GLuint skin_bones_ssbo, skin_inst_ssbo, skin_list_ssbo;
     size_t skin_bones_capacity, skin_list_capacity, skin_list_cursor;   // in elements
     mat4*  skin_bone_staging;  size_t skin_bone_staging_capacity;
-    uint32_t* skin_list_staging;      // PIX_MAX_ANIMATED
+    uint32_t* skin_list_staging;      // PIX_MAX_ANIMATED: the last culled, sorted skinned list
+    // That list's view: a view's prepass, colour and outline passes all ask
+    // for the same one, and reuse it rather than cull, sort and upload again.
+    struct { bool valid, culled; frustum fr; uint32_t layers; size_t base, count; int dropped; } skin_reuse;
     pix__program_uniforms uniform_cache[MAX_SHADERS * 2];
     int uniform_cache_count;
 
@@ -7551,11 +7574,14 @@ static inline bool collide_circle_rect(const circle2& c, const rect2& r, contact
 }
 
 static inline bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out) {
-    circle2 local = { obb__to_local(b, c.centre), c.radius };
+    // obb__to_local and obb__to_world_dir inlined, sharing one cos / sin
+    float cs = cosf(b.yaw), sn = sinf(b.yaw);
+    float dx = c.centre.x - b.centre.x, dz = c.centre.y - b.centre.y;
+    circle2 local = { v2(dx * cs - dz * sn, dx * sn + dz * cs), c.radius };
     rect2 lr = { v2(-b.half.x, -b.half.y), v2(b.half.x, b.half.y) };
     contact2 hit;
     if (!collide_circle_rect(local, lr, &hit)) return false;
-    out->normal = obb__to_world_dir(b, hit.normal);
+    out->normal = v2(hit.normal.x * cs + hit.normal.y * sn, -hit.normal.x * sn + hit.normal.y * cs);
     out->depth = hit.depth;
     return true;
 }
@@ -8518,12 +8544,15 @@ struct phys2d__poly {
     float radius;
 };
 
-struct phys2d__cell_item { int32_t cx, cy; idx body; };
+// the body's bounds ride along, so pair tests stream through the grid instead
+// of reaching into the body structs at random
+struct phys2d__cell_item { int32_t cx, cy; idx body; rect2 bounds; };
 struct phys2d__grid {
     uint32_t*          start;     // PHYS2D_GRID_BUCKETS + 1 prefix offsets
     phys2d__cell_item* items;
     size_t             count, capacity;
 };
+struct phys2d__poly_key;
 
 struct phys2d_world {
     // ---- settings, edit freely ----
@@ -8567,13 +8596,22 @@ struct phys2d_world {
     float*    island_sleep;       // per island root: the shortest sleep_time in it
     uint8_t*  island_awake;
 
-    phys2d__grid static_grid, moving_grid;
+    // statics (rebuilt when they change), awake + kinematic bodies, and
+    // sleeping bodies - which only awake ones look up, never each other
+    phys2d__grid static_grid, moving_grid, resting_grid;
+    phys2d__poly_key* poly_keys;  // per body: what its world shape was last built from
+    uint8_t*     grid_kinds;      // per body: the grid it was last bucketed in (0xFF none)
+    bool         resting_dirty;   // the sleepers changed: rebuild resting_grid
     bool         statics_dirty;
 
     phys2d_contact* contacts;     // this step's pairs
     size_t          contact_count, contact_capacity;
     phys2d_contact* prev_contacts;
     size_t          prev_count, prev_capacity;
+    uint32_t*       active_contacts;   // this step's contacts the solver works on (not idle)
+    uint32_t*       awake_bodies;      // this step's moving bodies (not static, not asleep)
+    size_t          awake_count;
+    size_t          active_count, active_capacity;
     uint32_t*       prev_table;   // open-addressed pair -> prev index
     size_t          table_size;
 
@@ -9015,12 +9053,15 @@ struct phys3d_world;
 typedef void (*phys3d_action_fn)(phys3d_world& w, float dt, void* user);
 #define PHYS3D_MAX_ACTIONS 32
 
-struct phys3d__cell_item { int32_t cx, cy, cz; idx body; };
+// the body's bounds ride along, so pair tests stream through the grid instead
+// of reaching into the (large) body structs at random
+struct phys3d__cell_item { int32_t cx, cy, cz; idx body; aabb bounds; };
 struct phys3d__grid {
     uint32_t*          start;
     phys3d__cell_item* items;
     size_t             count, capacity;
 };
+struct phys3d__bounds_key;
 
 struct phys3d_world {
     // ---- settings ----
@@ -9064,7 +9105,12 @@ struct phys3d_world {
     float*    island_sleep;
     uint8_t*  island_awake;
 
-    phys3d__grid static_grid, moving_grid;
+    // statics (rebuilt when they change), awake + kinematic bodies, and
+    // sleeping bodies - which only awake ones look up, never each other
+    phys3d__grid static_grid, moving_grid, resting_grid;
+    phys3d__bounds_key* bounds_keys;   // per body: what its bounds were last computed from
+    uint8_t*     grid_kinds;      // per body: the grid it was last bucketed in (0xFF none)
+    bool         resting_dirty;   // the sleepers changed: rebuild resting_grid
     idx*         oversize;        // bodies too big for a grid
     size_t       oversize_count;
     bool         statics_dirty;
@@ -9073,6 +9119,10 @@ struct phys3d_world {
     size_t          contact_count, contact_capacity;
     phys3d_contact* prev_contacts;
     size_t          prev_count, prev_capacity;
+    uint32_t*       active_contacts;   // this step's contacts the solver works on (not idle)
+    uint32_t*       awake_bodies;      // this step's moving bodies (not static, not asleep)
+    size_t          awake_count;
+    size_t          active_count, active_capacity;
     uint32_t*       prev_table;   // pair -> first prev contact of that pair
     size_t          table_size;
 
@@ -15921,6 +15971,7 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     r.lod_chains         = pix_alloc<pix_mesh_lods>(PIX_MAX_MESHES);
     r.lod_band = 0.2f;
     r.lod_bias = 1.0f;
+    r.cull_pixels = 0.5f;
     r.instances         = pix_alloc<pix_render_instance>(PIX_MAX_INSTANCES);
     r.animated_instances = pix_alloc<pix_render_instance>(PIX_MAX_ANIMATED);
     r.animated_bones     = pix_alloc<const mat4*>(PIX_MAX_ANIMATED);
@@ -16217,6 +16268,7 @@ void pix_set_quality(pix_renderer& r, int quality) {
     static const bool glow[4] = { false, true,   true,  true };
     static const bool probe[4] = { false, false, true,  true };
     static const int  probe_res[4] = { 64, 64,   128,   256 };
+    static const float speck[4] = { 1.5f, 1.0f,  0.5f,  0.25f };   // cull_pixels
     int q = quality < 0 ? 0 : (quality > 3 ? 3 : quality);
     r.shadows.enabled = true;
     r.shadows.resolution = res[q];
@@ -16227,6 +16279,7 @@ void pix_set_quality(pix_renderer& r, int quality) {
     r.reflections.probe = probe[q];
     r.reflections.probe_resolution = probe_res[q];
     r.reflections.probe_faces_per_frame = q == PIX_QUALITY_ULTRA ? 2 : 1;
+    r.cull_pixels = speck[q];
     pix__sync_settings(r);
 }
 
@@ -17190,26 +17243,36 @@ static void pix__gpu_end(pix_renderer& r, int pass) {
 
 // LSD radix sort of (key, value) pairs, 8 bits a pass, skipping every pass
 // whose digit is the same for all keys - which for keys made of a few small
-// fields is most of them. Linear in the count, no comparisons, stable.
-static void pix__radix_sort(pix_renderer& r, size_t n) {
+// fields is most of them. Linear in the count, no comparisons, stable. All
+// eight digit histograms come from one read of the keys, and the sorted
+// values are returned where the last pass left them (sort_vals or
+// sort_vals_tmp) rather than copied back: callers copy them once, to where
+// they are kept.
+static const uint32_t* pix__radix_sort(pix_renderer& r, size_t n) {
     uint64_t* k = r.sort_keys;     uint64_t* kt = r.sort_keys_tmp;
     uint32_t* v = r.sort_vals;     uint32_t* vt = r.sort_vals_tmp;
-    for (int shift = 0; shift < 64; shift += 8) {
-        size_t count[257] = {};
-        for (size_t i = 0; i < n; i++) count[((k[i] >> shift) & 255) + 1]++;
-        bool trivial = false;
-        for (int d = 1; d <= 256; d++) if (count[d] == n) { trivial = true; break; }
-        if (trivial) continue;
-        for (int d = 0; d < 256; d++) count[d + 1] += count[d];
+    if (n < 2) return v;
+    uint32_t count[8][256];
+    memset(count, 0, sizeof(count));
+    for (size_t i = 0; i < n; i++) {
+        uint64_t key = k[i];
+        for (int d = 0; d < 8; d++) count[d][(key >> (d * 8)) & 255]++;
+    }
+    for (int d = 0; d < 8; d++) {
+        int shift = d * 8;
+        uint32_t* c = count[d];
+        if (c[(k[0] >> shift) & 255] == n) continue;   // every key has this digit: nothing moves
+        uint32_t sum = 0;
+        for (int b = 0; b < 256; b++) { uint32_t t = c[b]; c[b] = sum; sum += t; }
         for (size_t i = 0; i < n; i++) {
-            size_t at = count[(k[i] >> shift) & 255]++;
+            uint32_t at = c[(k[i] >> shift) & 255]++;
             kt[at] = k[i];
             vt[at] = v[i];
         }
         uint64_t* tk = k; k = kt; kt = tk;
         uint32_t* tv = v; v = vt; vt = tv;
     }
-    if (v != r.sort_vals) memcpy(r.sort_vals, v, n * sizeof(uint32_t));
+    return v;
 }
 
 static uint64_t pix__batch_key(const pix_render_instance& it) {
@@ -17220,6 +17283,16 @@ static uint32_t pix__depth16(float d, float far_plane) {
     float t = d / (far_plane > 1e-3f ? far_plane : 1.0f);
     t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
     return (uint32_t)(t * 65535.0f);
+}
+
+// Maps part of the buffer bound to `target` for writing only, without
+// waiting on the GPU: for storage just (re)specified this frame, or a range
+// no draw has used yet. Null if the driver declines; the caller then fills a
+// staging copy and uploads that instead.
+static void* pix__map_write(GLenum target, size_t offset, size_t bytes) {
+    if (!bytes) return 0;
+    return glMapBufferRange(target, (GLintptr)offset, (GLsizeiptr)bytes,
+                            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
 }
 
 // ---------------- the frame's shared data ----------------
@@ -17244,35 +17317,53 @@ struct pix__skin_record { mat4 model; vec4 tint; uint32_t info[4]; };
 
 static void pix__upload_skinning(pix_renderer& r) {
     r.skin_list_cursor = 0;
+    r.skin_reuse.valid = false;     // a new frame: new instances, a fresh list buffer
     if (!r.animated_count) return;
     size_t total = 0;
     for (size_t k = 0; k < r.animated_count; k++) total += r.animated_bone_count[k];
-    if (total > r.skin_bone_staging_capacity) {
-        size_t cap = r.skin_bone_staging_capacity ? r.skin_bone_staging_capacity : 4096;
-        while (cap < total) cap *= 2;
-        mat4* grown = (mat4*)pix_mem_realloc(r.skin_bone_staging, cap * sizeof(mat4));
-        if (!grown) { r.animated_count = 0; return; }
-        r.skin_bone_staging = grown;
-        r.skin_bone_staging_capacity = cap;
+    // every palette back to back, copied from the animators straight into the
+    // freshly specified buffer (through a staging copy only if it cannot be mapped)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_bones_ssbo);
+    if (total > r.skin_bones_capacity) r.skin_bones_capacity = total * 2;
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_bones_capacity * sizeof(mat4)), 0, GL_STREAM_DRAW);
+    mat4* bones = (mat4*)pix__map_write(GL_SHADER_STORAGE_BUFFER, 0, total * sizeof(mat4));
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!bones) {
+            if (total > r.skin_bone_staging_capacity) {
+                size_t cap = r.skin_bone_staging_capacity ? r.skin_bone_staging_capacity : 4096;
+                while (cap < total) cap *= 2;
+                mat4* grown = (mat4*)pix_mem_realloc(r.skin_bone_staging, cap * sizeof(mat4));
+                if (!grown) { r.animated_count = 0; glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0); return; }
+                r.skin_bone_staging = grown;
+                r.skin_bone_staging_capacity = cap;
+            }
+        }
+        mat4* out = bones ? bones : r.skin_bone_staging;
+        size_t at = 0;
+        for (size_t k = 0; k < r.animated_count; k++) {
+            memcpy(out + at, r.animated_bones[k], r.animated_bone_count[k] * sizeof(mat4));
+            at += r.animated_bone_count[k];
+        }
+        if (bones && glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)) break;
+        if (!bones) {
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(total * sizeof(mat4)), r.skin_bone_staging);
+            break;
+        }
+        bones = 0;    // the mapping's contents were lost: once more through the staging copy
     }
-    // the records borrow the instance staging array, which is idle until the first view streams
+    // the records borrow the instance staging array, which streaming only
+    // uses when it cannot map the instance buffer - and never before this
     static_assert(sizeof(pix__gpu_instance) * PIX_MAX_INSTANCES >= sizeof(pix__skin_record) * PIX_MAX_ANIMATED,
                   "PIX_MAX_ANIMATED too large for the shared staging array");
     pix__skin_record* rec = (pix__skin_record*)r.staging;
     size_t at = 0;
     for (size_t k = 0; k < r.animated_count; k++) {
-        uint32_t n = r.animated_bone_count[k];
-        memcpy(r.skin_bone_staging + at, r.animated_bones[k], n * sizeof(mat4));
         rec[k].model = r.animated_instances[k].transform;
         rec[k].tint = r.animated_instances[k].tint;
         rec[k].info[0] = (uint32_t)at;
         rec[k].info[1] = rec[k].info[2] = rec[k].info[3] = 0;
-        at += n;
+        at += r.animated_bone_count[k];
     }
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_bones_ssbo);
-    if (total > r.skin_bones_capacity) r.skin_bones_capacity = total * 2;
-    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_bones_capacity * sizeof(mat4)), 0, GL_STREAM_DRAW);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(total * sizeof(mat4)), r.skin_bone_staging);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_inst_ssbo);
     glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.animated_count * sizeof(pix__skin_record)), rec, GL_STREAM_DRAW);
     // index lists: a few views and cascades per frame, each at most every instance
@@ -17348,11 +17439,22 @@ static void pix__prepare_frame(pix_renderer& r) {
     r.frame_prepared = true;
 }
 
-// Uploads a sorted list's transforms into the instance stream and records
+static void pix__fill_instances(const pix_renderer& r, const pix__draw_list& list, pix__gpu_instance* out) {
+    for (size_t i = 0; i < list.count; i++) {
+        const pix_render_instance& it = r.instances[list.items[i]];
+        out[i].model = it.transform;
+        out[i].tint = it.tint;
+        out[i].lod = it.lod_fade;
+    }
+}
+
+// Writes a sorted list's transforms into the instance stream and records
 // where they landed; the draws then name that slice with baseInstance. No two
-// uploads in a frame overlap, so none waits on a draw. When the frame outgrows
-// the buffer, it is re-specified larger: draws already issued keep the storage
-// they were issued against, so nothing in flight is disturbed.
+// uploads in a frame overlap, so none waits on a draw - which is also what
+// lets them go straight into the mapped buffer instead of through a staging
+// copy. When the frame outgrows the buffer, it is re-specified larger: draws
+// already issued keep the storage they were issued against, so nothing in
+// flight is disturbed.
 static void pix__stream_list(pix_renderer& r, pix__draw_list& list) {
     list.base = 0;
     if (!list.count) return;
@@ -17363,36 +17465,39 @@ static void pix__stream_list(pix_renderer& r, pix__draw_list& list) {
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.instance_capacity * sizeof(pix__gpu_instance)), 0, GL_STREAM_DRAW);
         r.instance_cursor = 0;
     }
-    for (size_t i = 0; i < list.count; i++) {
-        const pix_render_instance& it = r.instances[list.items[i]];
-        r.staging[i].model = it.transform;
-        r.staging[i].tint = it.tint;
-        r.staging[i].lod = it.lod_fade;
+    size_t offset = r.instance_cursor * sizeof(pix__gpu_instance), bytes = list.count * sizeof(pix__gpu_instance);
+    pix__gpu_instance* dst = (pix__gpu_instance*)pix__map_write(GL_ARRAY_BUFFER, offset, bytes);
+    if (dst) pix__fill_instances(r, list, dst);
+    if (!dst || !glUnmapBuffer(GL_ARRAY_BUFFER)) {   // no mapping, or its contents were lost
+        pix__fill_instances(r, list, r.staging);
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)offset, (GLsizeiptr)bytes, r.staging);
     }
-    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(r.instance_cursor * sizeof(pix__gpu_instance)),
-                    (GLsizeiptr)(list.count * sizeof(pix__gpu_instance)), r.staging);
     list.base = (GLuint)r.instance_cursor;
     r.instance_cursor += list.count;
 }
 
 // A view's opaque list (by batch, front to back inside it for early depth
 // rejection) and blended list (strictly back to front), culled against its
-// frustum, its layers and its distance cap.
+// frustum, its layers, its distance cap and r.cull_pixels. `pixels` is how
+// many pixels one world unit covers at distance 1 (perspective; d away it is
+// pixels / d) or anywhere (`ortho`).
 static void pix__build_view_lists(pix_renderer& r, const frustum& fr, vec3 eye, float max_dist, float far_plane,
-                                  uint32_t layers, bool opaque, bool blended_too) {
+                                  uint32_t layers, bool opaque, bool blended_too, float pixels, bool ortho) {
     size_t n = r.renderable_count, count = 0;
     r.refract_needed = false;
+    // too small to see: diameter * pixels / d < cull_pixels, kept free of the division
+    float speck = r.cull_pixels > 0.0f ? r.cull_pixels / (2.0f * pixels) : 0.0f;
     if (opaque) {
         for (size_t i = 0; i < n; i++) {
             if ((r.flags[i] & (PIX__BLENDED | PIX__HIDDEN)) || !(r.instances[i].layers & layers)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float d = v3dist(c, eye);
-            if (d - r.bounds[i].w > max_dist || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
+            if (d - r.bounds[i].w > max_dist || r.bounds[i].w < speck * (ortho ? 1.0f : d)
+                || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
             r.sort_keys[count] = pix__batch_key(r.instances[i]) | ((uint64_t)pix__depth16(d, far_plane) << 16);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_opaque.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_opaque.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
     }
     r.list_opaque.count = count;
 
@@ -17402,14 +17507,14 @@ static void pix__build_view_lists(pix_renderer& r, const frustum& fr, vec3 eye, 
             if (!(r.flags[i] & PIX__BLENDED) || (r.flags[i] & PIX__HIDDEN) || !(r.instances[i].layers & layers)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float d = v3dist(c, eye);
-            if (d - r.bounds[i].w > max_dist || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
+            if (d - r.bounds[i].w > max_dist || r.bounds[i].w < speck * (ortho ? 1.0f : d)
+                || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
             if (r.flags[i] & PIX__REFRACT) r.refract_needed = true;
             uint32_t back = 65535u - pix__depth16(d, far_plane);
             r.sort_keys[count] = ((uint64_t)back << 48) | (pix__batch_key(r.instances[i]) >> 16);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_transparent.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_transparent.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
     }
     r.list_transparent.count = count;
 }
@@ -17835,33 +17940,52 @@ static void pix__draw_sorted(pix_renderer& r, const pix__draw_list& list, pix__p
 static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* light_vp,
                               const frustum* fr, uint32_t layers, int mode = PIX__SKIN_COLOR) {
     if (!r.animated_count) return;
-    size_t count = 0;
-    for (size_t k = 0; k < r.animated_count; k++) {
-        const pix_render_instance& inst = r.animated_instances[k];
-        if (!(inst.layers & layers)) continue;
-        if (fr) {
-            const mesh& me = r.skinned_meshes[inst.mesh];
-            vec3 c = mat4_mul_point(inst.transform, me.center);
-            float rad = me.radius * mat4_max_scale(inst.transform) * 1.5f;   // poses reach past the bind pose
-            if (!frustum_test_sphere(*fr, c, rad)) { r.frame_culled++; continue; }
+    auto& reuse = r.skin_reuse;
+    const uint32_t* order = r.skin_list_staging;
+    size_t count = 0, base = 0;
+    if (reuse.valid && reuse.layers == layers && reuse.culled == (fr != 0) && (!fr || !memcmp(fr, &reuse.fr, sizeof(frustum)))) {
+        count = reuse.count;          // this view's list is up already
+        base = reuse.base;
+        r.frame_culled += reuse.dropped;
+    } else {
+        int dropped = 0;
+        for (size_t k = 0; k < r.animated_count; k++) {
+            const pix_render_instance& inst = r.animated_instances[k];
+            if (!(inst.layers & layers)) continue;
+            if (fr) {
+                const mesh& me = r.skinned_meshes[inst.mesh];
+                vec3 c = mat4_mul_point(inst.transform, me.center);
+                float rad = me.radius * mat4_max_scale(inst.transform) * 1.5f;   // poses reach past the bind pose
+                if (!frustum_test_sphere(*fr, c, rad)) { dropped++; continue; }
+            }
+            r.sort_keys[count] = pix__batch_key(inst);
+            r.sort_vals[count++] = (uint32_t)k;
         }
-        r.sort_keys[count] = pix__batch_key(inst);
-        r.sort_vals[count++] = (uint32_t)k;
+        r.frame_culled += dropped;
+        if (count) {
+            memcpy(r.skin_list_staging, pix__radix_sort(r, count), count * sizeof(uint32_t));
+            if (r.skin_list_cursor + count > r.skin_list_capacity) {
+                // more views than budgeted: a fresh buffer; draws already issued keep theirs
+                r.skin_list_capacity = (r.skin_list_capacity + count) * 2;
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_list_capacity * sizeof(uint32_t)), 0, GL_STREAM_DRAW);
+                r.skin_list_cursor = 0;
+            }
+            base = r.skin_list_cursor;
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(base * sizeof(uint32_t)),
+                            (GLsizeiptr)(count * sizeof(uint32_t)), r.skin_list_staging);
+            r.skin_list_cursor += count;
+        }
+        reuse.valid = true;
+        reuse.culled = fr != 0;
+        if (fr) reuse.fr = *fr;
+        reuse.layers = layers;
+        reuse.base = base;
+        reuse.count = count;
+        reuse.dropped = dropped;
     }
     if (!count) return;
-    pix__radix_sort(r, count);
-    if (r.skin_list_cursor + count > r.skin_list_capacity) {
-        // more views than budgeted: a fresh buffer; draws already issued keep theirs
-        r.skin_list_capacity = (r.skin_list_capacity + count) * 2;
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_list_capacity * sizeof(uint32_t)), 0, GL_STREAM_DRAW);
-        r.skin_list_cursor = 0;
-    }
-    size_t base = r.skin_list_cursor;
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(base * sizeof(uint32_t)),
-                    (GLsizeiptr)(count * sizeof(uint32_t)), r.sort_vals);
-    r.skin_list_cursor += count;
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, r.skin_inst_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, r.skin_bones_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, r.skin_list_ssbo);
@@ -17871,10 +17995,10 @@ static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* 
     idx bound = PIX_INVALID;
     size_t i = 0;
     while (i < count) {
-        const pix_render_instance& a = r.animated_instances[r.sort_vals[i]];
+        const pix_render_instance& a = r.animated_instances[order[i]];
         size_t j = i + 1;
         while (j < count) {
-            const pix_render_instance& b = r.animated_instances[r.sort_vals[j]];
+            const pix_render_instance& b = r.animated_instances[order[j]];
             if (b.mesh != a.mesh || b.material != a.material) break;
             j++;
         }
@@ -18287,15 +18411,20 @@ static void pix__velocity_pass(pix_renderer& r) {
         if (!r.velocity_staging) { r.velocity_capacity = 0; return; }
         r.velocity_capacity = cap;
     }
-    size_t k = 0;
-    for (size_t i = 0; i < r.renderable_count; i++) {
-        const pix_render_instance& it = r.instances[i];
-        if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
-        mat4 prev = pix__motion_prev(r, it.motion_id, it.transform);
-        memcpy(r.velocity_staging + k * 32, it.transform.data, 16 * sizeof(float));
-        memcpy(r.velocity_staging + k * 32 + 16, prev.data, 16 * sizeof(float));
-        k++;
-    }
+    // this frame's and last frame's transform per instance, written straight
+    // into the freshly specified buffer (pix__motion_prev answers the same
+    // twice in a frame, so the staging fallback can simply fill again)
+    auto fill = [&](float* out) {
+        size_t k = 0;
+        for (size_t i = 0; i < r.renderable_count; i++) {
+            const pix_render_instance& it = r.instances[i];
+            if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
+            mat4 prev = pix__motion_prev(r, it.motion_id, it.transform);
+            memcpy(out + k * 32, it.transform.data, 16 * sizeof(float));
+            memcpy(out + k * 32 + 16, prev.data, 16 * sizeof(float));
+            k++;
+        }
+    };
     // the pool's buffers change when it grows, so the layout is set each time
     glBindVertexArray(r.velocity_vao);
     glBindBuffer(GL_ARRAY_BUFFER, r.pool.vbo);
@@ -18303,7 +18432,12 @@ static void pix__velocity_pass(pix_renderer& r) {
     glEnableVertexAttribArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, r.velocity_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.velocity_capacity * 32 * sizeof(float)), 0, GL_STREAM_DRAW);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(k * 32 * sizeof(float)), r.velocity_staging);
+    float* mapped = (float*)pix__map_write(GL_ARRAY_BUFFER, 0, n * 32 * sizeof(float));
+    if (mapped) fill(mapped);
+    if (!mapped || !glUnmapBuffer(GL_ARRAY_BUFFER)) {
+        fill(r.velocity_staging);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * 32 * sizeof(float)), r.velocity_staging);
+    }
     for (int c = 0; c < 8; c++) {
         glVertexAttribPointer(1 + c, 4, GL_FLOAT, GL_FALSE, 32 * sizeof(float), (void*)(size_t)(c * 4 * sizeof(float)));
         glEnableVertexAttribArray(1 + c);
@@ -18321,7 +18455,7 @@ static void pix__velocity_pass(pix_renderer& r) {
     glDepthMask(GL_FALSE);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
-    k = 0;
+    size_t k = 0;
     for (size_t i = 0; i < r.renderable_count; i++) {
         const pix_render_instance& it = r.instances[i];
         if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
@@ -18372,8 +18506,10 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     }
     GLuint draw_fbo = msaa ? r.msaa_fbo : fbo;
     float max_dist = v.max_distance > 0.0f ? v.max_distance : r.camera_far;
+    // the projection's y scale: how big a world unit is on this view's rows
+    float pixels = r.projection_matrix.data[5] * 0.5f * (float)vh;
     pix__build_view_lists(r, r.view_frustum, r.camera_position, max_dist, r.camera_far, v.layers,
-                          v.opaque, v.transparent);
+                          v.opaque, v.transparent, pixels, r.projection_matrix.data[15] != 0.0f);
     pix__stream_list(r, r.list_opaque);
     pix__stream_list(r, r.list_transparent);
 
@@ -18548,12 +18684,13 @@ static void pix__render_local_shadows(pix_renderer& r) {
             if (!(r.flags[i] & PIX__CASTER)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float rad = r.bounds[i].w;
-            if (v3len(v3sub(c, eye)) - rad > reach || !frustum_test_sphere(fr, c, rad)) continue;
+            vec3 to = v3sub(c, eye);
+            float near_side = reach + rad;    // |to| - rad > reach, without the square root
+            if (v3dot(to, to) > near_side * near_side || !frustum_test_sphere(fr, c, rad)) continue;
             r.sort_keys[count] = pix__batch_key(r.instances[i]);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(list.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(list.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
         list.count = count;
         pix__stream_list(r, list);
         glViewport((t % 4) * tile, (t / 4) * tile, tile, tile);
@@ -18573,13 +18710,16 @@ void pix_render_shadows(pix_renderer& r) {
     pix__gpu_begin(r, PIX_GPU_SHADOW);
 
     size_t n = r.renderable_count;
+    // a caster under cull_pixels texels across is a speck in that cascade's map
+    float speck[SHADOW_CASCADES];
+    for (int k = 0; k < SHADOW_CASCADES; k++) speck[k] = 0.5f * r.cull_pixels * r.cascade_texel[k];
     for (size_t i = 0; i < n; i++) {
         r.flags[i] &= (uint8_t)~0xF0;
         if (!(r.flags[i] & PIX__CASTER)) continue;
         vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
         float rad = r.bounds[i].w;
         for (int k = 0; k < SHADOW_CASCADES; k++) {
-            if (!(r.cascade_mask & (1 << k))) continue;
+            if (!(r.cascade_mask & (1 << k)) || rad < speck[k]) continue;
             vec3 lp = mat4_mul_point(r.cascade_view[k], c);
             float e = r.cascade_radius[k] + rad;
             if (fabsf(lp.x) <= e && fabsf(lp.y) <= e && -lp.z >= -rad && -lp.z <= r.cascade_depth + rad)
@@ -18596,8 +18736,7 @@ void pix_render_shadows(pix_renderer& r) {
             r.sort_keys[count] = pix__batch_key(r.instances[i]);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_cascade[k].items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_cascade[k].items, pix__radix_sort(r, count), count * sizeof(uint32_t));
         r.list_cascade[k].count = count;
         pix__stream_list(r, r.list_cascade[k]);
     }
@@ -21965,6 +22104,34 @@ static void phys2d__compute_mass(phys2d_body& b) {
 
 // ---- world ----
 
+// What a static or sleeping body's world shape and bounds were last built
+// from. While all of it still holds they are what they were, and the step
+// skips the trigonometry: most of a level is static, most of a settled pile
+// asleep. Compared bit for bit, so any change at all rebuilds.
+struct phys2d__poly_key {
+    phys2d_shape shape;       // a byte copy of the body's
+    vec2    position;
+    float   angle;
+    float   pad;              // the speculative margin around a sleeping body
+    uint8_t type;             // PHYS2D_*; 0xFF = nothing cached
+    bool    sleeping;
+};
+
+static void phys2d__make_key(const phys2d_body& b, float pad, phys2d__poly_key& k) {
+    memcpy(&k.shape, &b.shape, sizeof(phys2d_shape));
+    k.position = b.position;
+    k.angle = b.angle;
+    k.pad = pad;
+    k.type = b.type;
+    k.sleeping = b.sleeping;
+}
+
+static bool phys2d__key_holds(const phys2d__poly_key& k, const phys2d_body& b, float pad) {
+    if (k.type != b.type || k.sleeping != b.sleeping || memcmp(&k.pad, &pad, sizeof(float))) return false;
+    if (memcmp(&k.position, &b.position, sizeof(vec2)) || memcmp(&k.angle, &b.angle, sizeof(float))) return false;
+    return !memcmp(&k.shape, &b.shape, sizeof(phys2d_shape));
+}
+
 void phys2d_create_world(phys2d_world& w) {
     memset(&w, 0, sizeof(w));
     w.gravity = v2(0.0f, 980.0f);
@@ -21995,8 +22162,14 @@ void phys2d_create_world(phys2d_world& w) {
     w.polys        = pix_alloc<phys2d__poly>(PHYS2D_MAX_BODIES);
     w.free_ids     = pix_alloc<idx>(PHYS2D_MAX_BODIES);
     w.pending_free = pix_alloc<idx>(PHYS2D_MAX_BODIES);
-    w.static_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
-    w.moving_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.awake_bodies = pix_alloc<uint32_t>(PHYS2D_MAX_BODIES);
+    w.poly_keys    = pix_alloc<phys2d__poly_key>(PHYS2D_MAX_BODIES);
+    w.grid_kinds   = pix_alloc<uint8_t>(PHYS2D_MAX_BODIES);
+    memset(w.grid_kinds, 0xFF, PHYS2D_MAX_BODIES);
+    w.resting_dirty = true;
+    w.static_grid.start  = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.moving_grid.start  = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.resting_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
 }
 
 void phys2d_destroy_world(phys2d_world& w) {
@@ -22009,12 +22182,18 @@ void phys2d_destroy_world(phys2d_world& w) {
     pix_free(w.polys);
     pix_free(w.free_ids);
     pix_free(w.pending_free);
+    pix_free(w.poly_keys);
+    pix_free(w.grid_kinds);
     pix_free(w.static_grid.start);
     pix_free(w.static_grid.items);
     pix_free(w.moving_grid.start);
     pix_free(w.moving_grid.items);
+    pix_free(w.resting_grid.start);
+    pix_free(w.resting_grid.items);
     pix_free(w.contacts);
     pix_free(w.prev_contacts);
+    pix_free(w.active_contacts);
+    pix_free(w.awake_bodies);
     pix_free(w.prev_table);
     pix_free(w.events);
     memset(&w, 0, sizeof(w));
@@ -22058,6 +22237,7 @@ idx phys2d_add_body(phys2d_world& w, const phys2d_body& body) {
     b.prev_position = b.position;
     b.prev_angle = b.angle;
     phys2d__compute_mass(b);
+    w.poly_keys[id].type = 0xFF;
     if (b.type == PHYS2D_STATIC) w.statics_dirty = true;
     return id;
 }
@@ -22567,22 +22747,35 @@ static void phys2d__islands_sleep(phys2d_world& w, float dt) {
 
 // ---- broadphase grid ----
 
-static inline int32_t phys2d__cell(float x, float inv_cell) { return (int32_t)floorf(x * inv_cell); }
+// floorf without the library call (MSVC makes one): truncate, then step down for negatives
+static inline int32_t phys2d__cell(float x, float inv_cell) {
+    float f = x * inv_cell;
+    int32_t i = (int32_t)f;
+    return i - (f < (float)i);
+}
 static inline uint32_t phys2d__bucket(int32_t cx, int32_t cy) {
     return ((uint32_t)cx * 73856093u ^ (uint32_t)cy * 19349663u) & (PHYS2D_GRID_BUCKETS - 1);
 }
 
-// Buckets every body for which `want(type)` holds into every cell its bounds
+#define PHYS2D__GRID_STATIC  0
+#define PHYS2D__GRID_MOVING  1   // awake dynamic and every kinematic body
+#define PHYS2D__GRID_RESTING 2   // sleeping dynamic bodies
+
+static inline int phys2d__grid_kind(const phys2d_body& b) {
+    return b.type == PHYS2D_STATIC ? PHYS2D__GRID_STATIC : (b.sleeping ? PHYS2D__GRID_RESTING : PHYS2D__GRID_MOVING);
+}
+
+// Buckets every active body of one grid kind into every cell its bounds
 // cover: a counting pass, a prefix sum, then a fill that turns each bucket's
 // start into its end - shifted back by one at the end.
-static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, bool statics) {
+static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, int kind) {
     float inv = 1.0f / w.cell_size;
     uint32_t* start = g.start;
     memset(start, 0, (PHYS2D_GRID_BUCKETS + 1) * sizeof(uint32_t));
     size_t total = 0;
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || (b.type == PHYS2D_STATIC) != statics) continue;
+        if (!b.active || phys2d__grid_kind(b) != kind) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
         for (int32_t y = y0; y <= y1; y++)
@@ -22594,13 +22787,13 @@ static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, bool statics) {
     for (int i = 0; i < PHYS2D_GRID_BUCKETS; i++) { uint32_t c = start[i]; start[i] = sum; sum += c; }
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || (b.type == PHYS2D_STATIC) != statics) continue;
+        if (!b.active || phys2d__grid_kind(b) != kind) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
         for (int32_t y = y0; y <= y1; y++)
             for (int32_t x = x0; x <= x1; x++) {
                 phys2d__cell_item& it = g.items[start[phys2d__bucket(x, y)]++];
-                it.cx = x; it.cy = y; it.body = (idx)i;
+                it.cx = x; it.cy = y; it.body = (idx)i; it.bounds = b.bounds;
             }
     }
     memmove(start + 1, start, PHYS2D_GRID_BUCKETS * sizeof(uint32_t));
@@ -22642,27 +22835,40 @@ static void phys2d__push_event(phys2d_world& w, uint8_t type, idx a, idx b, vec2
     e.type = type; e.a = a; e.b = b; e.point = point; e.normal = normal; e.speed = speed;
 }
 
+// can these two (a < b) have a contact at all
+static inline bool phys2d__pair_wanted(const phys2d_world& w, idx ia, idx ib, const phys2d_body& a, const phys2d_body& b) {
+    if (!phys2d__layers_ok(a, b)) return false;
+    if (a.trigger && b.trigger) return false;
+    if (!a.trigger && !b.trigger && a.type != PHYS2D_DYNAMIC && b.type != PHYS2D_DYNAMIC) return false;
+    if (!phys2d__rects_overlap(a.bounds, b.bounds)) return false;
+    return !(a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys2d__joined(w, ia, ib));
+}
+
+// Pairs where neither body moved (asleep, static, a kinematic at rest) keep
+// last step's contact as it was, events and all. They are taken straight from
+// that list rather than found again through the grids, so a settled pile
+// costs a copy, not a broadphase - and sleepers never need pairing with each other.
+static void phys2d__carry_idle_contacts(phys2d_world& w) {
+    for (size_t k = 0; k < w.prev_count; k++) {
+        const phys2d_contact& old = w.prev_contacts[k];
+        const phys2d_body& a = w.bodies[old.a];
+        const phys2d_body& b = w.bodies[old.b];
+        if (!a.active || !b.active || !phys2d__idle(a) || !phys2d__idle(b) || !phys2d__pair_wanted(w, old.a, old.b, a, b)) continue;
+        phys2d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
+        phys2d_contact& c = w.contacts[w.contact_count++];
+        c = old;
+        c.prev = (uint32_t)k;
+        c.persisted = false;
+    }
+}
+
 static void phys2d__narrowphase(phys2d_world& w, idx ia, idx ib, float dt) {
     if (ia > ib) { idx t = ia; ia = ib; ib = t; }
     phys2d_body& a = w.bodies[ia];
     phys2d_body& b = w.bodies[ib];
-    if (!phys2d__layers_ok(a, b)) return;
+    if (phys2d__idle(a) && phys2d__idle(b)) return;    // phys2d__carry_idle_contacts has it
+    if (!phys2d__pair_wanted(w, ia, ib, a, b)) return;
     bool trigger = a.trigger || b.trigger;
-    if (a.trigger && b.trigger) return;
-    if (!trigger && a.type != PHYS2D_DYNAMIC && b.type != PHYS2D_DYNAMIC) return;
-    if (!phys2d__rects_overlap(a.bounds, b.bounds)) return;
-    if (a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys2d__joined(w, ia, ib)) return;
-    if (phys2d__idle(a) && phys2d__idle(b)) {
-        // nothing moved: keep last step's contact as it was, events and all
-        const phys2d_contact* old = phys2d__find_prev(w, ia, ib);
-        if (!old) return;
-        phys2d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
-        phys2d_contact& c = w.contacts[w.contact_count++];
-        c = *old;
-        c.prev = (uint32_t)(old - w.prev_contacts);
-        c.persisted = false;
-        return;
-    }
 
     const phys2d__poly& pa = w.polys[ia];
     const phys2d__poly& pb = w.polys[ib];
@@ -22698,37 +22904,40 @@ static void phys2d__narrowphase(phys2d_world& w, idx ia, idx ib, float dt) {
 static void phys2d__find_contacts(phys2d_world& w, float dt) {
     float inv = 1.0f / w.cell_size;
     const phys2d__grid& mg = w.moving_grid;
-    const phys2d__grid& sg = w.static_grid;
     // moving vs moving: pairs within each bucket that share a cell
     for (int bk = 0; bk < PHYS2D_GRID_BUCKETS; bk++)
-        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++)
+        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++) {
+            const phys2d__cell_item& p = mg.items[i];
             for (uint32_t j = i + 1; j < mg.start[bk + 1]; j++) {
-                const phys2d__cell_item& p = mg.items[i];
                 const phys2d__cell_item& q = mg.items[j];
                 if (p.cx != q.cx || p.cy != q.cy) continue;
-                const rect2& ra = w.bodies[p.body].bounds;
-                const rect2& rb = w.bodies[q.body].bounds;
-                if (!phys2d__rects_overlap(ra, rb) || !phys2d__owns_pair(ra, rb, p.cx, p.cy, inv)) continue;
+                if (!phys2d__rects_overlap(p.bounds, q.bounds) || !phys2d__owns_pair(p.bounds, q.bounds, p.cx, p.cy, inv)) continue;
                 phys2d__narrowphase(w, p.body, q.body, dt);
             }
-    // moving vs static: look each moving body up in the static grid
+        }
+    // each moving body looked up among the statics and the sleepers
+    const phys2d__grid* others[2] = { &w.static_grid, &w.resting_grid };
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || b.type == PHYS2D_STATIC) continue;
+        if (!b.active || phys2d__grid_kind(b) != PHYS2D__GRID_MOVING) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
-        for (int32_t y = y0; y <= y1; y++)
-            for (int32_t x = x0; x <= x1; x++) {
-                uint32_t bk = phys2d__bucket(x, y);
-                for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
-                    const phys2d__cell_item& it = sg.items[k];
-                    if (it.cx != x || it.cy != y) continue;
-                    const rect2& rs = w.bodies[it.body].bounds;
-                    if (!phys2d__rects_overlap(b.bounds, rs) || !phys2d__owns_pair(b.bounds, rs, x, y, inv)) continue;
-                    phys2d__narrowphase(w, (idx)i, it.body, dt);
+        for (int g = 0; g < 2; g++) {
+            const phys2d__grid& sg = *others[g];
+            if (!sg.count) continue;
+            for (int32_t y = y0; y <= y1; y++)
+                for (int32_t x = x0; x <= x1; x++) {
+                    uint32_t bk = phys2d__bucket(x, y);
+                    for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
+                        const phys2d__cell_item& it = sg.items[k];
+                        if (it.cx != x || it.cy != y) continue;
+                        if (!phys2d__rects_overlap(b.bounds, it.bounds) || !phys2d__owns_pair(b.bounds, it.bounds, x, y, inv)) continue;
+                        phys2d__narrowphase(w, (idx)i, it.body, dt);
+                    }
                 }
-            }
+        }
     }
+    phys2d__carry_idle_contacts(w);
 }
 
 // Begin/end events by comparing this step's touching pairs with the last's.
@@ -22777,12 +22986,15 @@ static void phys2d__report(phys2d_world& w) {
 // step, for the same cost.
 
 static void phys2d__prepare_contacts(phys2d_world& w) {
+    phys2d__reserve(w.active_contacts, w.active_capacity, w.contact_count);
+    w.active_count = 0;
     for (size_t i = 0; i < w.contact_count; i++) {
         phys2d_contact& c = w.contacts[i];
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         c.idle = c.trigger || (phys2d__idle(a) && phys2d__idle(b));
         if (c.idle) continue;
+        w.active_contacts[w.active_count++] = (uint32_t)i;
         vec2 n = c.normal, t = phys2d__perp(n);
         for (int k = 0; k < c.count; k++) {
             phys2d_contact_point& p = c.points[k];
@@ -22824,17 +23036,22 @@ static void phys2d__prepare_contacts(phys2d_world& w) {
     }
 }
 
+// static and kinematic bodies have no inverse mass or inertia: an impulse
+// would leave them as they are, so it is skipped rather than computed as zero
 static inline void phys2d__apply(phys2d_body& a, phys2d_body& b, const phys2d_contact_point& p, vec2 P) {
-    a.velocity -= P * a.inv_mass;
-    a.angular_velocity -= a.inv_inertia * phys2d__cross(p.ra, P);
-    b.velocity += P * b.inv_mass;
-    b.angular_velocity += b.inv_inertia * phys2d__cross(p.rb, P);
+    if (a.type == PHYS2D_DYNAMIC) {
+        a.velocity -= P * a.inv_mass;
+        a.angular_velocity -= a.inv_inertia * phys2d__cross(p.ra, P);
+    }
+    if (b.type == PHYS2D_DYNAMIC) {
+        b.velocity += P * b.inv_mass;
+        b.angular_velocity += b.inv_inertia * phys2d__cross(p.rb, P);
+    }
 }
 
 static void phys2d__warm_contacts(phys2d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
         vec2 n = c.normal, t = phys2d__perp(n);
         for (int k = 0; k < c.count; k++)
             phys2d__apply(w.bodies[c.a], w.bodies[c.b], c.points[k], n * c.points[k].normal_impulse + t * c.points[k].tangent_impulse);
@@ -22893,9 +23110,8 @@ static void phys2d__solve_block(phys2d_contact& c, phys2d_body& a, phys2d_body& 
 // `push_rate` is how much of an overlap (beyond slop) is removed per second;
 // 0 in the relax pass. A point still apart may close its gap and no more.
 static void phys2d__solve_contacts(phys2d_world& w, float inv_h, float push_rate) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         vec2 n = c.normal, t = phys2d__perp(n);
@@ -22928,9 +23144,9 @@ static void phys2d__solve_contacts(phys2d_world& w, float inv_h, float push_rate
 // Done here rather than as a bias so a speculative point never bounces a body
 // off a surface it was not going to reach.
 static void phys2d__restitution(phys2d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle || c.restitution <= 0.0f) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
+        if (c.restitution <= 0.0f) continue;
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         for (int k = 0; k < c.count; k++) {
@@ -22952,7 +23168,11 @@ static void phys2d__step(phys2d_world& w, float dt) {
     // wake what the game touched, then bounds swept along the motion for the broadphase
     for (size_t i = 0; i < w.body_count; i++) {
         phys2d_body& b = w.bodies[i];
-        if (!b.active) continue;
+        if (!b.active) {
+            if (w.grid_kinds[i] == PHYS2D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = 0xFF;
+            continue;
+        }
         if (b.sleeping) {
             // the game moved it, gave it a velocity or pushed it: wake up
             bool moved = b.position.x != b.prev_position.x || b.position.y != b.prev_position.y || b.angle != b.prev_angle;
@@ -22964,6 +23184,19 @@ static void phys2d__step(phys2d_world& w, float dt) {
         b.prev_angle = b.angle;
         b.delta_rot = v2(1.0f, 0.0f);
         if (!b.sleeping) b.on_ground = false;
+        uint8_t kind = (uint8_t)phys2d__grid_kind(b);
+        if (kind != w.grid_kinds[i]) {
+            if (kind == PHYS2D__GRID_RESTING || w.grid_kinds[i] == PHYS2D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = kind;
+        }
+        // a static or sleeping body that has not moved or changed keeps its shape and bounds
+        if (b.type == PHYS2D_STATIC || b.sleeping) {
+            if (phys2d__key_holds(w.poly_keys[i], b, w.speculative)) continue;
+            phys2d__make_key(b, w.speculative, w.poly_keys[i]);
+            if (b.sleeping) w.resting_dirty = true;
+        } else {
+            w.poly_keys[i].type = 0xFF;
+        }
         phys2d__poly& p = w.polys[i];
         phys2d__make_poly(b.shape, b.position, b.angle, p);
         rect2 r = phys2d__poly_bounds(p);
@@ -22980,8 +23213,10 @@ static void phys2d__step(phys2d_world& w, float dt) {
         r.max = v2(r.max.x + maxf(move.x, 0.0f), r.max.y + maxf(move.y, 0.0f)) + pad;
         b.bounds = r;
     }
-    if (w.statics_dirty) { phys2d__build_grid(w, w.static_grid, true); w.statics_dirty = false; }
-    phys2d__build_grid(w, w.moving_grid, false);
+    if (w.statics_dirty) { phys2d__build_grid(w, w.static_grid, PHYS2D__GRID_STATIC); w.statics_dirty = false; }
+    phys2d__build_grid(w, w.moving_grid, PHYS2D__GRID_MOVING);
+    // sleepers do not move: their grid stands until one wakes, sleeps or changes
+    if (w.resting_dirty) { phys2d__build_grid(w, w.resting_grid, PHYS2D__GRID_RESTING); w.resting_dirty = false; }
 
     // last step's contacts become the warm-start / event reference
     phys2d_contact* t = w.prev_contacts; w.prev_contacts = w.contacts; w.contacts = t;
@@ -23009,10 +23244,16 @@ static void phys2d__step(phys2d_world& w, float dt) {
     int substeps = w.substeps > 0 ? w.substeps : 1;
     float h = dt / substeps, inv_h = 1.0f / h;
     float push_rate = w.correction / dt;     // the same correction per second at any substep count
+    // the substeps visit only what moves: a mostly sleeping world is not walked eight times a step
+    w.awake_count = 0;
+    for (size_t i = 0; i < w.body_count; i++) {
+        const phys2d_body& b = w.bodies[i];
+        if (b.active && b.type != PHYS2D_STATIC && !b.sleeping) w.awake_bodies[w.awake_count++] = (uint32_t)i;
+    }
     for (int sub = 0; sub < substeps; sub++) {
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys2d_body& b = w.bodies[i];
-            if (!b.active || b.type != PHYS2D_DYNAMIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys2d_body& b = w.bodies[w.awake_bodies[k]];
+            if (b.type != PHYS2D_DYNAMIC) continue;
             b.velocity += (w.gravity * b.gravity_scale + b.force * b.inv_mass) * h;
             b.angular_velocity += b.torque * b.inv_inertia * h;
             b.velocity *= 1.0f / (1.0f + h * b.linear_damping);
@@ -23026,9 +23267,8 @@ static void phys2d__step(phys2d_world& w, float dt) {
             phys2d__joints_solve(w, h, true);
             phys2d__solve_contacts(w, inv_h, push_rate);
         }
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys2d_body& b = w.bodies[i];
-            if (!b.active || b.type == PHYS2D_STATIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys2d_body& b = w.bodies[w.awake_bodies[k]];
             b.position += b.velocity * h;
             b.angle += b.angular_velocity * h;
             float turned = b.angle - b.prev_angle;
@@ -23083,7 +23323,7 @@ int phys2d_update(phys2d_world& w, float frame_dt) {
 
 // ---- queries ----
 
-// every body whose bounds overlap `r`, from both grids, each reported once
+// every body whose bounds overlap `r`, from all three grids, each reported once
 template <typename F>
 static void phys2d__query_rect(phys2d_world& w, rect2 r, F&& visit) {
     float inv = 1.0f / w.cell_size;
@@ -23096,13 +23336,13 @@ static void phys2d__query_rect(phys2d_world& w, rect2 r, F&& visit) {
             phys2d__make_poly(b.shape, b.position, b.angle, p);
             b.bounds = phys2d__poly_bounds(p);
         }
-        phys2d__build_grid(w, w.static_grid, true);
+        phys2d__build_grid(w, w.static_grid, PHYS2D__GRID_STATIC);
         w.statics_dirty = false;
     }
     int32_t x0 = phys2d__cell(r.min.x, inv), x1 = phys2d__cell(r.max.x, inv);
     int32_t y0 = phys2d__cell(r.min.y, inv), y1 = phys2d__cell(r.max.y, inv);
-    const phys2d__grid* grids[2] = { &w.static_grid, &w.moving_grid };
-    for (int g = 0; g < 2; g++) {
+    const phys2d__grid* grids[3] = { &w.static_grid, &w.moving_grid, &w.resting_grid };
+    for (int g = 0; g < 3; g++) {
         if (!grids[g]->items) continue;
         for (int32_t y = y0; y <= y1; y++)
             for (int32_t x = x0; x <= x1; x++) {
@@ -24364,6 +24604,13 @@ struct phys3d__poly_view {
 static thread_local vec3  phys3d__pv_verts[2][PHYS3D_MAX_HULL_VERTICES];
 static thread_local vec3  phys3d__pv_norms[2][2 * PHYS3D_MAX_HULL_VERTICES];
 static thread_local float phys3d__pv_offs[2][2 * PHYS3D_MAX_HULL_VERTICES];
+// which hull pose each slot holds: a hull meeting a mesh is tested against
+// triangle after triangle in the same pose, and is turned into world space once
+// (only within one mesh pair, phys3d__narrowphase's triangle loop, so nothing
+// rebuilt in between can be mistaken for what was held)
+struct phys3d__pv_pose { const phys3d_hull* hull; vec3 centre; quat q; };
+static thread_local phys3d__pv_pose phys3d__pv_held[2];
+static thread_local bool phys3d__pv_reuse;
 
 // a box's faces in phys3d__face's order (+x, -x, +y, -y, +z, -z) and its edges
 static int phys3d__box_fstart[7];
@@ -24403,13 +24650,19 @@ static void phys3d__box_tables() {
 static phys3d__poly_view phys3d__make_view(const phys3d__core& c, int slot) {
     phys3d__poly_view v = {};
     v.centre = c.centre;
+    phys3d__pv_pose& held = phys3d__pv_held[slot];
     if (c.kind == PHYS3D__HULL) {
         const phys3d_hull& h = *c.hull;
-        for (int i = 0; i < h.vertex_count; i++) phys3d__pv_verts[slot][i] = c.centre + quat_rotate(c.q, h.vertices[i]);
-        for (int f = 0; f < h.face_count; f++) {
-            vec3 n = quat_rotate(c.q, v3(h.planes[f].x, h.planes[f].y, h.planes[f].z));
-            phys3d__pv_norms[slot][f] = n;
-            phys3d__pv_offs[slot][f] = h.planes[f].w + v3dot(n, c.centre);
+        bool same = phys3d__pv_reuse && held.hull == c.hull && !memcmp(&held.centre, &c.centre, sizeof(vec3))
+                 && !memcmp(&held.q, &c.q, sizeof(quat));
+        if (!same) {
+            for (int i = 0; i < h.vertex_count; i++) phys3d__pv_verts[slot][i] = c.centre + quat_rotate(c.q, h.vertices[i]);
+            for (int f = 0; f < h.face_count; f++) {
+                vec3 n = quat_rotate(c.q, v3(h.planes[f].x, h.planes[f].y, h.planes[f].z));
+                phys3d__pv_norms[slot][f] = n;
+                phys3d__pv_offs[slot][f] = h.planes[f].w + v3dot(n, c.centre);
+            }
+            held.hull = c.hull; held.centre = c.centre; held.q = c.q;
         }
         v.v = phys3d__pv_verts[slot]; v.nv = h.vertex_count;
         v.n = phys3d__pv_norms[slot]; v.d = phys3d__pv_offs[slot]; v.nf = h.face_count;
@@ -24417,6 +24670,7 @@ static phys3d__poly_view phys3d__make_view(const phys3d__core& c, int slot) {
         v.e = h.edges; v.ne = h.edge_count;
         v.prune = true;
     } else if (c.kind == PHYS3D__BOX) {
+        held.hull = 0;      // the slot's normals are about to be a box's
         phys3d__box_tables();
         const float hh[3] = { c.half.x, c.half.y, c.half.z };
         for (int f = 0; f < 6; f++) {
@@ -24430,6 +24684,7 @@ static phys3d__poly_view phys3d__make_view(const phys3d__core& c, int slot) {
         v.e = phys3d__box_edges; v.ne = 12;
         v.prune = true;
     } else {   // triangle: its front only
+        held.hull = 0;
         phys3d__pv_norms[slot][0] = c.axis[0];
         phys3d__pv_offs[slot][0] = v3dot(c.axis[0], c.v[0]);
         v.v = c.v; v.nv = 3;
@@ -24479,6 +24734,8 @@ static int phys3d__collide_views(const phys3d__poly_view& A, const phys3d__poly_
     vec3 edge_axis = v3(0, 1, 0);
     bool prune = A.prune && B.prune;
     vec3 dcent = B.centre - A.centre;
+    // faces win near-ties, as for boxes: no flicker between a face and an edge normal
+    float face_best = maxf(sep_a, sep_b), edge_needs = face_best + 0.5f * slop;
     for (int i = 0; i < A.ne; i++) {
         const phys3d_hull_edge& ea = A.e[i];
         vec3 pa = A.v[ea.v0], da = A.v[ea.v1] - pa;
@@ -24499,6 +24756,12 @@ static int phys3d__collide_views(const phys3d__poly_view& A, const phys3d__poly_
                 if (v3dot(ax, dcent) < 0.0f) ax = -ax;
                 float amax = -1e30f, bmin = 1e30f;
                 for (int k = 0; k < A.nv; k++) amax = maxf(amax, v3dot(ax, A.v[k]));
+                // B's edge ends bound the gap from above (no corner of B lies
+                // below them). If that cannot beat the best edge so far, or
+                // win over the faces and cross the margin, projecting all of
+                // B would change nothing. (A is the triangle when there is one.)
+                float bound = minf(v3dot(ax, pb), v3dot(ax, B.v[eb.v1])) - amax;
+                if (bound <= sep_e || (bound <= edge_needs && bound <= margin)) continue;
                 for (int k = 0; k < B.nv; k++) bmin = minf(bmin, v3dot(ax, B.v[k]));
                 s = bmin - amax;
             }
@@ -24506,9 +24769,7 @@ static int phys3d__collide_views(const phys3d__poly_view& A, const phys3d__poly_
             if (s > sep_e) { sep_e = s; edge_i = i; edge_j = j; edge_axis = ax; }
         }
     }
-    // faces win near-ties, as for boxes: no flicker between a face and an edge normal
-    float face_best = maxf(sep_a, sep_b);
-    if (edge_i >= 0 && sep_e > face_best + 0.5f * slop) {
+    if (edge_i >= 0 && sep_e > edge_needs) {
         vec3 ca, cb;
         closest_points_segments(A.v[A.e[edge_i].v0], A.v[A.e[edge_i].v1], B.v[B.e[edge_j].v0], B.v[B.e[edge_j].v1], &ca, &cb);
         m.normal = edge_axis;
@@ -24615,13 +24876,66 @@ static void phys3d__compute_mass(phys3d_body& b) {
         b.inv_inertia_local = mat3_inverse(inertia);
 }
 
-// R * M * R^T: a body's inverse inertia turned into world space
+// R * M * R^T: a body's inverse inertia turned into world space. Runs for
+// every moving body every substep, so the common cases skip the two full
+// matrix products: spheres (and bodies that cannot turn) are the same in every
+// frame, and boxes and capsules - diagonal M - need only the symmetric half of
+// sum_k M_kk * R_k * R_k^T.
 static inline void phys3d__update_inertia(phys3d_body& b) {
+    const float* m = b.inv_inertia_local.data;
+    bool diagonal = m[1] == 0.0f && m[2] == 0.0f && m[3] == 0.0f && m[5] == 0.0f && m[6] == 0.0f && m[7] == 0.0f;
+    if (diagonal && m[0] == m[4] && m[0] == m[8]) { b.inv_inertia = b.inv_inertia_local; return; }
     mat3 r = mat3_from_quat(b.rotation);
-    b.inv_inertia = r * b.inv_inertia_local * mat3_transpose(r);
+    if (!diagonal) { b.inv_inertia = r * b.inv_inertia_local * mat3_transpose(r); return; }
+    const float* c = r.data;       // column k is c[3k .. 3k + 2]
+    float* o = b.inv_inertia.data;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j <= i; j++)
+            o[j * 3 + i] = o[i * 3 + j] = m[0] * c[i] * c[j] + m[4] * c[3 + i] * c[3 + j] + m[8] * c[6 + i] * c[6 + j];
 }
 
 // ---- world ----
+
+// What a static or sleeping body's bounds were last computed from. While all
+// of it still holds, the bounds are what they were and the step skips them:
+// most of a level is static, and most of a settled pile asleep. Compared bit
+// for bit, so any change at all - pose, shape, a mesh rebuilt in place -
+// recomputes.
+struct phys3d__bounds_key {
+    phys3d_shape shape;        // a byte copy of the body's
+    aabb    part_bounds;       // a mesh's, hull's or compound's own bounds
+    vec3    position;
+    quat    rotation;
+    float   pad;               // the speculative margin around a sleeping body
+    uint8_t type;              // PHYS3D_*; 0xFF = nothing cached
+    bool    sleeping;
+};
+
+static inline aabb phys3d__part_bounds(const phys3d_shape& s) {
+    if (s.type == PHYS3D_MESH) return s.mesh->bounds;
+    if (s.type == PHYS3D_HULL) return s.hull->bounds;
+    if (s.type == PHYS3D_COMPOUND) return s.compound->bounds;
+    aabb none = {};
+    return none;
+}
+
+static void phys3d__make_key(const phys3d_body& b, float pad, phys3d__bounds_key& k) {
+    memcpy(&k.shape, &b.shape, sizeof(phys3d_shape));
+    k.part_bounds = phys3d__part_bounds(b.shape);
+    k.position = b.position;
+    k.rotation = b.rotation;
+    k.pad = pad;
+    k.type = b.type;
+    k.sleeping = b.sleeping;
+}
+
+static bool phys3d__key_holds(const phys3d__bounds_key& k, const phys3d_body& b, float pad) {
+    if (k.type != b.type || k.sleeping != b.sleeping || memcmp(&k.pad, &pad, sizeof(float))) return false;
+    if (memcmp(&k.position, &b.position, sizeof(vec3)) || memcmp(&k.rotation, &b.rotation, sizeof(quat))) return false;
+    if (memcmp(&k.shape, &b.shape, sizeof(phys3d_shape))) return false;
+    aabb pb = phys3d__part_bounds(b.shape);
+    return !memcmp(&k.part_bounds, &pb, sizeof(aabb));
+}
 
 void phys3d_create_world(phys3d_world& w) {
     memset(&w, 0, sizeof(w));
@@ -24650,14 +24964,20 @@ void phys3d_create_world(phys3d_world& w) {
     w.bodies       = pix_alloc<phys3d_body>(PHYS3D_MAX_BODIES);
     w.free_ids     = pix_alloc<idx>(PHYS3D_MAX_BODIES);
     w.pending_free = pix_alloc<idx>(PHYS3D_MAX_BODIES);
+    w.awake_bodies = pix_alloc<uint32_t>(PHYS3D_MAX_BODIES);
     w.oversize     = pix_alloc<idx>(PHYS3D_MAX_BODIES);
     w.joints       = pix_alloc<phys3d_joint>(PHYS3D_MAX_JOINTS);
     w.free_joints  = pix_alloc<idx>(PHYS3D_MAX_JOINTS);
     w.island       = pix_alloc<uint32_t>(PHYS3D_MAX_BODIES);
     w.island_sleep = pix_alloc<float>(PHYS3D_MAX_BODIES);
     w.island_awake = pix_alloc<uint8_t>(PHYS3D_MAX_BODIES);
-    w.static_grid.start = pix_alloc<uint32_t>(PHYS3D_GRID_BUCKETS + 1);
-    w.moving_grid.start = pix_alloc<uint32_t>(PHYS3D_GRID_BUCKETS + 1);
+    w.bounds_keys  = pix_alloc<phys3d__bounds_key>(PHYS3D_MAX_BODIES);
+    w.grid_kinds   = pix_alloc<uint8_t>(PHYS3D_MAX_BODIES);
+    memset(w.grid_kinds, 0xFF, PHYS3D_MAX_BODIES);
+    w.resting_dirty = true;
+    w.static_grid.start  = pix_alloc<uint32_t>(PHYS3D_GRID_BUCKETS + 1);
+    w.moving_grid.start  = pix_alloc<uint32_t>(PHYS3D_GRID_BUCKETS + 1);
+    w.resting_grid.start = pix_alloc<uint32_t>(PHYS3D_GRID_BUCKETS + 1);
 }
 
 void phys3d_destroy_world(phys3d_world& w) {
@@ -24670,12 +24990,18 @@ void phys3d_destroy_world(phys3d_world& w) {
     pix_free(w.island);
     pix_free(w.island_sleep);
     pix_free(w.island_awake);
+    pix_free(w.bounds_keys);
+    pix_free(w.grid_kinds);
     pix_free(w.static_grid.start);
     pix_free(w.static_grid.items);
     pix_free(w.moving_grid.start);
     pix_free(w.moving_grid.items);
+    pix_free(w.resting_grid.start);
+    pix_free(w.resting_grid.items);
     pix_free(w.contacts);
     pix_free(w.prev_contacts);
+    pix_free(w.active_contacts);
+    pix_free(w.awake_bodies);
     pix_free(w.prev_table);
     pix_free(w.events);
     memset(&w, 0, sizeof(w));
@@ -24730,6 +25056,7 @@ idx phys3d_add_body(phys3d_world& w, const phys3d_body& body) {
     b.delta_rot = quat_identity();
     phys3d__compute_mass(b);
     phys3d__update_inertia(b);
+    w.bounds_keys[id].type = 0xFF;
     w.statics_dirty = true;     // the oversize list may change too
     return id;
 }
@@ -24996,15 +25323,22 @@ static phys3d__soft phys3d__make_soft(float hertz, float zeta, float h) {
     return s;
 }
 
+// Static and kinematic bodies have no inverse mass or inertia, so an impulse
+// would leave them as they are: skipped rather than computed as zero. Half of
+// every contact with the ground, and every joint to the world, is that case.
 static inline void phys3d__apply_at(phys3d_body& A, phys3d_body& B, vec3 ra, vec3 rb, vec3 P) {
-    A.velocity -= P * A.inv_mass;
-    A.angular_velocity -= A.inv_inertia * v3cross(ra, P);
-    B.velocity += P * B.inv_mass;
-    B.angular_velocity += B.inv_inertia * v3cross(rb, P);
+    if (A.type == PHYS3D_DYNAMIC) {
+        A.velocity -= P * A.inv_mass;
+        A.angular_velocity -= A.inv_inertia * v3cross(ra, P);
+    }
+    if (B.type == PHYS3D_DYNAMIC) {
+        B.velocity += P * B.inv_mass;
+        B.angular_velocity += B.inv_inertia * v3cross(rb, P);
+    }
 }
 static inline void phys3d__apply_angular(phys3d_body& A, phys3d_body& B, vec3 L) {
-    A.angular_velocity -= A.inv_inertia * L;
-    B.angular_velocity += B.inv_inertia * L;
+    if (A.type == PHYS3D_DYNAMIC) A.angular_velocity -= A.inv_inertia * L;
+    if (B.type == PHYS3D_DYNAMIC) B.angular_velocity += B.inv_inertia * L;
 }
 // one constraint row: linear part `lin`, angular parts angA (on a) and angB (on b)
 static inline void phys3d__apply_row(phys3d_body& A, phys3d_body& B, vec3 lin, vec3 angA, vec3 angB, float imp) {
@@ -25553,7 +25887,12 @@ static void phys3d__islands_sleep(phys3d_world& w, float dt) {
 
 // ---- broadphase ----
 
-static inline int32_t phys3d__cell(float x, float inv) { return (int32_t)floorf(x * inv); }
+// floorf without the library call (MSVC makes one): truncate, then step down for negatives
+static inline int32_t phys3d__cell(float x, float inv) {
+    float f = x * inv;
+    int32_t i = (int32_t)f;
+    return i - (f < (float)i);
+}
 static inline uint32_t phys3d__bucket(int32_t x, int32_t y, int32_t z) {
     return ((uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u ^ (uint32_t)z * 83492791u) & (PHYS3D_GRID_BUCKETS - 1);
 }
@@ -25565,8 +25904,16 @@ static bool phys3d__is_oversize(const phys3d_world& w, const phys3d_body& b) {
     return (e.x + 1.0f) * (e.y + 1.0f) * (e.z + 1.0f) > (float)PHYS3D_OVERSIZE_CELLS;
 }
 
-// every body for which statics == (type is static), and not oversize
-static void phys3d__build_grid(phys3d_world& w, phys3d__grid& g, bool statics) {
+#define PHYS3D__GRID_STATIC  0
+#define PHYS3D__GRID_MOVING  1   // awake dynamic and every kinematic body
+#define PHYS3D__GRID_RESTING 2   // sleeping dynamic bodies
+
+static inline int phys3d__grid_kind(const phys3d_body& b) {
+    return b.type == PHYS3D_STATIC ? PHYS3D__GRID_STATIC : (b.sleeping ? PHYS3D__GRID_RESTING : PHYS3D__GRID_MOVING);
+}
+
+// every active, not oversize body of one grid kind
+static void phys3d__build_grid(phys3d_world& w, phys3d__grid& g, int kind) {
     float inv = 1.0f / w.cell_size;
     uint32_t* start = g.start;
     memset(start, 0, (PHYS3D_GRID_BUCKETS + 1) * sizeof(uint32_t));
@@ -25580,7 +25927,7 @@ static void phys3d__build_grid(phys3d_world& w, phys3d__grid& g, bool statics) {
         }
         for (size_t i = 0; i < w.body_count; i++) {
             const phys3d_body& b = w.bodies[i];
-            if (!b.active || b.oversize || (b.type == PHYS3D_STATIC) != statics) continue;
+            if (!b.active || b.oversize || phys3d__grid_kind(b) != kind) continue;
             int32_t x0 = phys3d__cell(b.bounds.min.x, inv), x1 = phys3d__cell(b.bounds.max.x, inv);
             int32_t y0 = phys3d__cell(b.bounds.min.y, inv), y1 = phys3d__cell(b.bounds.max.y, inv);
             int32_t z0 = phys3d__cell(b.bounds.min.z, inv), z1 = phys3d__cell(b.bounds.max.z, inv);
@@ -25590,7 +25937,7 @@ static void phys3d__build_grid(phys3d_world& w, phys3d__grid& g, bool statics) {
                         uint32_t bk = phys3d__bucket(x, y, z);
                         if (pass == 0) { start[bk]++; total++; continue; }
                         phys3d__cell_item& it = g.items[start[bk]++];
-                        it.cx = x; it.cy = y; it.cz = z; it.body = (idx)i;
+                        it.cx = x; it.cy = y; it.cz = z; it.body = (idx)i; it.bounds = b.bounds;
                     }
         }
     }
@@ -25693,28 +26040,49 @@ static void phys3d__finish_contact(phys3d_world& w, phys3d_contact& c, idx ia, i
     }
 }
 
+// can these two (a < b) have contacts at all
+static inline bool phys3d__pair_wanted(const phys3d_world& w, idx ia, idx ib, const phys3d_body& a, const phys3d_body& b) {
+    if (!phys3d__layers_ok(a, b)) return false;
+    if (a.trigger && b.trigger) return false;
+    if (!a.trigger && !b.trigger && a.type != PHYS3D_DYNAMIC && b.type != PHYS3D_DYNAMIC) return false;
+    if (!aabb_overlap(a.bounds, b.bounds)) return false;
+    return !(a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys3d__joined(w, ia, ib));
+}
+
+// Pairs where neither body moved (asleep, static, a kinematic at rest) keep
+// last step's contacts as they were. They are taken straight from that list
+// rather than found again through the grids, so a settled pile costs a copy,
+// not a broadphase - and sleeping bodies never need pairing with each other.
+static void phys3d__carry_idle_contacts(phys3d_world& w) {
+    size_t k = 0;
+    while (k < w.prev_count) {
+        idx ia = w.prev_contacts[k].a, ib = w.prev_contacts[k].b;
+        size_t end = k + 1;
+        while (end < w.prev_count && w.prev_contacts[end].a == ia && w.prev_contacts[end].b == ib) end++;
+        const phys3d_body& a = w.bodies[ia];
+        const phys3d_body& b = w.bodies[ib];
+        if (a.active && b.active && phys3d__idle(a) && phys3d__idle(b) && phys3d__pair_wanted(w, ia, ib, a, b)) {
+            phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + (end - k));
+            memcpy(w.contacts + w.contact_count, w.prev_contacts + k, (end - k) * sizeof(phys3d_contact));
+            for (size_t i = 0; i < end - k; i++) {
+                phys3d_contact& c = w.contacts[w.contact_count + i];
+                c.prev = i == 0 ? (uint32_t)k : 0xFFFFFFFFu;
+                c.persisted = false;
+            }
+            w.contact_count += end - k;
+        }
+        k = end;
+    }
+}
+
 static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
     if (ia > ib) { idx t = ia; ia = ib; ib = t; }
     phys3d_body& a = w.bodies[ia];
     phys3d_body& b = w.bodies[ib];
-    if (!phys3d__layers_ok(a, b)) return;
+    if (phys3d__idle(a) && phys3d__idle(b)) return;    // phys3d__carry_idle_contacts has it
+    if (!phys3d__pair_wanted(w, ia, ib, a, b)) return;
     bool trigger = a.trigger || b.trigger;
-    if (a.trigger && b.trigger) return;
-    if (!trigger && a.type != PHYS3D_DYNAMIC && b.type != PHYS3D_DYNAMIC) return;
-    if (!aabb_overlap(a.bounds, b.bounds)) return;
-    if (a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys3d__joined(w, ia, ib)) return;
     uint32_t prev = phys3d__find_prev(w, ia, ib);
-    if (phys3d__idle(a) && phys3d__idle(b)) {
-        // nothing moved: keep last step's contacts for the pair as they were
-        for (uint32_t k = prev; k != 0xFFFFFFFFu && k < w.prev_count && w.prev_contacts[k].a == ia && w.prev_contacts[k].b == ib; k++) {
-            phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
-            phys3d_contact& c = w.contacts[w.contact_count++];
-            c = w.prev_contacts[k];
-            c.prev = k == prev ? prev : 0xFFFFFFFFu;
-            c.persisted = false;
-        }
-        return;
-    }
     // linear only: a turning body is caught by the continuous pass (a speculative
     // margin wide enough for rotation makes contact points far from the real touch, and those fling)
     float margin = trigger ? 0.0f : w.speculative + v3len(b.velocity - a.velocity) * dt;
@@ -25735,13 +26103,28 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
             box.min = v3min(box.min, l); box.max = v3max(box.max, l);
         }
         bool first = true;
+        // the other body's parts are the same for every triangle: built once
+        // (unless it is a compound of more than a few)
+        const int max_parts = 8;
+        phys3d__core parts[max_parts];
+        int part_count = 0;
+        if (other.shape.type != PHYS3D_COMPOUND || other.shape.compound->count <= max_parts)
+            phys3d__for_each_core(other.shape, other.position, other.rotation, [&](const phys3d__core& oc, uint32_t) {
+                parts[part_count++] = oc;
+            });
+        auto each_part = [&](auto&& visit) {
+            if (part_count) for (int i = 0; i < part_count; i++) visit(parts[i], (uint32_t)i);
+            else phys3d__for_each_core(other.shape, other.position, other.rotation, visit);
+        };
+        phys3d__pv_held[0].hull = phys3d__pv_held[1].hull = 0;
+        phys3d__pv_reuse = true;
         phys3d__mesh_query(mesh, box, [&](uint32_t t) {
             vec3 v0 = mesh_body->position + quat_rotate(mesh_body->rotation, mesh.vertices[mesh.indices[t * 3]]);
             vec3 v1 = mesh_body->position + quat_rotate(mesh_body->rotation, mesh.vertices[mesh.indices[t * 3 + 1]]);
             vec3 v2 = mesh_body->position + quat_rotate(mesh_body->rotation, mesh.vertices[mesh.indices[t * 3 + 2]]);
             phys3d__core tri;
             phys3d__triangle_core(v0, v1, v2, tri);
-            phys3d__for_each_core(other.shape, other.position, other.rotation, [&](const phys3d__core& oc, uint32_t part) {
+            each_part([&](const phys3d__core& oc, uint32_t part) {
                 // one-sided: a body behind the surface passes through rather than snagging
                 if (v3dot(oc.centre - v0, tri.axis[0]) < 0.0f) return;
                 phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
@@ -25758,6 +26141,7 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
                 w.contact_count++;
             });
         });
+        phys3d__pv_reuse = false;
         return;
     }
     // a manifold per pair of parts (one pair unless a compound is involved)
@@ -25778,52 +26162,68 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
     });
 }
 
+// Does `box` lie wholly on the open side of a plane body? Then it cannot
+// touch it: the bounds already hold the speculative margin and the step's
+// motion, the same allowance every other pair gets from its bounds test.
+static inline bool phys3d__above_plane(const phys3d_body& p, const aabb& box) {
+    vec3 n = quat_rotate(p.rotation, p.shape.normal);
+    vec3 c = (box.min + box.max) * 0.5f, e = (box.max - box.min) * 0.5f;
+    return v3dot(n, c - p.position) - (fabsf(n.x) * e.x + fabsf(n.y) * e.y + fabsf(n.z) * e.z) > 0.0f;
+}
+
 static void phys3d__find_contacts(phys3d_world& w, float dt) {
     float inv = 1.0f / w.cell_size;
     const phys3d__grid& mg = w.moving_grid;
-    const phys3d__grid& sg = w.static_grid;
     for (int bk = 0; bk < PHYS3D_GRID_BUCKETS; bk++)
-        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++)
+        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++) {
+            const phys3d__cell_item& p = mg.items[i];
             for (uint32_t j = i + 1; j < mg.start[bk + 1]; j++) {
-                const phys3d__cell_item& p = mg.items[i];
                 const phys3d__cell_item& q = mg.items[j];
                 if (p.cx != q.cx || p.cy != q.cy || p.cz != q.cz) continue;
-                const aabb& ra = w.bodies[p.body].bounds;
-                const aabb& rb = w.bodies[q.body].bounds;
-                if (!aabb_overlap(ra, rb) || !phys3d__owns_pair(ra, rb, p.cx, p.cy, p.cz, inv)) continue;
+                if (!aabb_overlap(p.bounds, q.bounds) || !phys3d__owns_pair(p.bounds, q.bounds, p.cx, p.cy, p.cz, inv)) continue;
                 phys3d__narrowphase(w, p.body, q.body, dt);
             }
+        }
+    // each moving body looked up among the statics and the sleepers
+    const phys3d__grid* others[2] = { &w.static_grid, &w.resting_grid };
     for (size_t i = 0; i < w.body_count; i++) {
         const phys3d_body& b = w.bodies[i];
-        if (!b.active || b.type == PHYS3D_STATIC || b.oversize) continue;
+        if (!b.active || phys3d__grid_kind(b) != PHYS3D__GRID_MOVING || b.oversize) continue;
         int32_t x0 = phys3d__cell(b.bounds.min.x, inv), x1 = phys3d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys3d__cell(b.bounds.min.y, inv), y1 = phys3d__cell(b.bounds.max.y, inv);
         int32_t z0 = phys3d__cell(b.bounds.min.z, inv), z1 = phys3d__cell(b.bounds.max.z, inv);
-        for (int32_t z = z0; z <= z1; z++)
-            for (int32_t y = y0; y <= y1; y++)
-                for (int32_t x = x0; x <= x1; x++) {
-                    uint32_t bk = phys3d__bucket(x, y, z);
-                    for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
-                        const phys3d__cell_item& it = sg.items[k];
-                        if (it.cx != x || it.cy != y || it.cz != z) continue;
-                        const aabb& rs = w.bodies[it.body].bounds;
-                        if (!aabb_overlap(b.bounds, rs) || !phys3d__owns_pair(b.bounds, rs, x, y, z, inv)) continue;
-                        phys3d__narrowphase(w, (idx)i, it.body, dt);
+        for (int g = 0; g < 2; g++) {
+            const phys3d__grid& sg = *others[g];
+            if (!sg.count) continue;
+            for (int32_t z = z0; z <= z1; z++)
+                for (int32_t y = y0; y <= y1; y++)
+                    for (int32_t x = x0; x <= x1; x++) {
+                        uint32_t bk = phys3d__bucket(x, y, z);
+                        for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
+                            const phys3d__cell_item& it = sg.items[k];
+                            if (it.cx != x || it.cy != y || it.cz != z) continue;
+                            if (!aabb_overlap(b.bounds, it.bounds) || !phys3d__owns_pair(b.bounds, it.bounds, x, y, z, inv)) continue;
+                            phys3d__narrowphase(w, (idx)i, it.body, dt);
+                        }
                     }
-                }
+        }
     }
     // oversize bodies (planes, level meshes) against everything that could touch them
     for (size_t o = 0; o < w.oversize_count; o++) {
         idx big = w.oversize[o];
         const phys3d_body& g = w.bodies[big];
+        bool plane = g.shape.type == PHYS3D_PLANE && phys3d__idle(g);   // a moving plane sweeps: no shortcut
         for (size_t i = 0; i < w.body_count; i++) {
             const phys3d_body& b = w.bodies[i];
             if (!b.active || (idx)i == big) continue;
             if (b.oversize && (idx)i < big) continue;       // that pair is handled from the other side
             if (g.type != PHYS3D_DYNAMIC && b.type == PHYS3D_STATIC) continue;
+            if (phys3d__idle(g) && phys3d__idle(b)) continue;
+            if (plane && !b.oversize && phys3d__above_plane(g, b.bounds)) continue;
             phys3d__narrowphase(w, big, (idx)i, dt);
         }
     }
+    phys3d__carry_idle_contacts(w);
 }
 
 // Begin / end events per body pair, however many triangles it touched.
@@ -25884,12 +26284,15 @@ static void phys3d__report(phys3d_world& w) {
 // ---- solver (substepped, as in 2D) ----
 
 static void phys3d__prepare_contacts(phys3d_world& w) {
+    phys3d__reserve(w.active_contacts, w.active_capacity, w.contact_count);
+    w.active_count = 0;
     for (size_t i = 0; i < w.contact_count; i++) {
         phys3d_contact& c = w.contacts[i];
         phys3d_body& a = w.bodies[c.a];
         phys3d_body& b = w.bodies[c.b];
         c.idle = c.trigger || (phys3d__idle(a) && phys3d__idle(b));
         if (c.idle) continue;
+        w.active_contacts[w.active_count++] = (uint32_t)i;
         for (int k = 0; k < c.count; k++) {
             phys3d_contact_point& p = c.points[k];
             p.ra = p.point - a.position;
@@ -25915,9 +26318,8 @@ static inline vec3 phys3d__point_speed(const phys3d_body& a, const phys3d_body& 
 }
 
 static void phys3d__warm_contacts(phys3d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys3d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys3d_contact& c = w.contacts[w.active_contacts[ci]];
         for (int k = 0; k < c.count; k++) {
             const phys3d_contact_point& p = c.points[k];
             vec3 P = c.normal * p.normal_impulse + c.tangent[0] * p.tangent_impulse[0] + c.tangent[1] * p.tangent_impulse[1];
@@ -25933,9 +26335,8 @@ static inline float phys3d__separation(const phys3d_body& a, const phys3d_body& 
 }
 
 static void phys3d__solve_contacts(phys3d_world& w, float inv_h, float push_rate) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys3d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys3d_contact& c = w.contacts[w.active_contacts[ci]];
         phys3d_body& a = w.bodies[c.a];
         phys3d_body& b = w.bodies[c.b];
         if (c.rolling > 0.0f) {
@@ -25989,9 +26390,9 @@ static void phys3d__solve_contacts(phys3d_world& w, float inv_h, float push_rate
 }
 
 static void phys3d__restitution(phys3d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys3d_contact& c = w.contacts[i];
-        if (c.idle || c.restitution <= 0.0f) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys3d_contact& c = w.contacts[w.active_contacts[ci]];
+        if (c.restitution <= 0.0f) continue;
         phys3d_body& a = w.bodies[c.a];
         phys3d_body& b = w.bodies[c.b];
         for (int k = 0; k < c.count; k++) {
@@ -26013,8 +26414,9 @@ static void phys3d__rebuild_statics(phys3d_world& w) {
         b.oversize = phys3d__is_oversize(w, b);
         if (b.oversize) w.oversize[w.oversize_count++] = (idx)i;
     }
-    phys3d__build_grid(w, w.static_grid, true);
+    phys3d__build_grid(w, w.static_grid, PHYS3D__GRID_STATIC);
     w.statics_dirty = false;
+    w.resting_dirty = true;     // oversize flags may have changed
 }
 
 static aabb phys3d__body_bounds(const phys3d_body& b) {
@@ -26027,6 +26429,16 @@ static aabb phys3d__body_bounds(const phys3d_body& b) {
             r.min = v3min(r.min, p); r.max = v3max(r.max, p);
         }
         return r;
+    }
+    if (b.shape.type == PHYS3D_BOX) {
+        // the turned box's reach along each world axis, rather than eight corners
+        mat3 m = mat3_from_quat(b.rotation);
+        const float* d = m.data;
+        vec3 h = b.shape.half;
+        vec3 e = v3(fabsf(d[0]) * h.x + fabsf(d[3]) * h.y + fabsf(d[6]) * h.z,
+                    fabsf(d[1]) * h.x + fabsf(d[4]) * h.y + fabsf(d[7]) * h.z,
+                    fabsf(d[2]) * h.x + fabsf(d[5]) * h.y + fabsf(d[8]) * h.z);
+        return aabb_make(b.position - e, b.position + e);
     }
     aabb r = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
     phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& c, uint32_t) {
@@ -26067,7 +26479,11 @@ static void phys3d__step(phys3d_world& w, float dt) {
 
     for (size_t i = 0; i < w.body_count; i++) {
         phys3d_body& b = w.bodies[i];
-        if (!b.active) continue;
+        if (!b.active) {
+            if (w.grid_kinds[i] == PHYS3D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = 0xFF;
+            continue;
+        }
         if (b.sleeping) {
             bool moved = v3dot(b.position - b.prev_position, b.position - b.prev_position) > 0.0f ||
                          b.rotation.x != b.prev_rotation.x || b.rotation.y != b.prev_rotation.y ||
@@ -26080,6 +26496,19 @@ static void phys3d__step(phys3d_world& w, float dt) {
         b.prev_rotation = b.rotation;
         b.delta_rot = quat_identity();
         if (!b.sleeping) b.on_ground = false;
+        uint8_t kind = (uint8_t)phys3d__grid_kind(b);
+        if (kind != w.grid_kinds[i]) {
+            if (kind == PHYS3D__GRID_RESTING || w.grid_kinds[i] == PHYS3D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = kind;
+        }
+        // a static or sleeping body that has not moved or changed keeps its bounds
+        if (b.type == PHYS3D_STATIC || b.sleeping) {
+            if (phys3d__key_holds(w.bounds_keys[i], b, w.speculative)) continue;
+            phys3d__make_key(b, w.speculative, w.bounds_keys[i]);
+            if (b.sleeping) w.resting_dirty = true;
+        } else {
+            w.bounds_keys[i].type = 0xFF;
+        }
         aabb r = phys3d__body_bounds(b);
         if (b.type == PHYS3D_STATIC) {
             if (r.min.x != b.bounds.min.x || r.min.y != b.bounds.min.y || r.min.z != b.bounds.min.z ||
@@ -26096,7 +26525,9 @@ static void phys3d__step(phys3d_world& w, float dt) {
         b.bounds = r;
     }
     if (w.statics_dirty) phys3d__rebuild_statics(w);
-    phys3d__build_grid(w, w.moving_grid, false);
+    phys3d__build_grid(w, w.moving_grid, PHYS3D__GRID_MOVING);
+    // sleepers do not move: their grid stands until one wakes, sleeps or changes
+    if (w.resting_dirty) { phys3d__build_grid(w, w.resting_grid, PHYS3D__GRID_RESTING); w.resting_dirty = false; }
 
     phys3d_contact* t = w.prev_contacts; w.prev_contacts = w.contacts; w.contacts = t;
     size_t tc = w.prev_capacity; w.prev_capacity = w.contact_capacity; w.contact_capacity = tc;
@@ -26127,10 +26558,16 @@ static void phys3d__step(phys3d_world& w, float dt) {
     float h = dt / substeps, inv_h = 1.0f / h;
     float push_rate = w.correction / dt;
     float max_spin = 0.25f * PIX_PI * inv_h;     // Box2D's cap: a quarter turn per substep
+    // the substeps visit only what moves: a mostly sleeping world is not walked eight times a step
+    w.awake_count = 0;
+    for (size_t i = 0; i < w.body_count; i++) {
+        const phys3d_body& b = w.bodies[i];
+        if (b.active && b.type != PHYS3D_STATIC && !b.sleeping) w.awake_bodies[w.awake_count++] = (uint32_t)i;
+    }
     for (int sub = 0; sub < substeps; sub++) {
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys3d_body& b = w.bodies[i];
-            if (!b.active || b.type != PHYS3D_DYNAMIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys3d_body& b = w.bodies[w.awake_bodies[k]];
+            if (b.type != PHYS3D_DYNAMIC) continue;
             b.velocity += (w.gravity * b.gravity_scale + b.force * b.inv_mass) * h;
             b.angular_velocity += (b.inv_inertia * b.torque) * h;
             b.velocity *= 1.0f / (1.0f + h * b.linear_damping);
@@ -26143,9 +26580,8 @@ static void phys3d__step(phys3d_world& w, float dt) {
             phys3d__joints_solve(w, h, true);
             phys3d__solve_contacts(w, inv_h, push_rate);
         }
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys3d_body& b = w.bodies[i];
-            if (!b.active || b.type == PHYS3D_STATIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys3d_body& b = w.bodies[w.awake_bodies[k]];
             float spin = v3len(b.angular_velocity);
             if (spin > max_spin) b.angular_velocity *= max_spin / spin;
             b.position += b.velocity * h;
@@ -26223,8 +26659,8 @@ static void phys3d__query_box(phys3d_world& w, const aabb& r, F&& visit) {
     int32_t x0 = phys3d__cell(r.min.x, inv), x1 = phys3d__cell(r.max.x, inv);
     int32_t y0 = phys3d__cell(r.min.y, inv), y1 = phys3d__cell(r.max.y, inv);
     int32_t z0 = phys3d__cell(r.min.z, inv), z1 = phys3d__cell(r.max.z, inv);
-    const phys3d__grid* grids[2] = { &w.static_grid, &w.moving_grid };
-    for (int g = 0; g < 2; g++) {
+    const phys3d__grid* grids[3] = { &w.static_grid, &w.moving_grid, &w.resting_grid };
+    for (int g = 0; g < 3; g++) {
         if (!grids[g]->items) continue;
         for (int32_t z = z0; z <= z1; z++)
             for (int32_t y = y0; y <= y1; y++)
@@ -26486,9 +26922,9 @@ bool phys3d_raycast(phys3d_world& w, vec3 origin, vec3 direction, float max_dist
     float t_enter = 0.0f;
     // a body in many cells is tested many times; harmless, and cheaper than tracking
     for (int guard = 0; guard < 100000 && t_enter <= best; guard++) {
-        const phys3d__grid* grids[2] = { &w.static_grid, &w.moving_grid };
+        const phys3d__grid* grids[3] = { &w.static_grid, &w.moving_grid, &w.resting_grid };
         uint32_t bk = phys3d__bucket(c[0], c[1], c[2]);
-        for (int g = 0; g < 2; g++) {
+        for (int g = 0; g < 3; g++) {
             if (!grids[g]->items) continue;
             for (uint32_t k = grids[g]->start[bk]; k < grids[g]->start[bk + 1]; k++) {
                 const phys3d__cell_item& it = grids[g]->items[k];
@@ -27262,6 +27698,9 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
 
     obb2    self_box    = { v2xz(b.position), b.half, b.yaw };
     circle2 self_circle = { v2xz(b.position), b.radius };
+    // the body's square in XZ: a static whose bounds miss it cannot touch it
+    // (a rotated prop sits inside its bounds), so no shape test is needed
+    float sx0 = b.position.x - r, sx1 = b.position.x + r, sz0 = b.position.z - r, sz1 = b.position.z + r;
 
     for (int cz = cz0; cz <= cz1; cz++) {
         if (cz < 0 || cz >= w.grid_h) continue;
@@ -27270,6 +27709,7 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
             size_t cell = (size_t)cz * w.grid_w + cx;
             for (uint32_t k = w.cell_start[cell]; k < w.cell_start[cell + 1]; k++) {
                 const aabb& s = w.statics[w.cell_items[k]];
+                if (s.max.x < sx0 || s.min.x > sx1 || s.max.z < sz0 || s.min.z > sz1) continue;
 
                 // ledges, steps and doorsteps: low enough to walk straight over
                 if (aabb_height(s) <= w.step_height) continue;
@@ -27339,10 +27779,12 @@ static void phys3d_flat__resolve_statics(phys3d_flat_world& w, phys3d_flat_body&
 
 // ---- dynamic broadphase ----
 
-static uint32_t phys3d_flat__dyn_bucket(float x, float z) {
-    int cx = (int)floorf(x / PHYS3D_FLAT_CELL);
-    int cz = (int)floorf(z / PHYS3D_FLAT_CELL);
+static inline int phys3d_flat__dyn_cell(float x) { return (int)floorf(x / PHYS3D_FLAT_CELL); }
+static inline uint32_t phys3d_flat__cell_bucket(int cx, int cz) {
     return (uint32_t)((cx * 73856093) ^ (cz * 19349663)) & (PHYS3D_FLAT_DYN_BUCKETS - 1);
+}
+static uint32_t phys3d_flat__dyn_bucket(float x, float z) {
+    return phys3d_flat__cell_bucket(phys3d_flat__dyn_cell(x), phys3d_flat__dyn_cell(z));
 }
 
 static void phys3d_flat__build_dynamic_grid(phys3d_flat_world& w) {
@@ -27365,6 +27807,12 @@ static void phys3d_flat__build_dynamic_grid(phys3d_flat_world& w) {
 
 static void phys3d_flat__resolve_pair(phys3d_flat_body& a, phys3d_flat_body& b) {
     if (a.inv_mass == 0.0f && b.inv_mass == 0.0f) return;
+    // most pairs from the nine cells around a body are metres apart: their
+    // bounding circles settle it before any shape is built
+    float dx = b.position.x - a.position.x, dz = b.position.z - a.position.z;
+    float reach = (a.shape == PHYS3D_FLAT_BOX ? phys3d_flat__body_radius(a) : a.radius)
+                + (b.shape == PHYS3D_FLAT_BOX ? phys3d_flat__body_radius(b) : b.radius);
+    if (dx * dx + dz * dz > reach * reach) return;
     if (!phys3d_flat__layers_interact(a, b)) return;
 
     // vertical reject first - it is the cheapest test there is, and in a world
@@ -27442,10 +27890,10 @@ static void phys3d_flat__resolve_dynamics(phys3d_flat_world& w) {
         phys3d_flat_body& a = w.bodies[i];
         if (!a.active || a.inv_mass == 0.0f) continue;
 
+        int cx = phys3d_flat__dyn_cell(a.position.x), cz = phys3d_flat__dyn_cell(a.position.z);
         for (int oz = -1; oz <= 1; oz++)
             for (int ox = -1; ox <= 1; ox++) {
-                uint32_t bucket = phys3d_flat__dyn_bucket(a.position.x + ox * PHYS3D_FLAT_CELL,
-                                                   a.position.z + oz * PHYS3D_FLAT_CELL);
+                uint32_t bucket = phys3d_flat__cell_bucket(cx + ox, cz + oz);
                 for (uint32_t k = w.dyn_start[bucket]; k < w.dyn_start[bucket + 1]; k++) {
                     uint32_t j = w.dyn_items[k];
                     if (j <= i) continue;
@@ -27612,10 +28060,10 @@ size_t phys3d_flat_query_neighbours(const phys3d_flat_world& w, vec3 centre, flo
     float r2 = radius * radius;
     // shortcut: neighbouring cells can hash to the same bucket, so a body may
     // be counted twice in a tiny world; harmless for steering, which is the use
+    int cx = phys3d_flat__dyn_cell(centre.x), cz = phys3d_flat__dyn_cell(centre.z);
     for (int oz = -reach; oz <= reach; oz++)
         for (int ox = -reach; ox <= reach; ox++) {
-            uint32_t bucket = phys3d_flat__dyn_bucket(centre.x + ox * PHYS3D_FLAT_CELL,
-                                               centre.z + oz * PHYS3D_FLAT_CELL);
+            uint32_t bucket = phys3d_flat__cell_bucket(cx + ox, cz + oz);
             for (uint32_t k = w.dyn_start[bucket]; k < w.dyn_start[bucket + 1]; k++) {
                 uint32_t i = w.dyn_items[k];
                 const phys3d_flat_body& b = w.bodies[i];
@@ -27828,10 +28276,13 @@ void phys2d_debug_draw(pix_batch2d& batch, const phys2d_world& w, unsigned flags
             pix_batch_circle(batch, pb, thickness * 2.5f, joint_c);
         }
     if (flags & PHYS2D_DRAW_GRID) {
-        const phys2d__grid& g = w.moving_grid;
-        for (size_t i = 0; i < g.count; i++) {
-            pix_rect cell = { g.items[i].cx * w.cell_size, g.items[i].cy * w.cell_size, w.cell_size, w.cell_size };
-            pix_batch_rect_lines(batch, cell, thickness, pix_rgba(255, 255, 255, 30));
+        const phys2d__grid* grids[2] = { &w.moving_grid, &w.resting_grid };
+        for (int k = 0; k < 2; k++) {
+            const phys2d__grid& g = *grids[k];
+            for (size_t i = 0; i < g.count; i++) {
+                pix_rect cell = { g.items[i].cx * w.cell_size, g.items[i].cy * w.cell_size, w.cell_size, w.cell_size };
+                pix_batch_rect_lines(batch, cell, thickness, pix_rgba(255, 255, 255, 30));
+            }
         }
     }
     for (size_t i = 0; i < w.body_count; i++) {

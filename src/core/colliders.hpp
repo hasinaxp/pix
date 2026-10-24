@@ -196,11 +196,14 @@ static inline bool collide_circle_rect(const circle2& c, const rect2& r, contact
 }
 
 static inline bool collide_circle_obb(const circle2& c, const obb2& b, contact2* out) {
-    circle2 local = { obb__to_local(b, c.centre), c.radius };
+    // obb__to_local and obb__to_world_dir inlined, sharing one cos / sin
+    float cs = cosf(b.yaw), sn = sinf(b.yaw);
+    float dx = c.centre.x - b.centre.x, dz = c.centre.y - b.centre.y;
+    circle2 local = { v2(dx * cs - dz * sn, dx * sn + dz * cs), c.radius };
     rect2 lr = { v2(-b.half.x, -b.half.y), v2(b.half.x, b.half.y) };
     contact2 hit;
     if (!collide_circle_rect(local, lr, &hit)) return false;
-    out->normal = obb__to_world_dir(b, hit.normal);
+    out->normal = v2(hit.normal.x * cs + hit.normal.y * sn, -hit.normal.x * sn + hit.normal.y * cs);
     out->depth = hit.depth;
     return true;
 }

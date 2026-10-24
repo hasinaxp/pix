@@ -584,6 +584,13 @@ struct pix_renderer {
     pix_mesh_lods* lod_chains;  size_t lod_chain_count;
     float lod_band;   // how far past a switch point (fraction of it) the two levels cross-fade; 0 = hard switch
     float lod_bias;   // multiplies screen sizes: > 1 keeps detail longer, < 1 drops it sooner
+    // Instances smaller on screen than this many pixels across (their bounding
+    // sphere) are not drawn, and casters smaller than this many shadow texels
+    // are left out of a cascade: specks the rasteriser would mostly miss
+    // anyway. 0.5 by default, which changes nothing you can see; 1 to 2 drops
+    // far more of a big scene's distant clutter, but thousands of specks
+    // together do tint a far field, which then thins out. 0 draws everything.
+    float cull_pixels;
     idx       shaders[MAX_SHADERS]; size_t shader_count;
     // Depth-only twins of surface shaders with their own vertex stage, so what
     // a vertex shader moves (wind, waves) casts a shadow that moves with it.
@@ -696,7 +703,10 @@ struct pix_renderer {
     GLuint skin_bones_ssbo, skin_inst_ssbo, skin_list_ssbo;
     size_t skin_bones_capacity, skin_list_capacity, skin_list_cursor;   // in elements
     mat4*  skin_bone_staging;  size_t skin_bone_staging_capacity;
-    uint32_t* skin_list_staging;      // PIX_MAX_ANIMATED
+    uint32_t* skin_list_staging;      // PIX_MAX_ANIMATED: the last culled, sorted skinned list
+    // That list's view: a view's prepass, colour and outline passes all ask
+    // for the same one, and reuse it rather than cull, sort and upload again.
+    struct { bool valid, culled; frustum fr; uint32_t layers; size_t base, count; int dropped; } skin_reuse;
     pix__program_uniforms uniform_cache[MAX_SHADERS * 2];
     int uniform_cache_count;
 
@@ -1751,6 +1761,7 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     r.lod_chains         = pix_alloc<pix_mesh_lods>(PIX_MAX_MESHES);
     r.lod_band = 0.2f;
     r.lod_bias = 1.0f;
+    r.cull_pixels = 0.5f;
     r.instances         = pix_alloc<pix_render_instance>(PIX_MAX_INSTANCES);
     r.animated_instances = pix_alloc<pix_render_instance>(PIX_MAX_ANIMATED);
     r.animated_bones     = pix_alloc<const mat4*>(PIX_MAX_ANIMATED);
@@ -2047,6 +2058,7 @@ void pix_set_quality(pix_renderer& r, int quality) {
     static const bool glow[4] = { false, true,   true,  true };
     static const bool probe[4] = { false, false, true,  true };
     static const int  probe_res[4] = { 64, 64,   128,   256 };
+    static const float speck[4] = { 1.5f, 1.0f,  0.5f,  0.25f };   // cull_pixels
     int q = quality < 0 ? 0 : (quality > 3 ? 3 : quality);
     r.shadows.enabled = true;
     r.shadows.resolution = res[q];
@@ -2057,6 +2069,7 @@ void pix_set_quality(pix_renderer& r, int quality) {
     r.reflections.probe = probe[q];
     r.reflections.probe_resolution = probe_res[q];
     r.reflections.probe_faces_per_frame = q == PIX_QUALITY_ULTRA ? 2 : 1;
+    r.cull_pixels = speck[q];
     pix__sync_settings(r);
 }
 
@@ -3020,26 +3033,36 @@ static void pix__gpu_end(pix_renderer& r, int pass) {
 
 // LSD radix sort of (key, value) pairs, 8 bits a pass, skipping every pass
 // whose digit is the same for all keys - which for keys made of a few small
-// fields is most of them. Linear in the count, no comparisons, stable.
-static void pix__radix_sort(pix_renderer& r, size_t n) {
+// fields is most of them. Linear in the count, no comparisons, stable. All
+// eight digit histograms come from one read of the keys, and the sorted
+// values are returned where the last pass left them (sort_vals or
+// sort_vals_tmp) rather than copied back: callers copy them once, to where
+// they are kept.
+static const uint32_t* pix__radix_sort(pix_renderer& r, size_t n) {
     uint64_t* k = r.sort_keys;     uint64_t* kt = r.sort_keys_tmp;
     uint32_t* v = r.sort_vals;     uint32_t* vt = r.sort_vals_tmp;
-    for (int shift = 0; shift < 64; shift += 8) {
-        size_t count[257] = {};
-        for (size_t i = 0; i < n; i++) count[((k[i] >> shift) & 255) + 1]++;
-        bool trivial = false;
-        for (int d = 1; d <= 256; d++) if (count[d] == n) { trivial = true; break; }
-        if (trivial) continue;
-        for (int d = 0; d < 256; d++) count[d + 1] += count[d];
+    if (n < 2) return v;
+    uint32_t count[8][256];
+    memset(count, 0, sizeof(count));
+    for (size_t i = 0; i < n; i++) {
+        uint64_t key = k[i];
+        for (int d = 0; d < 8; d++) count[d][(key >> (d * 8)) & 255]++;
+    }
+    for (int d = 0; d < 8; d++) {
+        int shift = d * 8;
+        uint32_t* c = count[d];
+        if (c[(k[0] >> shift) & 255] == n) continue;   // every key has this digit: nothing moves
+        uint32_t sum = 0;
+        for (int b = 0; b < 256; b++) { uint32_t t = c[b]; c[b] = sum; sum += t; }
         for (size_t i = 0; i < n; i++) {
-            size_t at = count[(k[i] >> shift) & 255]++;
+            uint32_t at = c[(k[i] >> shift) & 255]++;
             kt[at] = k[i];
             vt[at] = v[i];
         }
         uint64_t* tk = k; k = kt; kt = tk;
         uint32_t* tv = v; v = vt; vt = tv;
     }
-    if (v != r.sort_vals) memcpy(r.sort_vals, v, n * sizeof(uint32_t));
+    return v;
 }
 
 static uint64_t pix__batch_key(const pix_render_instance& it) {
@@ -3050,6 +3073,16 @@ static uint32_t pix__depth16(float d, float far_plane) {
     float t = d / (far_plane > 1e-3f ? far_plane : 1.0f);
     t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
     return (uint32_t)(t * 65535.0f);
+}
+
+// Maps part of the buffer bound to `target` for writing only, without
+// waiting on the GPU: for storage just (re)specified this frame, or a range
+// no draw has used yet. Null if the driver declines; the caller then fills a
+// staging copy and uploads that instead.
+static void* pix__map_write(GLenum target, size_t offset, size_t bytes) {
+    if (!bytes) return 0;
+    return glMapBufferRange(target, (GLintptr)offset, (GLsizeiptr)bytes,
+                            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
 }
 
 // ---------------- the frame's shared data ----------------
@@ -3074,35 +3107,53 @@ struct pix__skin_record { mat4 model; vec4 tint; uint32_t info[4]; };
 
 static void pix__upload_skinning(pix_renderer& r) {
     r.skin_list_cursor = 0;
+    r.skin_reuse.valid = false;     // a new frame: new instances, a fresh list buffer
     if (!r.animated_count) return;
     size_t total = 0;
     for (size_t k = 0; k < r.animated_count; k++) total += r.animated_bone_count[k];
-    if (total > r.skin_bone_staging_capacity) {
-        size_t cap = r.skin_bone_staging_capacity ? r.skin_bone_staging_capacity : 4096;
-        while (cap < total) cap *= 2;
-        mat4* grown = (mat4*)pix_mem_realloc(r.skin_bone_staging, cap * sizeof(mat4));
-        if (!grown) { r.animated_count = 0; return; }
-        r.skin_bone_staging = grown;
-        r.skin_bone_staging_capacity = cap;
+    // every palette back to back, copied from the animators straight into the
+    // freshly specified buffer (through a staging copy only if it cannot be mapped)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_bones_ssbo);
+    if (total > r.skin_bones_capacity) r.skin_bones_capacity = total * 2;
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_bones_capacity * sizeof(mat4)), 0, GL_STREAM_DRAW);
+    mat4* bones = (mat4*)pix__map_write(GL_SHADER_STORAGE_BUFFER, 0, total * sizeof(mat4));
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!bones) {
+            if (total > r.skin_bone_staging_capacity) {
+                size_t cap = r.skin_bone_staging_capacity ? r.skin_bone_staging_capacity : 4096;
+                while (cap < total) cap *= 2;
+                mat4* grown = (mat4*)pix_mem_realloc(r.skin_bone_staging, cap * sizeof(mat4));
+                if (!grown) { r.animated_count = 0; glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0); return; }
+                r.skin_bone_staging = grown;
+                r.skin_bone_staging_capacity = cap;
+            }
+        }
+        mat4* out = bones ? bones : r.skin_bone_staging;
+        size_t at = 0;
+        for (size_t k = 0; k < r.animated_count; k++) {
+            memcpy(out + at, r.animated_bones[k], r.animated_bone_count[k] * sizeof(mat4));
+            at += r.animated_bone_count[k];
+        }
+        if (bones && glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)) break;
+        if (!bones) {
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(total * sizeof(mat4)), r.skin_bone_staging);
+            break;
+        }
+        bones = 0;    // the mapping's contents were lost: once more through the staging copy
     }
-    // the records borrow the instance staging array, which is idle until the first view streams
+    // the records borrow the instance staging array, which streaming only
+    // uses when it cannot map the instance buffer - and never before this
     static_assert(sizeof(pix__gpu_instance) * PIX_MAX_INSTANCES >= sizeof(pix__skin_record) * PIX_MAX_ANIMATED,
                   "PIX_MAX_ANIMATED too large for the shared staging array");
     pix__skin_record* rec = (pix__skin_record*)r.staging;
     size_t at = 0;
     for (size_t k = 0; k < r.animated_count; k++) {
-        uint32_t n = r.animated_bone_count[k];
-        memcpy(r.skin_bone_staging + at, r.animated_bones[k], n * sizeof(mat4));
         rec[k].model = r.animated_instances[k].transform;
         rec[k].tint = r.animated_instances[k].tint;
         rec[k].info[0] = (uint32_t)at;
         rec[k].info[1] = rec[k].info[2] = rec[k].info[3] = 0;
-        at += n;
+        at += r.animated_bone_count[k];
     }
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_bones_ssbo);
-    if (total > r.skin_bones_capacity) r.skin_bones_capacity = total * 2;
-    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_bones_capacity * sizeof(mat4)), 0, GL_STREAM_DRAW);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(total * sizeof(mat4)), r.skin_bone_staging);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_inst_ssbo);
     glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.animated_count * sizeof(pix__skin_record)), rec, GL_STREAM_DRAW);
     // index lists: a few views and cascades per frame, each at most every instance
@@ -3178,11 +3229,22 @@ static void pix__prepare_frame(pix_renderer& r) {
     r.frame_prepared = true;
 }
 
-// Uploads a sorted list's transforms into the instance stream and records
+static void pix__fill_instances(const pix_renderer& r, const pix__draw_list& list, pix__gpu_instance* out) {
+    for (size_t i = 0; i < list.count; i++) {
+        const pix_render_instance& it = r.instances[list.items[i]];
+        out[i].model = it.transform;
+        out[i].tint = it.tint;
+        out[i].lod = it.lod_fade;
+    }
+}
+
+// Writes a sorted list's transforms into the instance stream and records
 // where they landed; the draws then name that slice with baseInstance. No two
-// uploads in a frame overlap, so none waits on a draw. When the frame outgrows
-// the buffer, it is re-specified larger: draws already issued keep the storage
-// they were issued against, so nothing in flight is disturbed.
+// uploads in a frame overlap, so none waits on a draw - which is also what
+// lets them go straight into the mapped buffer instead of through a staging
+// copy. When the frame outgrows the buffer, it is re-specified larger: draws
+// already issued keep the storage they were issued against, so nothing in
+// flight is disturbed.
 static void pix__stream_list(pix_renderer& r, pix__draw_list& list) {
     list.base = 0;
     if (!list.count) return;
@@ -3193,36 +3255,39 @@ static void pix__stream_list(pix_renderer& r, pix__draw_list& list) {
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.instance_capacity * sizeof(pix__gpu_instance)), 0, GL_STREAM_DRAW);
         r.instance_cursor = 0;
     }
-    for (size_t i = 0; i < list.count; i++) {
-        const pix_render_instance& it = r.instances[list.items[i]];
-        r.staging[i].model = it.transform;
-        r.staging[i].tint = it.tint;
-        r.staging[i].lod = it.lod_fade;
+    size_t offset = r.instance_cursor * sizeof(pix__gpu_instance), bytes = list.count * sizeof(pix__gpu_instance);
+    pix__gpu_instance* dst = (pix__gpu_instance*)pix__map_write(GL_ARRAY_BUFFER, offset, bytes);
+    if (dst) pix__fill_instances(r, list, dst);
+    if (!dst || !glUnmapBuffer(GL_ARRAY_BUFFER)) {   // no mapping, or its contents were lost
+        pix__fill_instances(r, list, r.staging);
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)offset, (GLsizeiptr)bytes, r.staging);
     }
-    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(r.instance_cursor * sizeof(pix__gpu_instance)),
-                    (GLsizeiptr)(list.count * sizeof(pix__gpu_instance)), r.staging);
     list.base = (GLuint)r.instance_cursor;
     r.instance_cursor += list.count;
 }
 
 // A view's opaque list (by batch, front to back inside it for early depth
 // rejection) and blended list (strictly back to front), culled against its
-// frustum, its layers and its distance cap.
+// frustum, its layers, its distance cap and r.cull_pixels. `pixels` is how
+// many pixels one world unit covers at distance 1 (perspective; d away it is
+// pixels / d) or anywhere (`ortho`).
 static void pix__build_view_lists(pix_renderer& r, const frustum& fr, vec3 eye, float max_dist, float far_plane,
-                                  uint32_t layers, bool opaque, bool blended_too) {
+                                  uint32_t layers, bool opaque, bool blended_too, float pixels, bool ortho) {
     size_t n = r.renderable_count, count = 0;
     r.refract_needed = false;
+    // too small to see: diameter * pixels / d < cull_pixels, kept free of the division
+    float speck = r.cull_pixels > 0.0f ? r.cull_pixels / (2.0f * pixels) : 0.0f;
     if (opaque) {
         for (size_t i = 0; i < n; i++) {
             if ((r.flags[i] & (PIX__BLENDED | PIX__HIDDEN)) || !(r.instances[i].layers & layers)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float d = v3dist(c, eye);
-            if (d - r.bounds[i].w > max_dist || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
+            if (d - r.bounds[i].w > max_dist || r.bounds[i].w < speck * (ortho ? 1.0f : d)
+                || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
             r.sort_keys[count] = pix__batch_key(r.instances[i]) | ((uint64_t)pix__depth16(d, far_plane) << 16);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_opaque.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_opaque.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
     }
     r.list_opaque.count = count;
 
@@ -3232,14 +3297,14 @@ static void pix__build_view_lists(pix_renderer& r, const frustum& fr, vec3 eye, 
             if (!(r.flags[i] & PIX__BLENDED) || (r.flags[i] & PIX__HIDDEN) || !(r.instances[i].layers & layers)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float d = v3dist(c, eye);
-            if (d - r.bounds[i].w > max_dist || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
+            if (d - r.bounds[i].w > max_dist || r.bounds[i].w < speck * (ortho ? 1.0f : d)
+                || !frustum_test_sphere(fr, c, r.bounds[i].w)) { r.frame_culled++; continue; }
             if (r.flags[i] & PIX__REFRACT) r.refract_needed = true;
             uint32_t back = 65535u - pix__depth16(d, far_plane);
             r.sort_keys[count] = ((uint64_t)back << 48) | (pix__batch_key(r.instances[i]) >> 16);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_transparent.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_transparent.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
     }
     r.list_transparent.count = count;
 }
@@ -3665,33 +3730,52 @@ static void pix__draw_sorted(pix_renderer& r, const pix__draw_list& list, pix__p
 static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* light_vp,
                               const frustum* fr, uint32_t layers, int mode = PIX__SKIN_COLOR) {
     if (!r.animated_count) return;
-    size_t count = 0;
-    for (size_t k = 0; k < r.animated_count; k++) {
-        const pix_render_instance& inst = r.animated_instances[k];
-        if (!(inst.layers & layers)) continue;
-        if (fr) {
-            const mesh& me = r.skinned_meshes[inst.mesh];
-            vec3 c = mat4_mul_point(inst.transform, me.center);
-            float rad = me.radius * mat4_max_scale(inst.transform) * 1.5f;   // poses reach past the bind pose
-            if (!frustum_test_sphere(*fr, c, rad)) { r.frame_culled++; continue; }
+    auto& reuse = r.skin_reuse;
+    const uint32_t* order = r.skin_list_staging;
+    size_t count = 0, base = 0;
+    if (reuse.valid && reuse.layers == layers && reuse.culled == (fr != 0) && (!fr || !memcmp(fr, &reuse.fr, sizeof(frustum)))) {
+        count = reuse.count;          // this view's list is up already
+        base = reuse.base;
+        r.frame_culled += reuse.dropped;
+    } else {
+        int dropped = 0;
+        for (size_t k = 0; k < r.animated_count; k++) {
+            const pix_render_instance& inst = r.animated_instances[k];
+            if (!(inst.layers & layers)) continue;
+            if (fr) {
+                const mesh& me = r.skinned_meshes[inst.mesh];
+                vec3 c = mat4_mul_point(inst.transform, me.center);
+                float rad = me.radius * mat4_max_scale(inst.transform) * 1.5f;   // poses reach past the bind pose
+                if (!frustum_test_sphere(*fr, c, rad)) { dropped++; continue; }
+            }
+            r.sort_keys[count] = pix__batch_key(inst);
+            r.sort_vals[count++] = (uint32_t)k;
         }
-        r.sort_keys[count] = pix__batch_key(inst);
-        r.sort_vals[count++] = (uint32_t)k;
+        r.frame_culled += dropped;
+        if (count) {
+            memcpy(r.skin_list_staging, pix__radix_sort(r, count), count * sizeof(uint32_t));
+            if (r.skin_list_cursor + count > r.skin_list_capacity) {
+                // more views than budgeted: a fresh buffer; draws already issued keep theirs
+                r.skin_list_capacity = (r.skin_list_capacity + count) * 2;
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_list_capacity * sizeof(uint32_t)), 0, GL_STREAM_DRAW);
+                r.skin_list_cursor = 0;
+            }
+            base = r.skin_list_cursor;
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(base * sizeof(uint32_t)),
+                            (GLsizeiptr)(count * sizeof(uint32_t)), r.skin_list_staging);
+            r.skin_list_cursor += count;
+        }
+        reuse.valid = true;
+        reuse.culled = fr != 0;
+        if (fr) reuse.fr = *fr;
+        reuse.layers = layers;
+        reuse.base = base;
+        reuse.count = count;
+        reuse.dropped = dropped;
     }
     if (!count) return;
-    pix__radix_sort(r, count);
-    if (r.skin_list_cursor + count > r.skin_list_capacity) {
-        // more views than budgeted: a fresh buffer; draws already issued keep theirs
-        r.skin_list_capacity = (r.skin_list_capacity + count) * 2;
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_list_capacity * sizeof(uint32_t)), 0, GL_STREAM_DRAW);
-        r.skin_list_cursor = 0;
-    }
-    size_t base = r.skin_list_cursor;
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, r.skin_list_ssbo);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(base * sizeof(uint32_t)),
-                    (GLsizeiptr)(count * sizeof(uint32_t)), r.sort_vals);
-    r.skin_list_cursor += count;
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, r.skin_inst_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, r.skin_bones_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, r.skin_list_ssbo);
@@ -3701,10 +3785,10 @@ static void pix__draw_skinned(pix_renderer& r, pix__pass_state& st, const mat4* 
     idx bound = PIX_INVALID;
     size_t i = 0;
     while (i < count) {
-        const pix_render_instance& a = r.animated_instances[r.sort_vals[i]];
+        const pix_render_instance& a = r.animated_instances[order[i]];
         size_t j = i + 1;
         while (j < count) {
-            const pix_render_instance& b = r.animated_instances[r.sort_vals[j]];
+            const pix_render_instance& b = r.animated_instances[order[j]];
             if (b.mesh != a.mesh || b.material != a.material) break;
             j++;
         }
@@ -4117,15 +4201,20 @@ static void pix__velocity_pass(pix_renderer& r) {
         if (!r.velocity_staging) { r.velocity_capacity = 0; return; }
         r.velocity_capacity = cap;
     }
-    size_t k = 0;
-    for (size_t i = 0; i < r.renderable_count; i++) {
-        const pix_render_instance& it = r.instances[i];
-        if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
-        mat4 prev = pix__motion_prev(r, it.motion_id, it.transform);
-        memcpy(r.velocity_staging + k * 32, it.transform.data, 16 * sizeof(float));
-        memcpy(r.velocity_staging + k * 32 + 16, prev.data, 16 * sizeof(float));
-        k++;
-    }
+    // this frame's and last frame's transform per instance, written straight
+    // into the freshly specified buffer (pix__motion_prev answers the same
+    // twice in a frame, so the staging fallback can simply fill again)
+    auto fill = [&](float* out) {
+        size_t k = 0;
+        for (size_t i = 0; i < r.renderable_count; i++) {
+            const pix_render_instance& it = r.instances[i];
+            if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
+            mat4 prev = pix__motion_prev(r, it.motion_id, it.transform);
+            memcpy(out + k * 32, it.transform.data, 16 * sizeof(float));
+            memcpy(out + k * 32 + 16, prev.data, 16 * sizeof(float));
+            k++;
+        }
+    };
     // the pool's buffers change when it grows, so the layout is set each time
     glBindVertexArray(r.velocity_vao);
     glBindBuffer(GL_ARRAY_BUFFER, r.pool.vbo);
@@ -4133,7 +4222,12 @@ static void pix__velocity_pass(pix_renderer& r) {
     glEnableVertexAttribArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, r.velocity_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.velocity_capacity * 32 * sizeof(float)), 0, GL_STREAM_DRAW);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(k * 32 * sizeof(float)), r.velocity_staging);
+    float* mapped = (float*)pix__map_write(GL_ARRAY_BUFFER, 0, n * 32 * sizeof(float));
+    if (mapped) fill(mapped);
+    if (!mapped || !glUnmapBuffer(GL_ARRAY_BUFFER)) {
+        fill(r.velocity_staging);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * 32 * sizeof(float)), r.velocity_staging);
+    }
     for (int c = 0; c < 8; c++) {
         glVertexAttribPointer(1 + c, 4, GL_FLOAT, GL_FALSE, 32 * sizeof(float), (void*)(size_t)(c * 4 * sizeof(float)));
         glEnableVertexAttribArray(1 + c);
@@ -4151,7 +4245,7 @@ static void pix__velocity_pass(pix_renderer& r) {
     glDepthMask(GL_FALSE);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
-    k = 0;
+    size_t k = 0;
     for (size_t i = 0; i < r.renderable_count; i++) {
         const pix_render_instance& it = r.instances[i];
         if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
@@ -4202,8 +4296,10 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     }
     GLuint draw_fbo = msaa ? r.msaa_fbo : fbo;
     float max_dist = v.max_distance > 0.0f ? v.max_distance : r.camera_far;
+    // the projection's y scale: how big a world unit is on this view's rows
+    float pixels = r.projection_matrix.data[5] * 0.5f * (float)vh;
     pix__build_view_lists(r, r.view_frustum, r.camera_position, max_dist, r.camera_far, v.layers,
-                          v.opaque, v.transparent);
+                          v.opaque, v.transparent, pixels, r.projection_matrix.data[15] != 0.0f);
     pix__stream_list(r, r.list_opaque);
     pix__stream_list(r, r.list_transparent);
 
@@ -4378,12 +4474,13 @@ static void pix__render_local_shadows(pix_renderer& r) {
             if (!(r.flags[i] & PIX__CASTER)) continue;
             vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
             float rad = r.bounds[i].w;
-            if (v3len(v3sub(c, eye)) - rad > reach || !frustum_test_sphere(fr, c, rad)) continue;
+            vec3 to = v3sub(c, eye);
+            float near_side = reach + rad;    // |to| - rad > reach, without the square root
+            if (v3dot(to, to) > near_side * near_side || !frustum_test_sphere(fr, c, rad)) continue;
             r.sort_keys[count] = pix__batch_key(r.instances[i]);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(list.items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(list.items, pix__radix_sort(r, count), count * sizeof(uint32_t));
         list.count = count;
         pix__stream_list(r, list);
         glViewport((t % 4) * tile, (t / 4) * tile, tile, tile);
@@ -4403,13 +4500,16 @@ void pix_render_shadows(pix_renderer& r) {
     pix__gpu_begin(r, PIX_GPU_SHADOW);
 
     size_t n = r.renderable_count;
+    // a caster under cull_pixels texels across is a speck in that cascade's map
+    float speck[SHADOW_CASCADES];
+    for (int k = 0; k < SHADOW_CASCADES; k++) speck[k] = 0.5f * r.cull_pixels * r.cascade_texel[k];
     for (size_t i = 0; i < n; i++) {
         r.flags[i] &= (uint8_t)~0xF0;
         if (!(r.flags[i] & PIX__CASTER)) continue;
         vec3 c = v3(r.bounds[i].x, r.bounds[i].y, r.bounds[i].z);
         float rad = r.bounds[i].w;
         for (int k = 0; k < SHADOW_CASCADES; k++) {
-            if (!(r.cascade_mask & (1 << k))) continue;
+            if (!(r.cascade_mask & (1 << k)) || rad < speck[k]) continue;
             vec3 lp = mat4_mul_point(r.cascade_view[k], c);
             float e = r.cascade_radius[k] + rad;
             if (fabsf(lp.x) <= e && fabsf(lp.y) <= e && -lp.z >= -rad && -lp.z <= r.cascade_depth + rad)
@@ -4426,8 +4526,7 @@ void pix_render_shadows(pix_renderer& r) {
             r.sort_keys[count] = pix__batch_key(r.instances[i]);
             r.sort_vals[count++] = (uint32_t)i;
         }
-        pix__radix_sort(r, count);
-        memcpy(r.list_cascade[k].items, r.sort_vals, count * sizeof(uint32_t));
+        memcpy(r.list_cascade[k].items, pix__radix_sort(r, count), count * sizeof(uint32_t));
         r.list_cascade[k].count = count;
         pix__stream_list(r, r.list_cascade[k]);
     }

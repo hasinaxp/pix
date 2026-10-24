@@ -270,12 +270,15 @@ struct phys2d__poly {
     float radius;
 };
 
-struct phys2d__cell_item { int32_t cx, cy; idx body; };
+// the body's bounds ride along, so pair tests stream through the grid instead
+// of reaching into the body structs at random
+struct phys2d__cell_item { int32_t cx, cy; idx body; rect2 bounds; };
 struct phys2d__grid {
     uint32_t*          start;     // PHYS2D_GRID_BUCKETS + 1 prefix offsets
     phys2d__cell_item* items;
     size_t             count, capacity;
 };
+struct phys2d__poly_key;
 
 struct phys2d_world {
     // ---- settings, edit freely ----
@@ -319,13 +322,22 @@ struct phys2d_world {
     float*    island_sleep;       // per island root: the shortest sleep_time in it
     uint8_t*  island_awake;
 
-    phys2d__grid static_grid, moving_grid;
+    // statics (rebuilt when they change), awake + kinematic bodies, and
+    // sleeping bodies - which only awake ones look up, never each other
+    phys2d__grid static_grid, moving_grid, resting_grid;
+    phys2d__poly_key* poly_keys;  // per body: what its world shape was last built from
+    uint8_t*     grid_kinds;      // per body: the grid it was last bucketed in (0xFF none)
+    bool         resting_dirty;   // the sleepers changed: rebuild resting_grid
     bool         statics_dirty;
 
     phys2d_contact* contacts;     // this step's pairs
     size_t          contact_count, contact_capacity;
     phys2d_contact* prev_contacts;
     size_t          prev_count, prev_capacity;
+    uint32_t*       active_contacts;   // this step's contacts the solver works on (not idle)
+    uint32_t*       awake_bodies;      // this step's moving bodies (not static, not asleep)
+    size_t          awake_count;
+    size_t          active_count, active_capacity;
     uint32_t*       prev_table;   // open-addressed pair -> prev index
     size_t          table_size;
 
@@ -738,6 +750,34 @@ static void phys2d__compute_mass(phys2d_body& b) {
 
 // ---- world ----
 
+// What a static or sleeping body's world shape and bounds were last built
+// from. While all of it still holds they are what they were, and the step
+// skips the trigonometry: most of a level is static, most of a settled pile
+// asleep. Compared bit for bit, so any change at all rebuilds.
+struct phys2d__poly_key {
+    phys2d_shape shape;       // a byte copy of the body's
+    vec2    position;
+    float   angle;
+    float   pad;              // the speculative margin around a sleeping body
+    uint8_t type;             // PHYS2D_*; 0xFF = nothing cached
+    bool    sleeping;
+};
+
+static void phys2d__make_key(const phys2d_body& b, float pad, phys2d__poly_key& k) {
+    memcpy(&k.shape, &b.shape, sizeof(phys2d_shape));
+    k.position = b.position;
+    k.angle = b.angle;
+    k.pad = pad;
+    k.type = b.type;
+    k.sleeping = b.sleeping;
+}
+
+static bool phys2d__key_holds(const phys2d__poly_key& k, const phys2d_body& b, float pad) {
+    if (k.type != b.type || k.sleeping != b.sleeping || memcmp(&k.pad, &pad, sizeof(float))) return false;
+    if (memcmp(&k.position, &b.position, sizeof(vec2)) || memcmp(&k.angle, &b.angle, sizeof(float))) return false;
+    return !memcmp(&k.shape, &b.shape, sizeof(phys2d_shape));
+}
+
 void phys2d_create_world(phys2d_world& w) {
     memset(&w, 0, sizeof(w));
     w.gravity = v2(0.0f, 980.0f);
@@ -768,8 +808,14 @@ void phys2d_create_world(phys2d_world& w) {
     w.polys        = pix_alloc<phys2d__poly>(PHYS2D_MAX_BODIES);
     w.free_ids     = pix_alloc<idx>(PHYS2D_MAX_BODIES);
     w.pending_free = pix_alloc<idx>(PHYS2D_MAX_BODIES);
-    w.static_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
-    w.moving_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.awake_bodies = pix_alloc<uint32_t>(PHYS2D_MAX_BODIES);
+    w.poly_keys    = pix_alloc<phys2d__poly_key>(PHYS2D_MAX_BODIES);
+    w.grid_kinds   = pix_alloc<uint8_t>(PHYS2D_MAX_BODIES);
+    memset(w.grid_kinds, 0xFF, PHYS2D_MAX_BODIES);
+    w.resting_dirty = true;
+    w.static_grid.start  = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.moving_grid.start  = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
+    w.resting_grid.start = pix_alloc<uint32_t>(PHYS2D_GRID_BUCKETS + 1);
 }
 
 void phys2d_destroy_world(phys2d_world& w) {
@@ -782,12 +828,18 @@ void phys2d_destroy_world(phys2d_world& w) {
     pix_free(w.polys);
     pix_free(w.free_ids);
     pix_free(w.pending_free);
+    pix_free(w.poly_keys);
+    pix_free(w.grid_kinds);
     pix_free(w.static_grid.start);
     pix_free(w.static_grid.items);
     pix_free(w.moving_grid.start);
     pix_free(w.moving_grid.items);
+    pix_free(w.resting_grid.start);
+    pix_free(w.resting_grid.items);
     pix_free(w.contacts);
     pix_free(w.prev_contacts);
+    pix_free(w.active_contacts);
+    pix_free(w.awake_bodies);
     pix_free(w.prev_table);
     pix_free(w.events);
     memset(&w, 0, sizeof(w));
@@ -831,6 +883,7 @@ idx phys2d_add_body(phys2d_world& w, const phys2d_body& body) {
     b.prev_position = b.position;
     b.prev_angle = b.angle;
     phys2d__compute_mass(b);
+    w.poly_keys[id].type = 0xFF;
     if (b.type == PHYS2D_STATIC) w.statics_dirty = true;
     return id;
 }
@@ -1340,22 +1393,35 @@ static void phys2d__islands_sleep(phys2d_world& w, float dt) {
 
 // ---- broadphase grid ----
 
-static inline int32_t phys2d__cell(float x, float inv_cell) { return (int32_t)floorf(x * inv_cell); }
+// floorf without the library call (MSVC makes one): truncate, then step down for negatives
+static inline int32_t phys2d__cell(float x, float inv_cell) {
+    float f = x * inv_cell;
+    int32_t i = (int32_t)f;
+    return i - (f < (float)i);
+}
 static inline uint32_t phys2d__bucket(int32_t cx, int32_t cy) {
     return ((uint32_t)cx * 73856093u ^ (uint32_t)cy * 19349663u) & (PHYS2D_GRID_BUCKETS - 1);
 }
 
-// Buckets every body for which `want(type)` holds into every cell its bounds
+#define PHYS2D__GRID_STATIC  0
+#define PHYS2D__GRID_MOVING  1   // awake dynamic and every kinematic body
+#define PHYS2D__GRID_RESTING 2   // sleeping dynamic bodies
+
+static inline int phys2d__grid_kind(const phys2d_body& b) {
+    return b.type == PHYS2D_STATIC ? PHYS2D__GRID_STATIC : (b.sleeping ? PHYS2D__GRID_RESTING : PHYS2D__GRID_MOVING);
+}
+
+// Buckets every active body of one grid kind into every cell its bounds
 // cover: a counting pass, a prefix sum, then a fill that turns each bucket's
 // start into its end - shifted back by one at the end.
-static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, bool statics) {
+static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, int kind) {
     float inv = 1.0f / w.cell_size;
     uint32_t* start = g.start;
     memset(start, 0, (PHYS2D_GRID_BUCKETS + 1) * sizeof(uint32_t));
     size_t total = 0;
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || (b.type == PHYS2D_STATIC) != statics) continue;
+        if (!b.active || phys2d__grid_kind(b) != kind) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
         for (int32_t y = y0; y <= y1; y++)
@@ -1367,13 +1433,13 @@ static void phys2d__build_grid(phys2d_world& w, phys2d__grid& g, bool statics) {
     for (int i = 0; i < PHYS2D_GRID_BUCKETS; i++) { uint32_t c = start[i]; start[i] = sum; sum += c; }
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || (b.type == PHYS2D_STATIC) != statics) continue;
+        if (!b.active || phys2d__grid_kind(b) != kind) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
         for (int32_t y = y0; y <= y1; y++)
             for (int32_t x = x0; x <= x1; x++) {
                 phys2d__cell_item& it = g.items[start[phys2d__bucket(x, y)]++];
-                it.cx = x; it.cy = y; it.body = (idx)i;
+                it.cx = x; it.cy = y; it.body = (idx)i; it.bounds = b.bounds;
             }
     }
     memmove(start + 1, start, PHYS2D_GRID_BUCKETS * sizeof(uint32_t));
@@ -1415,27 +1481,40 @@ static void phys2d__push_event(phys2d_world& w, uint8_t type, idx a, idx b, vec2
     e.type = type; e.a = a; e.b = b; e.point = point; e.normal = normal; e.speed = speed;
 }
 
+// can these two (a < b) have a contact at all
+static inline bool phys2d__pair_wanted(const phys2d_world& w, idx ia, idx ib, const phys2d_body& a, const phys2d_body& b) {
+    if (!phys2d__layers_ok(a, b)) return false;
+    if (a.trigger && b.trigger) return false;
+    if (!a.trigger && !b.trigger && a.type != PHYS2D_DYNAMIC && b.type != PHYS2D_DYNAMIC) return false;
+    if (!phys2d__rects_overlap(a.bounds, b.bounds)) return false;
+    return !(a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys2d__joined(w, ia, ib));
+}
+
+// Pairs where neither body moved (asleep, static, a kinematic at rest) keep
+// last step's contact as it was, events and all. They are taken straight from
+// that list rather than found again through the grids, so a settled pile
+// costs a copy, not a broadphase - and sleepers never need pairing with each other.
+static void phys2d__carry_idle_contacts(phys2d_world& w) {
+    for (size_t k = 0; k < w.prev_count; k++) {
+        const phys2d_contact& old = w.prev_contacts[k];
+        const phys2d_body& a = w.bodies[old.a];
+        const phys2d_body& b = w.bodies[old.b];
+        if (!a.active || !b.active || !phys2d__idle(a) || !phys2d__idle(b) || !phys2d__pair_wanted(w, old.a, old.b, a, b)) continue;
+        phys2d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
+        phys2d_contact& c = w.contacts[w.contact_count++];
+        c = old;
+        c.prev = (uint32_t)k;
+        c.persisted = false;
+    }
+}
+
 static void phys2d__narrowphase(phys2d_world& w, idx ia, idx ib, float dt) {
     if (ia > ib) { idx t = ia; ia = ib; ib = t; }
     phys2d_body& a = w.bodies[ia];
     phys2d_body& b = w.bodies[ib];
-    if (!phys2d__layers_ok(a, b)) return;
+    if (phys2d__idle(a) && phys2d__idle(b)) return;    // phys2d__carry_idle_contacts has it
+    if (!phys2d__pair_wanted(w, ia, ib, a, b)) return;
     bool trigger = a.trigger || b.trigger;
-    if (a.trigger && b.trigger) return;
-    if (!trigger && a.type != PHYS2D_DYNAMIC && b.type != PHYS2D_DYNAMIC) return;
-    if (!phys2d__rects_overlap(a.bounds, b.bounds)) return;
-    if (a.joint_list != PIX_INVALID && b.joint_list != PIX_INVALID && phys2d__joined(w, ia, ib)) return;
-    if (phys2d__idle(a) && phys2d__idle(b)) {
-        // nothing moved: keep last step's contact as it was, events and all
-        const phys2d_contact* old = phys2d__find_prev(w, ia, ib);
-        if (!old) return;
-        phys2d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
-        phys2d_contact& c = w.contacts[w.contact_count++];
-        c = *old;
-        c.prev = (uint32_t)(old - w.prev_contacts);
-        c.persisted = false;
-        return;
-    }
 
     const phys2d__poly& pa = w.polys[ia];
     const phys2d__poly& pb = w.polys[ib];
@@ -1471,37 +1550,40 @@ static void phys2d__narrowphase(phys2d_world& w, idx ia, idx ib, float dt) {
 static void phys2d__find_contacts(phys2d_world& w, float dt) {
     float inv = 1.0f / w.cell_size;
     const phys2d__grid& mg = w.moving_grid;
-    const phys2d__grid& sg = w.static_grid;
     // moving vs moving: pairs within each bucket that share a cell
     for (int bk = 0; bk < PHYS2D_GRID_BUCKETS; bk++)
-        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++)
+        for (uint32_t i = mg.start[bk]; i < mg.start[bk + 1]; i++) {
+            const phys2d__cell_item& p = mg.items[i];
             for (uint32_t j = i + 1; j < mg.start[bk + 1]; j++) {
-                const phys2d__cell_item& p = mg.items[i];
                 const phys2d__cell_item& q = mg.items[j];
                 if (p.cx != q.cx || p.cy != q.cy) continue;
-                const rect2& ra = w.bodies[p.body].bounds;
-                const rect2& rb = w.bodies[q.body].bounds;
-                if (!phys2d__rects_overlap(ra, rb) || !phys2d__owns_pair(ra, rb, p.cx, p.cy, inv)) continue;
+                if (!phys2d__rects_overlap(p.bounds, q.bounds) || !phys2d__owns_pair(p.bounds, q.bounds, p.cx, p.cy, inv)) continue;
                 phys2d__narrowphase(w, p.body, q.body, dt);
             }
-    // moving vs static: look each moving body up in the static grid
+        }
+    // each moving body looked up among the statics and the sleepers
+    const phys2d__grid* others[2] = { &w.static_grid, &w.resting_grid };
     for (size_t i = 0; i < w.body_count; i++) {
         const phys2d_body& b = w.bodies[i];
-        if (!b.active || b.type == PHYS2D_STATIC) continue;
+        if (!b.active || phys2d__grid_kind(b) != PHYS2D__GRID_MOVING) continue;
         int32_t x0 = phys2d__cell(b.bounds.min.x, inv), x1 = phys2d__cell(b.bounds.max.x, inv);
         int32_t y0 = phys2d__cell(b.bounds.min.y, inv), y1 = phys2d__cell(b.bounds.max.y, inv);
-        for (int32_t y = y0; y <= y1; y++)
-            for (int32_t x = x0; x <= x1; x++) {
-                uint32_t bk = phys2d__bucket(x, y);
-                for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
-                    const phys2d__cell_item& it = sg.items[k];
-                    if (it.cx != x || it.cy != y) continue;
-                    const rect2& rs = w.bodies[it.body].bounds;
-                    if (!phys2d__rects_overlap(b.bounds, rs) || !phys2d__owns_pair(b.bounds, rs, x, y, inv)) continue;
-                    phys2d__narrowphase(w, (idx)i, it.body, dt);
+        for (int g = 0; g < 2; g++) {
+            const phys2d__grid& sg = *others[g];
+            if (!sg.count) continue;
+            for (int32_t y = y0; y <= y1; y++)
+                for (int32_t x = x0; x <= x1; x++) {
+                    uint32_t bk = phys2d__bucket(x, y);
+                    for (uint32_t k = sg.start[bk]; k < sg.start[bk + 1]; k++) {
+                        const phys2d__cell_item& it = sg.items[k];
+                        if (it.cx != x || it.cy != y) continue;
+                        if (!phys2d__rects_overlap(b.bounds, it.bounds) || !phys2d__owns_pair(b.bounds, it.bounds, x, y, inv)) continue;
+                        phys2d__narrowphase(w, (idx)i, it.body, dt);
+                    }
                 }
-            }
+        }
     }
+    phys2d__carry_idle_contacts(w);
 }
 
 // Begin/end events by comparing this step's touching pairs with the last's.
@@ -1550,12 +1632,15 @@ static void phys2d__report(phys2d_world& w) {
 // step, for the same cost.
 
 static void phys2d__prepare_contacts(phys2d_world& w) {
+    phys2d__reserve(w.active_contacts, w.active_capacity, w.contact_count);
+    w.active_count = 0;
     for (size_t i = 0; i < w.contact_count; i++) {
         phys2d_contact& c = w.contacts[i];
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         c.idle = c.trigger || (phys2d__idle(a) && phys2d__idle(b));
         if (c.idle) continue;
+        w.active_contacts[w.active_count++] = (uint32_t)i;
         vec2 n = c.normal, t = phys2d__perp(n);
         for (int k = 0; k < c.count; k++) {
             phys2d_contact_point& p = c.points[k];
@@ -1597,17 +1682,22 @@ static void phys2d__prepare_contacts(phys2d_world& w) {
     }
 }
 
+// static and kinematic bodies have no inverse mass or inertia: an impulse
+// would leave them as they are, so it is skipped rather than computed as zero
 static inline void phys2d__apply(phys2d_body& a, phys2d_body& b, const phys2d_contact_point& p, vec2 P) {
-    a.velocity -= P * a.inv_mass;
-    a.angular_velocity -= a.inv_inertia * phys2d__cross(p.ra, P);
-    b.velocity += P * b.inv_mass;
-    b.angular_velocity += b.inv_inertia * phys2d__cross(p.rb, P);
+    if (a.type == PHYS2D_DYNAMIC) {
+        a.velocity -= P * a.inv_mass;
+        a.angular_velocity -= a.inv_inertia * phys2d__cross(p.ra, P);
+    }
+    if (b.type == PHYS2D_DYNAMIC) {
+        b.velocity += P * b.inv_mass;
+        b.angular_velocity += b.inv_inertia * phys2d__cross(p.rb, P);
+    }
 }
 
 static void phys2d__warm_contacts(phys2d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
         vec2 n = c.normal, t = phys2d__perp(n);
         for (int k = 0; k < c.count; k++)
             phys2d__apply(w.bodies[c.a], w.bodies[c.b], c.points[k], n * c.points[k].normal_impulse + t * c.points[k].tangent_impulse);
@@ -1666,9 +1756,8 @@ static void phys2d__solve_block(phys2d_contact& c, phys2d_body& a, phys2d_body& 
 // `push_rate` is how much of an overlap (beyond slop) is removed per second;
 // 0 in the relax pass. A point still apart may close its gap and no more.
 static void phys2d__solve_contacts(phys2d_world& w, float inv_h, float push_rate) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         vec2 n = c.normal, t = phys2d__perp(n);
@@ -1701,9 +1790,9 @@ static void phys2d__solve_contacts(phys2d_world& w, float inv_h, float push_rate
 // Done here rather than as a bias so a speculative point never bounces a body
 // off a surface it was not going to reach.
 static void phys2d__restitution(phys2d_world& w) {
-    for (size_t i = 0; i < w.contact_count; i++) {
-        phys2d_contact& c = w.contacts[i];
-        if (c.idle || c.restitution <= 0.0f) continue;
+    for (size_t ci = 0; ci < w.active_count; ci++) {
+        phys2d_contact& c = w.contacts[w.active_contacts[ci]];
+        if (c.restitution <= 0.0f) continue;
         phys2d_body& a = w.bodies[c.a];
         phys2d_body& b = w.bodies[c.b];
         for (int k = 0; k < c.count; k++) {
@@ -1725,7 +1814,11 @@ static void phys2d__step(phys2d_world& w, float dt) {
     // wake what the game touched, then bounds swept along the motion for the broadphase
     for (size_t i = 0; i < w.body_count; i++) {
         phys2d_body& b = w.bodies[i];
-        if (!b.active) continue;
+        if (!b.active) {
+            if (w.grid_kinds[i] == PHYS2D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = 0xFF;
+            continue;
+        }
         if (b.sleeping) {
             // the game moved it, gave it a velocity or pushed it: wake up
             bool moved = b.position.x != b.prev_position.x || b.position.y != b.prev_position.y || b.angle != b.prev_angle;
@@ -1737,6 +1830,19 @@ static void phys2d__step(phys2d_world& w, float dt) {
         b.prev_angle = b.angle;
         b.delta_rot = v2(1.0f, 0.0f);
         if (!b.sleeping) b.on_ground = false;
+        uint8_t kind = (uint8_t)phys2d__grid_kind(b);
+        if (kind != w.grid_kinds[i]) {
+            if (kind == PHYS2D__GRID_RESTING || w.grid_kinds[i] == PHYS2D__GRID_RESTING) w.resting_dirty = true;
+            w.grid_kinds[i] = kind;
+        }
+        // a static or sleeping body that has not moved or changed keeps its shape and bounds
+        if (b.type == PHYS2D_STATIC || b.sleeping) {
+            if (phys2d__key_holds(w.poly_keys[i], b, w.speculative)) continue;
+            phys2d__make_key(b, w.speculative, w.poly_keys[i]);
+            if (b.sleeping) w.resting_dirty = true;
+        } else {
+            w.poly_keys[i].type = 0xFF;
+        }
         phys2d__poly& p = w.polys[i];
         phys2d__make_poly(b.shape, b.position, b.angle, p);
         rect2 r = phys2d__poly_bounds(p);
@@ -1753,8 +1859,10 @@ static void phys2d__step(phys2d_world& w, float dt) {
         r.max = v2(r.max.x + maxf(move.x, 0.0f), r.max.y + maxf(move.y, 0.0f)) + pad;
         b.bounds = r;
     }
-    if (w.statics_dirty) { phys2d__build_grid(w, w.static_grid, true); w.statics_dirty = false; }
-    phys2d__build_grid(w, w.moving_grid, false);
+    if (w.statics_dirty) { phys2d__build_grid(w, w.static_grid, PHYS2D__GRID_STATIC); w.statics_dirty = false; }
+    phys2d__build_grid(w, w.moving_grid, PHYS2D__GRID_MOVING);
+    // sleepers do not move: their grid stands until one wakes, sleeps or changes
+    if (w.resting_dirty) { phys2d__build_grid(w, w.resting_grid, PHYS2D__GRID_RESTING); w.resting_dirty = false; }
 
     // last step's contacts become the warm-start / event reference
     phys2d_contact* t = w.prev_contacts; w.prev_contacts = w.contacts; w.contacts = t;
@@ -1782,10 +1890,16 @@ static void phys2d__step(phys2d_world& w, float dt) {
     int substeps = w.substeps > 0 ? w.substeps : 1;
     float h = dt / substeps, inv_h = 1.0f / h;
     float push_rate = w.correction / dt;     // the same correction per second at any substep count
+    // the substeps visit only what moves: a mostly sleeping world is not walked eight times a step
+    w.awake_count = 0;
+    for (size_t i = 0; i < w.body_count; i++) {
+        const phys2d_body& b = w.bodies[i];
+        if (b.active && b.type != PHYS2D_STATIC && !b.sleeping) w.awake_bodies[w.awake_count++] = (uint32_t)i;
+    }
     for (int sub = 0; sub < substeps; sub++) {
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys2d_body& b = w.bodies[i];
-            if (!b.active || b.type != PHYS2D_DYNAMIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys2d_body& b = w.bodies[w.awake_bodies[k]];
+            if (b.type != PHYS2D_DYNAMIC) continue;
             b.velocity += (w.gravity * b.gravity_scale + b.force * b.inv_mass) * h;
             b.angular_velocity += b.torque * b.inv_inertia * h;
             b.velocity *= 1.0f / (1.0f + h * b.linear_damping);
@@ -1799,9 +1913,8 @@ static void phys2d__step(phys2d_world& w, float dt) {
             phys2d__joints_solve(w, h, true);
             phys2d__solve_contacts(w, inv_h, push_rate);
         }
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys2d_body& b = w.bodies[i];
-            if (!b.active || b.type == PHYS2D_STATIC || b.sleeping) continue;
+        for (size_t k = 0; k < w.awake_count; k++) {
+            phys2d_body& b = w.bodies[w.awake_bodies[k]];
             b.position += b.velocity * h;
             b.angle += b.angular_velocity * h;
             float turned = b.angle - b.prev_angle;
@@ -1856,7 +1969,7 @@ int phys2d_update(phys2d_world& w, float frame_dt) {
 
 // ---- queries ----
 
-// every body whose bounds overlap `r`, from both grids, each reported once
+// every body whose bounds overlap `r`, from all three grids, each reported once
 template <typename F>
 static void phys2d__query_rect(phys2d_world& w, rect2 r, F&& visit) {
     float inv = 1.0f / w.cell_size;
@@ -1869,13 +1982,13 @@ static void phys2d__query_rect(phys2d_world& w, rect2 r, F&& visit) {
             phys2d__make_poly(b.shape, b.position, b.angle, p);
             b.bounds = phys2d__poly_bounds(p);
         }
-        phys2d__build_grid(w, w.static_grid, true);
+        phys2d__build_grid(w, w.static_grid, PHYS2D__GRID_STATIC);
         w.statics_dirty = false;
     }
     int32_t x0 = phys2d__cell(r.min.x, inv), x1 = phys2d__cell(r.max.x, inv);
     int32_t y0 = phys2d__cell(r.min.y, inv), y1 = phys2d__cell(r.max.y, inv);
-    const phys2d__grid* grids[2] = { &w.static_grid, &w.moving_grid };
-    for (int g = 0; g < 2; g++) {
+    const phys2d__grid* grids[3] = { &w.static_grid, &w.moving_grid, &w.resting_grid };
+    for (int g = 0; g < 3; g++) {
         if (!grids[g]->items) continue;
         for (int32_t y = y0; y <= y1; y++)
             for (int32_t x = x0; x <= x1; x++) {

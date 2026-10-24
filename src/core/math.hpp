@@ -686,7 +686,14 @@ static inline mat4 mat4_from_mat3(const mat3& m) {
         for (int row = 0; row < 3; row++) r.data[c * 4 + row] = m.data[c * 3 + row];
     return r;
 }
-static inline mat3 mat3_from_quat(quat q) { return mat3_from_mat4(mat4_from_quat(q)); }
+// built directly rather than through a mat4: the same entries as mat4_from_quat
+static inline mat3 mat3_from_quat(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat3 m = { { 1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y + z * w), 2.0f * (x * z - y * w),
+                 2.0f * (x * y - z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z + x * w),
+                 2.0f * (x * z + y * w), 2.0f * (y * z - x * w), 1.0f - 2.0f * (x * x + y * y) } };
+    return m;
+}
 static inline mat3 mat3_rotate(vec3 axis, float radians) { return mat3_from_quat(quat_from_axis_angle(axis, radians)); }
 // What transforms normals correctly through `model` even when it scales
 // unevenly (a squashed sphere): the inverse transpose of its 3x3 part.

@@ -42,10 +42,13 @@ void phys2d_debug_draw(pix_batch2d& batch, const phys2d_world& w, unsigned flags
             pix_batch_circle(batch, pb, thickness * 2.5f, joint_c);
         }
     if (flags & PHYS2D_DRAW_GRID) {
-        const phys2d__grid& g = w.moving_grid;
-        for (size_t i = 0; i < g.count; i++) {
-            pix_rect cell = { g.items[i].cx * w.cell_size, g.items[i].cy * w.cell_size, w.cell_size, w.cell_size };
-            pix_batch_rect_lines(batch, cell, thickness, pix_rgba(255, 255, 255, 30));
+        const phys2d__grid* grids[2] = { &w.moving_grid, &w.resting_grid };
+        for (int k = 0; k < 2; k++) {
+            const phys2d__grid& g = *grids[k];
+            for (size_t i = 0; i < g.count; i++) {
+                pix_rect cell = { g.items[i].cx * w.cell_size, g.items[i].cy * w.cell_size, w.cell_size, w.cell_size };
+                pix_batch_rect_lines(batch, cell, thickness, pix_rgba(255, 255, 255, 30));
+            }
         }
     }
     for (size_t i = 0; i < w.body_count; i++) {

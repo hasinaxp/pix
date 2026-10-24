@@ -45,6 +45,10 @@ typedef ptrdiff_t GLintptr;
 #define GL_COPY_READ_BUFFER     0x8F36
 #define GL_COPY_WRITE_BUFFER    0x8F37
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
+// glMapBufferRange access bits: streaming writes straight into a buffer
+#define GL_MAP_WRITE_BIT              0x0002
+#define GL_MAP_INVALIDATE_RANGE_BIT   0x0004
+#define GL_MAP_UNSYNCHRONIZED_BIT     0x0020
 #define GL_DRAW_INDIRECT_BUFFER  0x8F3F
 #define GL_DISPATCH_INDIRECT_BUFFER 0x90EE
 #define GL_COMPUTE_SHADER        0x91B9
@@ -154,6 +158,8 @@ typedef void  (APIENTRY* PFN_glVertexAttrib4f)(GLuint, GLfloat, GLfloat, GLfloat
 typedef void  (APIENTRY* PFN_glVertexAttribDivisor)(GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstanced)(GLenum, GLsizei, GLenum, const void*, GLsizei);
 typedef void  (APIENTRY* PFN_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
+typedef void* (APIENTRY* PFN_glMapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+typedef GLboolean (APIENTRY* PFN_glUnmapBuffer)(GLenum);
 typedef void  (APIENTRY* PFN_glBindBufferBase)(GLenum, GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstancedBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint);
 typedef void  (APIENTRY* PFN_glDrawElementsBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLint);
@@ -226,7 +232,7 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glGetShaderInfoLog) E(glCreateProgram) E(glAttachShader) E(glLinkProgram) \
     E(glGetProgramiv) E(glGetProgramInfoLog) E(glDeleteShader) E(glDeleteProgram) E(glUseProgram) \
     E(glGenVertexArrays) E(glBindVertexArray) E(glGenBuffers) E(glBindBuffer) \
-    E(glBufferData) E(glBufferSubData) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
+    E(glBufferData) E(glBufferSubData) E(glMapBufferRange) E(glUnmapBuffer) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) \
     E(glEnableVertexAttribArray) E(glDisableVertexAttribArray) E(glVertexAttrib4f) \
     E(glVertexAttribDivisor) E(glDrawElementsInstanced) E(glDrawElementsInstancedBaseVertex) \
     E(glDrawElementsBaseVertex) E(glDrawArraysInstanced) E(glDrawArraysInstancedBaseInstance) \
