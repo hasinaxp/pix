@@ -80,8 +80,9 @@ void phys2d_debug_draw(pix_batch2d& batch, const phys2d_world& w, unsigned flags
             vec2 mid = (p.v[0] + p.v[1]) * 0.5f;
             pix_batch_line(batch, mid, mid + facing * p.radius, thickness, c);
         } else {
-            pix_batch_polyline(batch, p.v, 4, thickness, c, true);
-            pix_batch_line(batch, b.position, b.position + facing * minf(b.shape.half.x, b.shape.half.y), thickness, c);
+            pix_batch_polyline(batch, p.v, p.count, thickness, c, true);
+            float reach = b.shape.type == PHYS2D_POLYGON ? 0.5f * v2len(p.v[0] - b.position) : minf(b.shape.half.x, b.shape.half.y);
+            pix_batch_line(batch, b.position, b.position + facing * reach, thickness, c);
         }
     }
     if (flags & PHYS2D_DRAW_CONTACTS)
@@ -112,6 +113,50 @@ static void phys3d__draw_circle(pix_renderer& r, vec3 c, vec3 u, vec3 v, float r
     }
 }
 
+// one shape's outline; compounds draw each part
+static void phys3d__draw_shape(pix_renderer& r, const phys3d_shape& s, vec3 pos, quat rot, pix_color c) {
+    vec3 ax = quat_rotate(rot, v3(1, 0, 0)), ay = quat_rotate(rot, v3(0, 1, 0)), az = quat_rotate(rot, v3(0, 0, 1));
+    if (s.type == PHYS3D_SPHERE) {
+        phys3d__draw_circle(r, pos, ax, ay, s.radius, c);
+        phys3d__draw_circle(r, pos, ay, az, s.radius, c);
+        phys3d__draw_circle(r, pos, az, ax, s.radius, c);
+    } else if (s.type == PHYS3D_CAPSULE) {
+        vec3 top = pos + ay * s.half_length, bot = pos - ay * s.half_length;
+        phys3d__draw_circle(r, top, ax, az, s.radius, c);
+        phys3d__draw_circle(r, bot, ax, az, s.radius, c);
+        phys3d__draw_circle(r, top, ax, ay, s.radius, c);
+        phys3d__draw_circle(r, bot, ax, ay, s.radius, c);
+        phys3d__draw_circle(r, top, az, ay, s.radius, c);
+        phys3d__draw_circle(r, bot, az, ay, s.radius, c);
+        vec3 sides[4] = { ax, -ax, az, -az };
+        for (int k = 0; k < 4; k++) push_line(r, bot + sides[k] * s.radius, top + sides[k] * s.radius, c);
+    } else if (s.type == PHYS3D_BOX) {
+        phys3d__core core;
+        phys3d__make_core(s, pos, rot, core);
+        for (int a = 0; a < 8; a++)
+            for (int k = 0; k < 3; k++) {
+                int bb = a | (1 << k);
+                if (bb != a) push_line(r, core.v[a], core.v[bb], c);
+            }
+    } else if (s.type == PHYS3D_PLANE) {
+        vec3 n = quat_rotate(rot, s.normal), u, v;
+        phys3d__basis(n, &u, &v);
+        for (int k = -5; k <= 5; k++) {
+            push_line(r, pos + u * (k * 2.0f) - v * 10.0f, pos + u * (k * 2.0f) + v * 10.0f, c);
+            push_line(r, pos + v * (k * 2.0f) - u * 10.0f, pos + v * (k * 2.0f) + u * 10.0f, c);
+        }
+    } else if (s.type == PHYS3D_HULL) {
+        const phys3d_hull& h = *s.hull;
+        for (int e = 0; e < h.edge_count; e++)
+            push_line(r, pos + quat_rotate(rot, h.vertices[h.edges[e].v0]), pos + quat_rotate(rot, h.vertices[h.edges[e].v1]), c);
+    } else if (s.type == PHYS3D_COMPOUND) {
+        for (int i = 0; i < s.compound->count; i++) {
+            const phys3d_compound_child& ch = s.compound->children[i];
+            phys3d__draw_shape(r, ch.shape, pos + quat_rotate(rot, ch.position), quat_mul(rot, ch.rotation), c);
+        }
+    }
+}
+
 void phys3d_debug_draw(pix_renderer& r, const phys3d_world& w, unsigned flags) {
     const pix_color static_c = pix_rgba(140, 150, 165), dynamic_c = pix_rgba(110, 220, 120), ground_c = pix_rgba(240, 200, 80),
                     kinematic_c = pix_rgba(110, 170, 255), trigger_c = pix_rgba(80, 220, 230), sleeping_c = pix_rgba(70, 120, 85),
@@ -123,7 +168,6 @@ void phys3d_debug_draw(pix_renderer& r, const phys3d_world& w, unsigned flags) {
         pix_color c = b.trigger ? trigger_c : b.type == PHYS3D_STATIC ? static_c : b.type == PHYS3D_KINEMATIC ? kinematic_c
                     : b.sleeping ? sleeping_c : b.on_ground ? ground_c : dynamic_c;
         const phys3d_shape& s = b.shape;
-        vec3 ax = quat_rotate(b.rotation, v3(1, 0, 0)), ay = quat_rotate(b.rotation, v3(0, 1, 0)), az = quat_rotate(b.rotation, v3(0, 0, 1));
         if (s.type == PHYS3D_MESH) {
             if (!(flags & PHYS3D_DRAW_MESHES)) continue;
             const phys3d_mesh& m = *s.mesh;
@@ -135,36 +179,7 @@ void phys3d_debug_draw(pix_renderer& r, const phys3d_world& w, unsigned flags) {
             continue;
         }
         if (!(flags & PHYS3D_DRAW_SHAPES)) continue;
-        if (s.type == PHYS3D_SPHERE) {
-            phys3d__draw_circle(r, b.position, ax, ay, s.radius, c);
-            phys3d__draw_circle(r, b.position, ay, az, s.radius, c);
-            phys3d__draw_circle(r, b.position, az, ax, s.radius, c);
-        } else if (s.type == PHYS3D_CAPSULE) {
-            vec3 top = b.position + ay * s.half_length, bot = b.position - ay * s.half_length;
-            phys3d__draw_circle(r, top, ax, az, s.radius, c);
-            phys3d__draw_circle(r, bot, ax, az, s.radius, c);
-            phys3d__draw_circle(r, top, ax, ay, s.radius, c);
-            phys3d__draw_circle(r, bot, ax, ay, s.radius, c);
-            phys3d__draw_circle(r, top, az, ay, s.radius, c);
-            phys3d__draw_circle(r, bot, az, ay, s.radius, c);
-            vec3 sides[4] = { ax, -ax, az, -az };
-            for (int k = 0; k < 4; k++) push_line(r, bot + sides[k] * s.radius, top + sides[k] * s.radius, c);
-        } else if (s.type == PHYS3D_BOX) {
-            phys3d__core core;
-            phys3d__make_core(s, b.position, b.rotation, core);
-            for (int a = 0; a < 8; a++)
-                for (int k = 0; k < 3; k++) {
-                    int bb = a | (1 << k);
-                    if (bb != a) push_line(r, core.v[a], core.v[bb], c);
-                }
-        } else if (s.type == PHYS3D_PLANE) {
-            vec3 n = quat_rotate(b.rotation, s.normal), u, v;
-            phys3d__basis(n, &u, &v);
-            for (int k = -5; k <= 5; k++) {
-                push_line(r, b.position + u * (k * 2.0f) - v * 10.0f, b.position + u * (k * 2.0f) + v * 10.0f, c);
-                push_line(r, b.position + v * (k * 2.0f) - u * 10.0f, b.position + v * (k * 2.0f) + u * 10.0f, c);
-            }
-        }
+        phys3d__draw_shape(r, s, b.position, b.rotation, c);
     }
     if (flags & PHYS3D_DRAW_CONTACTS)
         for (size_t i = 0; i < w.contact_count; i++) {

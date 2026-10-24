@@ -56,6 +56,7 @@ struct pix_model {
     size_t                    clip_count;
     vec3 bounds_min;
     vec3 bounds_max;
+    void* owned;    // one heap block holding skeleton + clips; pix_unload_model frees it
 };
 
 // ---- lifetime and frame ----
@@ -75,6 +76,8 @@ PIXDEF int    pix_width(void);
 PIXDEF int    pix_height(void);
 
 PIXDEF void pix_set_title(const char* title);
+// Saves this frame, exactly as shown, as a PNG when the next pix_frame presents it.
+PIXDEF void pix_screenshot(const char* path);
 PIXDEF void pix_set_vsync_enabled(bool on);
 PIXDEF void pix_toggle_fullscreen(void);
 // Hides the cursor and keeps it centred; mouse_delta keeps reporting motion.
@@ -216,12 +219,31 @@ PIXDEF void pix_end_3d(void);
 PIXDEF void pix_finish_3d(void);
 // Draws a render target's colour in 2D (e.g. a minimap or a security camera).
 PIXDEF void pix_draw_target(const framebuffer& target, pix_rect dst, pix_color tint = PIX_WHITE);
-PIXDEF void pix_draw_mesh(idx mesh, idx material, const mat4& transform, pix_color tint = PIX_WHITE);
-PIXDEF void pix_draw_model(const pix_model& model, const mat4& transform, pix_color tint = PIX_WHITE);
+// motion_id: any number of yours, the same every frame, for things that move -
+// temporal AA then keeps their edges sharp (see pix_render_instance::motion_id)
+PIXDEF void pix_draw_mesh(idx mesh, idx material, const mat4& transform, pix_color tint = PIX_WHITE, uint32_t motion_id = 0);
+PIXDEF void pix_draw_model(const pix_model& model, const mat4& transform, pix_color tint = PIX_WHITE, uint32_t motion_id = 0);
 // `pose` (animator.pose) must stay alive until pix_end_3d
 PIXDEF void pix_draw_model_animated(const pix_model& model, const animation& pose, const mat4& transform,
                                     pix_color tint = PIX_WHITE);
 PIXDEF void pix_draw_line3d(vec3 a, vec3 b, pix_color color);
+// A picture standing in the world, `height` units tall (width from the
+// texture's shape), centred on `pos`. facing: PIX_FACE_CAMERA (turns to face
+// you), PIX_FACE_UPRIGHT (turns about y only: trees, sprite characters).
+// Unlit; fog applies. Alpha-blended unless `cutout` (hard edges, no sorting).
+PIXDEF void pix_draw_billboard(const pix_texture& t, vec3 pos, float height, pix_color tint = PIX_WHITE,
+                               int facing = PIX_FACE_CAMERA, bool cutout = false);
+// Part of a texture (`src` in pixels, an atlas frame), `size` in world units,
+// hung from `origin` (0..1 of the rect, y up: (0.5, 0) = bottom centre).
+PIXDEF void pix_draw_billboard_pro(const pix_texture& t, pix_rect src, vec3 pos, vec2 size, vec2 origin,
+                                   pix_color tint = PIX_WHITE, int facing = PIX_FACE_CAMERA, bool cutout = false);
+// Text in the world, letters `height` units tall, centred on `pos`: names over
+// heads, damage numbers, labels. Crisp at any distance (SDF).
+PIXDEF void pix_draw_text3d(const char* text, vec3 pos, float height, pix_color color,
+                            int facing = PIX_FACE_CAMERA);
+// Text lying in a plane: the transform's x axis is along the line, y is up, its
+// translation the text's centre - a sign on a wall, writing on the floor.
+PIXDEF void pix_draw_text3d_fixed(const char* text, const mat4& transform, float height, pix_color color);
 // the 3D physics world's shapes, contacts and joints as lines (see physics3d.hpp)
 PIXDEF void pix_draw_physics3d(const phys3d_world& world, unsigned flags = PHYS3D_DRAW_DEFAULT);
 PIXDEF void pix_draw_physics3d_flat(const phys3d_flat_world& world);
@@ -247,6 +269,9 @@ PIXDEF void pix_time_of_day(float hour);
 // ---- assets ----
 // .obj (with its .mtl texture/colours) or .gltf/.glb (static or rigged)
 PIXDEF pix_model pix_load_model(const char* path);
+// Frees the model's mesh, material, texture and animation data. Animators and
+// pix_anim_system actors made from it must not be used afterwards.
+PIXDEF void pix_unload_model(pix_model& model);
 // an animator with every clip the model shipped with, playing clip 0
 PIXDEF animator pix_model_animator(const pix_model& model);
 PIXDEF idx pix_make_material(pix_color color, float metallic = 0.0f, float roughness = 0.6f);
@@ -263,6 +288,7 @@ PIXDEF font_data& pix_default_font(void);
 
 // ---- audio ----
 PIXDEF idx  pix_load_sound(const char* wav_path);          // PIX_INVALID on failure
+PIXDEF void pix_unload_sound(idx sound);                   // stops it wherever it plays
 PIXDEF idx  pix_play_sound(idx sound, float volume = 1.0f, float pitch = 1.0f, bool loop = false,
                            float pan = 0.0f);                // returns a voice handle
 PIXDEF void pix_stop_sound(idx voice);
@@ -291,6 +317,7 @@ PIXDEF void pix_draw_model_bones(const pix_model& model, const mat4* bones, int 
 #include <stdarg.h>
 
 struct pix__context {
+    char            screenshot[260];   // taken at the end of this frame when set
     pix_window      window;
     unsigned int    flags;
     pix_renderer    renderer;
@@ -432,6 +459,35 @@ static void pix__run_effects(pix__context& c) {
     pix_apply_effects(c.renderer, pix__frame_fb(c));
 }
 
+void pix_screenshot(const char* path) {
+    if (!path) return;
+    strncpy(pix__ctx->screenshot, path, sizeof(pix__ctx->screenshot) - 1);
+}
+
+// The window's back buffer, complete (every 2D draw flushed, effects run),
+// read just before it is presented.
+static void pix__take_screenshot(pix__context& c) {
+    int w = c.window.width, h = c.window.height;
+    unsigned char* px = pix_new<unsigned char>((size_t)w * h * 3);
+    if (px) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+        // GL rows run bottom up, PNG top down
+        size_t row = (size_t)w * 3;
+        unsigned char* tmp = pix_new<unsigned char>(row);
+        for (int y = 0; tmp && y < h / 2; y++) {
+            memcpy(tmp, px + y * row, row);
+            memcpy(px + y * row, px + (h - 1 - y) * row, row);
+            memcpy(px + (h - 1 - y) * row, tmp, row);
+        }
+        pix_free(tmp);
+        if (!png_write_rgb(c.screenshot, px, w, h)) pix_log("pix: could not write screenshot '%s'", c.screenshot);
+        pix_free(px);
+    }
+    c.screenshot[0] = 0;
+}
+
 bool pix_frame(void) {
     if (!pix__ctx) return false;
     pix__context& c = *pix__ctx;
@@ -439,6 +495,7 @@ bool pix_frame(void) {
     pix__run_effects(c);
     pix_batch2d_flush(c.batch);
     pix__present_virtual(c);
+    if (c.screenshot[0]) pix__take_screenshot(c);
     pix_update_window(c.window);     // presents the finished frame, then pumps input
     if (c.window.resized) pix__fit_renderer(c);
 
@@ -792,21 +849,27 @@ void pix_end_3d(void) {
 
 static vec4 pix__tint(pix_color c) { return pix_color_to_vec4(c); }
 
-void pix_draw_mesh(idx mesh, idx material, const mat4& transform, pix_color tint) {
-    push_instance(pix_get_renderer(), mesh, material, transform, pix__tint(tint));
+void pix_draw_mesh(idx mesh, idx material, const mat4& transform, pix_color tint, uint32_t motion_id) {
+    pix_renderer& r = pix_get_renderer();
+    size_t before = r.renderable_count;
+    push_instance(r, mesh, material, transform, pix__tint(tint));
+    if (motion_id && r.renderable_count > before) r.instances[before].motion_id = motion_id;
 }
 
-void pix_draw_model(const pix_model& m, const mat4& transform, pix_color tint) {
+// the skeleton pix_draw_model's cached rest pose belongs to; cleared on unload
+// because the next model's skeleton can land at the same address
+static const skeleton_file_data* pix__rest_of = 0;
+
+void pix_draw_model(const pix_model& m, const mat4& transform, pix_color tint, uint32_t motion_id) {
     if (m.mesh == PIX_INVALID) return;
     if (m.skinned) {
         // a rigged model drawn without a pose: its rest pose, cached per model skeleton
         static animation rest;
-        static const skeleton_file_data* rest_of = 0;
-        if (rest_of != m.skeleton && m.skeleton) { animation_rest_pose(*m.skeleton, &rest); rest_of = m.skeleton; }
+        if (pix__rest_of != m.skeleton && m.skeleton) { animation_rest_pose(*m.skeleton, &rest); pix__rest_of = m.skeleton; }
         pix_draw_model_animated(m, rest, transform, tint);
         return;
     }
-    push_instance(pix_get_renderer(), m.mesh, m.material, transform, pix__tint(tint));
+    pix_draw_mesh(m.mesh, m.material, transform, tint, motion_id);
 }
 
 void pix_draw_model_animated(const pix_model& m, const animation& pose, const mat4& transform, pix_color tint) {
@@ -820,6 +883,81 @@ void pix_draw_model_animated(const pix_model& m, const animation& pose, const ma
 }
 
 void pix_draw_line3d(vec3 a, vec3 b, pix_color c)      { push_line(pix_get_renderer(), a, b, c); }
+
+static vec4 pix__linear_color(pix_color c) {
+    return v4(powf(c.r / 255.0f, 2.2f), powf(c.g / 255.0f, 2.2f), powf(c.b / 255.0f, 2.2f), c.a / 255.0f);
+}
+
+void pix_draw_billboard_pro(const pix_texture& t, pix_rect src, vec3 pos, vec2 size, vec2 origin,
+                            pix_color tint, int facing, bool cutout) {
+    if (!t.id || t.width <= 0 || t.height <= 0) return;
+    pix_quad3d q = {};
+    q.anchor = pos;
+    q.facing = facing;
+    q.right = v3(1, 0, 0);
+    q.up = v3(0, 1, 0);
+    q.rect = v4(-origin.x * size.x, -origin.y * size.y, (1.0f - origin.x) * size.x, (1.0f - origin.y) * size.y);
+    q.uv = v4(src.x / t.width, src.y / t.height, (src.x + src.w) / t.width, (src.y + src.h) / t.height);
+    q.color = pix__linear_color(tint);
+    q.texture = t.id;
+    q.cutout = cutout;
+    push_quad3d(pix_get_renderer(), q);
+}
+
+void pix_draw_billboard(const pix_texture& t, vec3 pos, float height, pix_color tint, int facing, bool cutout) {
+    if (t.height <= 0) return;
+    pix_rect all = { 0.0f, 0.0f, (float)t.width, (float)t.height };
+    vec2 size = v2(height * (float)t.width / (float)t.height, height);
+    pix_draw_billboard_pro(t, all, pos, size, v2(0.5f, 0.5f), tint, facing, cutout);
+}
+
+// One quad per glyph, all hung off the same anchor, so the label turns (and
+// sorts) as one piece. Laid out the way 2D text is, then centred and flipped
+// to y up.
+static void pix__text3d(const char* text, vec3 anchor, int facing, vec3 right, vec3 up, float height,
+                        pix_color color) {
+    font_data& font = pix_default_font();
+    if (!text || !font.bitmap) return;
+    if (!font.atlas_texture)
+        font.atlas_texture = opengl_create_texture2d((int)font.width, (int)font.height, 1, font.bitmap,
+                                                     TEXTURE_LINEAR | TEXTURE_CLAMP);
+    float scale = pix__font_scale(font, height);
+    vec2 extent = pix_measure_text(font, text, height, 0.0f);
+    float iw = 1.0f / (float)font.width, ih = 1.0f / (float)font.height;
+    pix_quad3d q = {};
+    q.anchor = anchor;
+    q.facing = facing;
+    q.right = right;
+    q.up = up;
+    q.color = pix__linear_color(color);
+    q.texture = font.atlas_texture;
+    q.sdf = true;
+    float pen_x = 0.0f, pen_y = font.ascent * scale;   // from the top-left, y down
+    const char* p = text;
+    while (*p) {
+        unsigned int cp = pix__utf8_next(&p);
+        if (cp == '\n') { pen_x = 0.0f; pen_y += font.line_height * scale; continue; }
+        const glyph& g = font.glyphs[pix_font_slot(cp)];
+        if (g.crop.z > 0.0f) {
+            float x0 = pen_x + g.offset.x * scale, y0 = pen_y + g.offset.y * scale;
+            float x1 = x0 + g.crop.z * scale, y1 = y0 + g.crop.w * scale;
+            q.rect = v4(x0 - extent.x * 0.5f, extent.y * 0.5f - y1, x1 - extent.x * 0.5f, extent.y * 0.5f - y0);
+            q.uv = v4(g.crop.x * iw, g.crop.y * ih, (g.crop.x + g.crop.z) * iw, (g.crop.y + g.crop.w) * ih);
+            push_quad3d(pix_get_renderer(), q);
+        }
+        pen_x += g.advance * scale;
+    }
+}
+
+void pix_draw_text3d(const char* text, vec3 pos, float height, pix_color color, int facing) {
+    pix__text3d(text, pos, facing, v3(1, 0, 0), v3(0, 1, 0), height, color);
+}
+
+void pix_draw_text3d_fixed(const char* text, const mat4& m, float height, pix_color color) {
+    vec3 right = v3norm(mat4_mul_dir(m, v3(1, 0, 0)));
+    vec3 up = v3norm(mat4_mul_dir(m, v3(0, 1, 0)));
+    pix__text3d(text, mat4_get_translation(m), PIX_FACE_FIXED, right, up, height, color);
+}
 void pix_draw_physics3d(const phys3d_world& w, unsigned flags) { phys3d_debug_draw(pix_get_renderer(), w, flags); }
 void pix_draw_physics3d_flat(const phys3d_flat_world& w)         { phys3d_flat_debug_draw(pix_get_renderer(), w); }
 void pix_draw_grid(float size, int cells, pix_color c) { push_grid_lines(pix_get_renderer(), v3(0, 0, 0), size, cells, c); }
@@ -854,6 +992,67 @@ static bool pix__ends_with(const char* s, const char* suffix) {
 }
 
 static vec3 pix__srgb3(pix_color c) { return v3(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f); }
+
+// Copies a skeleton and its clips (with their tracks and keys) into one heap
+// block, so the loader's arena can be rewound and unloading is one free.
+static void pix__own_animation(pix_model& model, const skeleton_file_data& sk,
+                               const animation_clip_file_data* clips, size_t clip_count) {
+    #define PIX__ALIGN16(n) (((n) + 15) & ~(size_t)15)
+    size_t size = PIX__ALIGN16(sizeof(skeleton_file_data)) + PIX__ALIGN16(sk.bone_count * sizeof(bone))
+                + PIX__ALIGN16(clip_count * sizeof(animation_clip_file_data));
+    for (size_t c = 0; c < clip_count; c++) {
+        size += PIX__ALIGN16(clips[c].track_count * sizeof(bone_animation_track));
+        for (size_t t = 0; t < clips[c].track_count; t++)
+            size += PIX__ALIGN16(clips[c].tracks[t].keyframe_count * sizeof(bone_keyframe));
+    }
+    char* block = (char*)pix_new<char>(size);
+    if (!block) return;
+    char* at = block;
+    #define PIX__TAKE(T, n) (T*)at; at += PIX__ALIGN16((n) * sizeof(T))
+    skeleton_file_data* s = PIX__TAKE(skeleton_file_data, 1);
+    *s = sk;
+    s->bones = PIX__TAKE(bone, sk.bone_count);
+    memcpy(s->bones, sk.bones, sk.bone_count * sizeof(bone));
+    animation_clip_file_data* out = PIX__TAKE(animation_clip_file_data, clip_count);
+    for (size_t c = 0; c < clip_count; c++) {
+        out[c] = clips[c];
+        out[c].tracks = PIX__TAKE(bone_animation_track, clips[c].track_count);
+        for (size_t t = 0; t < clips[c].track_count; t++) {
+            const bone_animation_track& src = clips[c].tracks[t];
+            out[c].tracks[t] = src;
+            out[c].tracks[t].keyframes = PIX__TAKE(bone_keyframe, src.keyframe_count);
+            if (src.keyframe_count) memcpy(out[c].tracks[t].keyframes, src.keyframes, src.keyframe_count * sizeof(bone_keyframe));
+        }
+    }
+    #undef PIX__TAKE
+    #undef PIX__ALIGN16
+    model.owned = block;
+    model.skeleton = s;
+    model.clips = clip_count ? out : 0;
+    model.clip_count = clip_count;
+}
+
+void pix_unload_model(pix_model& m) {
+    pix_renderer& r = pix_get_renderer();
+    if (m.material != PIX_INVALID) {
+        material* mat = pix_get_material(r, m.material);
+        if (mat) {   // a model's textures are its own
+            opengl_destroy_texture(mat->texture);
+            opengl_destroy_texture(mat->normal_map);
+            opengl_destroy_texture(mat->orm_map);
+            opengl_destroy_texture(mat->emissive_map);
+        }
+        pix_unload_material(r, m.material);
+    }
+    if (m.mesh != PIX_INVALID) {
+        if (m.skinned) pix_unload_skinned_mesh(r, m.mesh);
+        else           pix_unload_mesh(r, m.mesh);
+    }
+    if (pix__rest_of == m.skeleton) pix__rest_of = 0;
+    pix_free(m.owned);
+    m = pix_model();
+    m.mesh = m.material = PIX_INVALID;
+}
 
 pix_model pix_load_model(const char* path) {
     pix_model model = {};
@@ -895,19 +1094,37 @@ pix_model pix_load_model(const char* path) {
         skinned_mesh_file_data* md = get_model_mesh(l, id);
         skeleton_file_data* sk = get_model_skeleton(l, id);
         if (!md) { pix_loader_rewind(l, mark); return model; }
+        const pbr_file_data& pbr = mf.pbr;
+        // material.color is an sRGB multiplier, the glTF factor is linear
+        vec3 tint = v3(powf(pbr.base_color.x, 1.0f / 2.2f), powf(pbr.base_color.y, 1.0f / 2.2f),
+                       powf(pbr.base_color.z, 1.0f / 2.2f));
         model.material = load_material_image(r, mf.image >= 0 ? &l.image_files[mf.image] : 0,
-                                             v3(1, 1, 1), 0.0f, 0.6f, mf.image_is_palette);
+                                             tint, pbr.metallic, pbr.roughness, mf.image_is_palette);
+        material* mat = pix_get_material(r, model.material);
+        if (mat) {
+            const int32_t images[3] = { pbr.normal_image, pbr.orm_image, pbr.emissive_image };
+            idx* slots[3] = { &mat->normal_map, &mat->orm_map, &mat->emissive_map };
+            for (int i = 0; i < 3; i++) {
+                if (images[i] < 0) continue;
+                const image_file_data& im = l.image_files[images[i]];
+                *slots[i] = opengl_create_texture2d(im.width, im.height, 4, im.data, TEXTURE_BILINEAR);
+            }
+            mat->normal_scale = pbr.normal_scale;
+            mat->occlusion = pbr.occlusion_strength;
+            mat->emissive = pbr.emissive;
+        }
         mesh tmp = {};
         pix__mesh_bounds(tmp, md->vertex_data, md->vertex_count, sizeof(vertex_rigged));
         model.bounds_min = tmp.bounds_min;
         model.bounds_max = tmp.bounds_max;
         if (sk && sk->bone_count) {
-            // rigged: skeleton and clips stay resident, the animator reads them every frame
+            // rigged: the animator reads skeleton and clips every frame, so they
+            // move out of the loader into a block the model owns
             model.skinned = true;
             model.mesh = load_skinned_mesh(r, *md);
-            model.skeleton = sk;
-            model.clip_count = mf.animation_count;
-            model.clips = mf.first_animation >= 0 ? &l.animation_clips[mf.first_animation] : 0;
+            pix__own_animation(model, *sk, mf.first_animation >= 0 ? &l.animation_clips[mf.first_animation] : 0,
+                               mf.animation_count);
+            pix_loader_rewind(l, mark);
         } else {
             model.mesh = load_mesh_from_skinned(r, *md);
             pix_loader_rewind(l, mark);   // a static prop needs nothing CPU side
@@ -993,6 +1210,7 @@ idx  pix_play_sound(idx s, float volume, float pitch, bool loop, float pan) {
     return play_sound(pix_get_audio(), s, volume, pitch, loop, pan);
 }
 void pix_stop_sound(idx voice) { stop_sound(pix_get_audio(), voice); }
+void pix_unload_sound(idx s)   { unload_sound(pix_get_audio(), s); }
 void pix_set_volume(float v)   { set_master_volume(pix_get_audio(), v); }
 
 pix_jobs& pix_get_jobs(void) {

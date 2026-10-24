@@ -43,6 +43,8 @@ layout(std140, binding = 0) uniform SceneBlock {
     vec4 bFogHeight;      // x height the fog thins from, y falloff per metre (0 = even), z sun scatter, w max opacity
     vec4 bScreenFx;       // x screen AO / contact shadow texture ready for this view, w frame number
     vec4 bShadowSoft;     // x sun penumbra (0 = plain PCF), y local shadow texel angle, z cascade depth range, w local tiles per row
+    vec4 bIbl;            // HDR environment: x ready, y max mip of its prefiltered cube, z intensity
+    vec4 bSH[9];          // its diffuse light: order-2 SH (rgb), cosine-convolved and divided by pi
 };
 #define uViewProj       bViewProj
 #define uSunDir         bSunDir.xyz
@@ -117,6 +119,24 @@ vec3 apply_fog(vec3 color, vec3 world) {
 // interleaved gradient noise (Jimenez 2014): a per-pixel offset that breaks
 // sampling patterns into fine noise
 float ign(vec2 px) { return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715)))); }
+// The environment's diffuse light arriving at a surface facing `n`, ready to
+// multiply by albedo (Ramamoorthi & Hanrahan 2001, the nine-coefficient form).
+vec3 sh_irradiance(vec3 n) {
+    return max(bSH[0].rgb * 0.282095
+             + bSH[1].rgb * 0.488603 * n.y + bSH[2].rgb * 0.488603 * n.z + bSH[3].rgb * 0.488603 * n.x
+             + bSH[4].rgb * 1.092548 * n.x * n.y + bSH[5].rgb * 1.092548 * n.y * n.z
+             + bSH[6].rgb * 0.315392 * (3.0 * n.z * n.z - 1.0)
+             + bSH[7].rgb * 1.092548 * n.x * n.z + bSH[8].rgb * 0.546274 * (n.x * n.x - n.y * n.y), vec3(0.0));
+}
+// LOD cross-fade: while an object changes detail level both levels draw, and
+// share the pixels by a screen-door pattern. `lod` 0 = whole; c > 0 keeps the
+// pattern below c, -c the rest - so the pair always covers each pixel once.
+// Call with gl_FragCoord.xy from a fragment shader.
+bool lod_hidden(float lod, vec2 px) {
+    if (lod == 0.0) return false;
+    float d = ign(px);
+    return lod > 0.0 ? d >= lod : d < -lod;
+}
 )";
 
 // ---- shared BRDF ----
@@ -407,6 +427,8 @@ void clip_test(vec3 world) {
 // incoming light from direction `dir`, blurred to match `rough`
 vec3 env_specular(vec3 dir, float rough) {
     if (bReflect.y > 0.5) return textureLod(uEnvMap, dir, rough * bReflect.z).rgb * bReflect.w;
+    // no probe: the HDR environment's prefiltered cube sits on the same unit
+    if (bIbl.x > 0.5) return textureLod(uEnvMap, dir, rough * bIbl.y).rgb * bIbl.z;
     vec3 flat_dome = mix(uSkyHorizon, uSkyZenith, clamp(dir.y * 0.5 + 0.5, 0.0, 1.0));
     return mix(sky_env(dir), flat_dome, rough * rough);
 }
@@ -446,7 +468,7 @@ vec3 shade_surface_full(vec3 world, vec3 n, vec3 albedo, float metal, float roug
     direct += punctual_lights(world, n, v, diff_albedo, f0, a);
 
     float hemi = n.y * 0.5 + 0.5;
-    vec3 irradiance = mix(uGroundColor, uSkyColor, hemi);
+    vec3 irradiance = bIbl.x > 0.5 ? sh_irradiance(n) * bIbl.z : mix(uGroundColor, uSkyColor, hemi);
     // the probe's blurriest mip is a cheap stand-in for bounced light
     if (bReflect.y > 0.5) irradiance = mix(irradiance, textureLod(uEnvMap, n, bReflect.z).rgb * bReflect.w, 0.5);
     vec3 amb_diffuse = irradiance * diff_albedo;
@@ -527,15 +549,23 @@ layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
 layout(location=3) in mat4 aModel;   // consumes 3..6
 layout(location=7) in vec4 aTint;
+layout(location=8) in vec4 aTangent;
+layout(location=9) in float aLod;    // LOD cross-fade (see lod_hidden), 0 = none
 out vec3 vNormal;
 out vec2 vUV;
 out vec3 vWorld;
 out vec4 vTint;
+out vec4 vTangent;
+flat out float vLod;
 void main() {
+    vLod = aLod;
     vec4 world = aModel * vec4(aPos, 1.0);
     vWorld = world.xyz;
     gl_Position = uViewProj * world;
-    vNormal = mat3(aModel) * aNormal;
+    mat3 m = mat3(aModel);
+    vNormal = m * aNormal;
+    // a mirroring instance (negative scale) swaps which side the bitangent is on
+    vTangent = vec4(m * aTangent.xyz, determinant(m) < 0.0 ? -aTangent.w : aTangent.w);
     vUV = aUV;
     vTint = aTint;
 }
@@ -569,17 +599,23 @@ layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
 layout(location=3) in vec4 aBoneIds;
 layout(location=4) in vec4 aWeights;
+layout(location=5) in vec4 aTangent;
 out vec3 vNormal;
 out vec2 vUV;
 out vec3 vWorld;
 out vec4 vTint;
+out vec4 vTangent;
+flat out float vLod;
 void main() {
+    vLod = 0.0;   // skinned meshes have no LOD chain
     SkinInstance si = skin_instance();
     mat4 skin = skin_matrix(si, aBoneIds, aWeights);
     vec4 world = si.model * (skin * vec4(aPos, 1.0));
     vWorld = world.xyz;
     gl_Position = uViewProj * world;
-    vNormal = mat3(si.model) * (mat3(skin) * aNormal);
+    mat3 m = mat3(si.model) * mat3(skin);
+    vNormal = m * aNormal;
+    vTangent = vec4(m * aTangent.xyz, determinant(mat3(si.model)) < 0.0 ? -aTangent.w : aTangent.w);
     vUV = aUV;
     vTint = si.tint;
 }
@@ -591,6 +627,8 @@ in vec3 vNormal;
 in vec2 vUV;
 in vec3 vWorld;
 in vec4 vTint;
+in vec4 vTangent;
+flat in float vLod;
 out vec4 frag;
 
 uniform sampler2D uTex;
@@ -603,21 +641,44 @@ uniform int   uUnlit;
 uniform float uPlanar;        // 0..1: how much of the planar mirror this surface shows
 uniform float uRefraction;    // > 0: see-through, bending what is behind by this much
 uniform vec4  uToon;          // x toon amount (0 PBR .. 1 cel), y bands, z rim, w highlight size
+uniform sampler2D uNormalMap;
+uniform sampler2D uOrmMap;     // r occlusion, g roughness, b metallic
+uniform sampler2D uEmissiveMap;
+uniform int   uMaps;          // bit 0 normal, 1 orm, 2 emissive
+uniform vec2  uMapScale;      // x normal strength, y occlusion strength
 
 void main() {
     clip_test(vWorld);
+    if (lod_hidden(vLod, gl_FragCoord.xy)) discard;
     vec4 tex = texture(uTex, vUV);
     float alpha = tex.a * uColor.a * vTint.a;
     if (alpha < uAlphaCutoff) discard;
     vec3 albedo = srgb_to_linear(tex.rgb * uColor.rgb * vTint.rgb);
-    if (uUnlit != 0) { frag = vec4(albedo + uEmissive, alpha); return; }
+    vec3 emissive = uEmissive;
+    if ((uMaps & 4) != 0) emissive *= srgb_to_linear(texture(uEmissiveMap, vUV).rgb);
+    if (uUnlit != 0) { frag = vec4(albedo + emissive, alpha); return; }
     vec3 n = normalize(vNormal);
+    if ((uMaps & 1) != 0) {
+        // the interpolated frame drifts off perpendicular: square it up first
+        vec3 t = normalize(vTangent.xyz - n * dot(n, vTangent.xyz));
+        vec3 b = cross(n, t) * (vTangent.w < 0.0 ? -1.0 : 1.0);
+        vec3 tn = texture(uNormalMap, vUV).xyz * 2.0 - 1.0;
+        tn.xy *= uMapScale.x;
+        n = normalize(t * tn.x + b * tn.y + n * tn.z);
+    }
     if (!gl_FrontFacing) n = -n;   // double-sided materials light their back faces too
+    float metal = uMetallic, rough = uRoughness, occlusion = 1.0;
+    if ((uMaps & 2) != 0) {
+        vec3 orm = texture(uOrmMap, vUV).rgb;
+        occlusion = mix(1.0, orm.r, uMapScale.y);
+        rough *= orm.g;
+        metal *= orm.b;
+    }
     vec3 lit;
-    if (uToon.x >= 0.999)     lit = shade_toon(vWorld, n, albedo, uToon, uEmissive);
-    else if (uToon.x > 0.0)   lit = mix(shade_surface_ex(vWorld, n, albedo, uMetallic, uRoughness, uEmissive, uPlanar),
-                                        shade_toon(vWorld, n, albedo, uToon, uEmissive), uToon.x);
-    else                      lit = shade_surface_ex(vWorld, n, albedo, uMetallic, uRoughness, uEmissive, uPlanar);
+    if (uToon.x >= 0.999)     lit = shade_toon(vWorld, n, albedo, uToon, emissive);
+    else if (uToon.x > 0.0)   lit = mix(shade_surface_full(vWorld, n, albedo, metal, rough, emissive, uPlanar, occlusion),
+                                        shade_toon(vWorld, n, albedo, uToon, emissive), uToon.x);
+    else                      lit = shade_surface_full(vWorld, n, albedo, metal, rough, emissive, uPlanar, occlusion);
     if (uRefraction > 0.0) {
         // glass: the scene behind, tinted by the surface colour, with the lit
         // surface (its reflections and highlights) laid over it by opacity
@@ -787,9 +848,11 @@ static const char* const VSHDER_DEPTH = R"(#version 440 core
 layout(location=0) in vec3 aPos;
 layout(location=2) in vec2 aUV;
 layout(location=3) in mat4 aModel;
+layout(location=9) in float aLod;
 uniform mat4 uLightViewProj;
 out vec2 vUV;
-void main() { vUV = aUV; gl_Position = uLightViewProj * (aModel * vec4(aPos, 1.0)); }
+flat out float vLod;
+void main() { vUV = aUV; vLod = aLod; gl_Position = uLightViewProj * (aModel * vec4(aPos, 1.0)); }
 )";
 
 static const char* const VSHDER_DEPTH_SKINNED = R"(#version 440 core
@@ -805,11 +868,22 @@ void main() {
     gl_Position = uLightViewProj * (si.model * (skin_matrix(si, aBoneIds, aWeights) * vec4(aPos, 1.0)));
 }
 )";
+// PIX_LOD_FADE: built with VSHDER_DEPTH, which carries the LOD cross-fade; the
+// twins of custom vertex stages are built without it (they do not write vLod).
 static const char* const FSHDER_DEPTH = R"(#version 440 core
 in vec2 vUV;
+#ifdef PIX_LOD_FADE
+flat in float vLod;
+#endif
 uniform sampler2D uTex;
 uniform float uAlphaCutoff;
 void main() {
+#ifdef PIX_LOD_FADE
+    if (vLod != 0.0) {   // lod_hidden, which this unspliced shader cannot call
+        float d = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        if (vLod > 0.0 ? d >= vLod : d < -vLod) discard;
+    }
+#endif
     if (uAlphaCutoff > 0.0 && texture(uTex, vUV).a < uAlphaCutoff) discard;
 }
 )";
@@ -821,11 +895,17 @@ void main() {
 static const char* const FSHDER_PREPASS = R"(#version 440 core
 in vec3 vNormal;
 in vec2 vUV;
+#ifdef PIX_LOD_FADE
+flat in float vLod;   // only with VSHDER_BASIC (see FSHDER_DEPTH)
+#endif
 out vec4 frag;
 uniform sampler2D uTex;
 uniform float uAlphaCutoff;
 uniform float uOutlineGroup;
 void main() {
+#ifdef PIX_LOD_FADE
+    if (lod_hidden(vLod, gl_FragCoord.xy)) discard;
+#endif
     if (uAlphaCutoff > 0.0 && texture(uTex, vUV).a < uAlphaCutoff) discard;
     vec3 n = normalize(vNormal);
     if (!gl_FrontFacing) n = -n;
@@ -1144,10 +1224,11 @@ static const char* const FSHDER_SKY = R"(#version 440 core
 in vec2 vNDC;
 out vec4 frag;
 uniform mat4 uInvViewProj;
+uniform samplerCube uSkyCube;   // the HDR environment, when bIbl.x
 void main() {
     vec4 far = uInvViewProj * vec4(vNDC, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - uCameraPos);
-    vec3 col = sky_env(dir);
+    vec3 col = bIbl.x > 0.5 ? textureLod(uSkyCube, dir, 0.0).rgb * bIbl.z : sky_env(dir);
     if (bFogHeight.y > 0.0) {
         // height fog: as much as a ray that never hits anything gathers
         frag = vec4(mix(col, fog_color(dir), fog_amount(uCameraPos + dir * bScreen.w)), 1.0);
@@ -1367,6 +1448,194 @@ void main() {
     if (r2 > 1.0) discard;
     float falloff = 1.0 - r2;
     frag = vec4(vColor.rgb, vColor.a * falloff * falloff);
+}
+)";
+
+// ---- world quads: billboards and 3D text ----
+static const char* const VSHDER_QUAD3D = R"(#version 440 core
+layout(location=0) in vec4 aAnchor;   // xyz world anchor, w facing (PIX_FACE_*)
+layout(location=1) in vec4 aRect;     // x0, y0, x1, y1 along right/up
+layout(location=2) in vec4 aUV;       // u0, v0 top-left, u1, v1 bottom-right
+layout(location=3) in vec4 aColor;    // linear rgb, alpha
+layout(location=4) in vec4 aRight;    // fixed facing's right axis, w = sdf
+layout(location=5) in vec4 aUp;       // fixed facing's up axis
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+out vec2 vUV;
+out vec4 vColor;
+out vec3 vWorld;
+flat out float vSdf;
+void main() {
+    vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));   // strip corner, 0..1
+    int facing = int(aAnchor.w + 0.5);
+    vec3 right = aRight.xyz, up = aUp.xyz;
+    if (facing == 0) {
+        right = uCamRight; up = uCamUp;
+    } else if (facing == 1) {
+        // about world y toward the camera; from straight above, the screen's right will do
+        up = vec3(0.0, 1.0, 0.0);
+        vec3 to = uCameraPos - aAnchor.xyz;
+        to.y = 0.0;
+        right = dot(to, to) > 1e-8 ? normalize(cross(up, to)) : uCamRight;
+    }
+    vec2 local = mix(aRect.xy, aRect.zw, c);
+    vWorld = aAnchor.xyz + right * local.x + up * local.y;
+    gl_Position = uViewProj * vec4(vWorld, 1.0);
+    vUV = vec2(mix(aUV.x, aUV.z, c.x), mix(aUV.w, aUV.y, c.y));   // rect y up, image v down
+    vColor = aColor;
+    vSdf = aRight.w;
+}
+)";
+
+static const char* const FSHDER_QUAD3D = R"(#version 440 core
+in vec2 vUV;
+in vec4 vColor;
+in vec3 vWorld;
+flat in float vSdf;
+out vec4 frag;
+uniform sampler2D uTex;
+uniform int uCutout;
+void main() {
+    vec4 t = texture(uTex, vUV);
+    vec3 rgb = vColor.rgb;
+    float a;
+    if (vSdf > 0.5) {
+        // glyph: 0.5 is the outline, one pixel of smoothing at any distance
+        float w = max(fwidth(t.r), 1e-4);
+        a = smoothstep(0.5 - w, 0.5 + w, t.r) * vColor.a;
+    } else {
+        rgb *= srgb_to_linear(t.rgb);
+        a = t.a * vColor.a;
+    }
+    if (uCutout != 0) { if (a < 0.5) discard; a = 1.0; }
+    else if (a < 0.002) discard;
+    frag = vec4(apply_fog(rgb, vWorld), a);
+}
+)";
+
+// ---- temporal AA ----
+// Velocity of the things that moved on their own (instances with a motion_id):
+// where each pixel of them was last frame, as a uv offset. Rasterised with the
+// jittered camera so it depth-tests against the scene it belongs to; measured
+// with the unjittered ones so the jitter itself is not motion.
+static const char* const VSHDER_VELOCITY = R"(#version 440 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in mat4 aModel;      // 1..4
+layout(location=5) in mat4 aPrevModel;  // 5..8
+uniform mat4 uJitteredViewProj;
+uniform mat4 uCurViewProj;
+uniform mat4 uPrevViewProj;
+out vec4 vCur;
+out vec4 vPrev;
+void main() {
+    vec4 world = aModel * vec4(aPos, 1.0);
+    gl_Position = uJitteredViewProj * world;
+    vCur = uCurViewProj * world;
+    vPrev = uPrevViewProj * (aPrevModel * vec4(aPos, 1.0));
+}
+)";
+
+static const char* const FSHDER_VELOCITY = R"(#version 440 core
+in vec4 vCur;
+in vec4 vPrev;
+out vec2 frag;
+void main() { frag = (vCur.xy / vCur.w - vPrev.xy / vPrev.w) * 0.5; }
+)";
+
+// The resolve: this frame's jittered image blended into the history, which is
+// fetched where each pixel was last frame (its velocity, or the camera's
+// motion through the depth buffer) with a Catmull-Rom filter (Jimenez 2016) so
+// it does not blur, then clipped to the colour range of the pixel's current
+// neighbourhood - variance clipping in YCoCg (Salvi 2016) - so what is no
+// longer there cannot linger. Blended with luminance weights (Karis 2014) so
+// bright pixels do not flicker.
+static const char* const FSHDER_TAA = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uScene;
+uniform sampler2D uHistory;
+uniform sampler2D uVelocity;
+uniform sampler2D uDepth;
+uniform mat4  uInvViewProj;    // this frame, unjittered
+uniform mat4  uPrevViewProj;   // last frame, unjittered
+uniform vec2  uTexel;
+uniform float uFeedback;
+uniform int   uHasHistory;
+
+vec3 to_ycocg(vec3 c) { return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)), dot(c, vec3(-0.25, 0.5, -0.25))); }
+vec3 from_ycocg(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+
+vec3 history_catmull_rom(vec2 uv) {
+    vec2 size = 1.0 / uTexel;
+    vec2 pos = uv * size;
+    vec2 t1 = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - t1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 t0 = (t1 - 1.0) * uTexel, t3 = (t1 + 2.0) * uTexel, t12 = (t1 + w2 / w12) * uTexel;
+    vec3 c = textureLod(uHistory, vec2(t0.x,  t0.y), 0.0).rgb  * w0.x  * w0.y
+           + textureLod(uHistory, vec2(t12.x, t0.y), 0.0).rgb  * w12.x * w0.y
+           + textureLod(uHistory, vec2(t3.x,  t0.y), 0.0).rgb  * w3.x  * w0.y
+           + textureLod(uHistory, vec2(t0.x,  t12.y), 0.0).rgb * w0.x  * w12.y
+           + textureLod(uHistory, vec2(t12.x, t12.y), 0.0).rgb * w12.x * w12.y
+           + textureLod(uHistory, vec2(t3.x,  t12.y), 0.0).rgb * w3.x  * w12.y
+           + textureLod(uHistory, vec2(t0.x,  t3.y), 0.0).rgb  * w0.x  * w3.y
+           + textureLod(uHistory, vec2(t12.x, t3.y), 0.0).rgb  * w12.x * w3.y
+           + textureLod(uHistory, vec2(t3.x,  t3.y), 0.0).rgb  * w3.x  * w3.y;
+    return max(c, vec3(0.0));
+}
+
+// pull `h` toward the box centre until it is inside (Playdead's clip, not a clamp)
+vec3 clip_to_box(vec3 h, vec3 lo, vec3 hi) {
+    vec3 centre = 0.5 * (hi + lo), extent = 0.5 * (hi - lo) + 1e-5;
+    vec3 d = h - centre;
+    vec3 ratio = abs(d / extent);
+    float m = max(ratio.x, max(ratio.y, ratio.z));
+    return m > 1.0 ? centre + d / m : h;
+}
+
+void main() {
+    vec3 cur = textureLod(uScene, vUV, 0.0).rgb;
+    // the neighbourhood: its colour statistics, and its nearest surface (whose
+    // motion is the one to follow, so edges move with the object in front)
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
+    float nearest = 1.0;
+    vec2 nearest_uv = vUV;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            vec2 uv = vUV + vec2(x, y) * uTexel;
+            vec3 c = to_ycocg(textureLod(uScene, uv, 0.0).rgb);
+            m1 += c; m2 += c * c;
+            lo = min(lo, c); hi = max(hi, c);
+            float d = textureLod(uDepth, uv, 0.0).r;
+            if (d < nearest) { nearest = d; nearest_uv = uv; }
+        }
+    if (uHasHistory == 0) { frag = vec4(cur, 1.0); return; }
+
+    vec2 vel = textureLod(uVelocity, nearest_uv, 0.0).xy;
+    vec2 prev_uv;
+    if (vel.x > 100.0) {
+        // nothing moved here by itself: the camera's motion, from the depth
+        vec4 world = uInvViewProj * vec4(vUV * 2.0 - 1.0, nearest * 2.0 - 1.0, 1.0);
+        vec4 prev = uPrevViewProj * vec4(world.xyz / world.w, 1.0);
+        prev_uv = prev.xy / prev.w * 0.5 + 0.5;
+    } else {
+        prev_uv = vUV - vel;
+    }
+    if (any(lessThan(prev_uv, vec2(0.0))) || any(greaterThan(prev_uv, vec2(1.0)))) { frag = vec4(cur, 1.0); return; }
+
+    vec3 mean = m1 / 9.0;
+    vec3 sigma = sqrt(abs(m2 / 9.0 - mean * mean));
+    vec3 box_lo = max(lo, mean - sigma * 1.25), box_hi = min(hi, mean + sigma * 1.25);
+    vec3 hist = from_ycocg(clip_to_box(to_ycocg(history_catmull_rom(prev_uv)), box_lo, box_hi));
+
+    // luminance-weighted blend: a bright sample does not dominate its neighbours
+    float wc = (1.0 - uFeedback) / (1.0 + dot(cur, vec3(0.2126, 0.7152, 0.0722)));
+    float wh = uFeedback / (1.0 + dot(hist, vec3(0.2126, 0.7152, 0.0722)));
+    frag = vec4((cur * wc + hist * wh) / (wc + wh), 1.0);
 }
 )";
 

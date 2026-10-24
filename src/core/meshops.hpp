@@ -48,6 +48,16 @@ PIXDEF size_t pix_mesh_simplify(pix_mesh_data& mesh, float ratio, float max_erro
 // Splits every triangle into four (midpoint subdivision), iterations times.
 PIXDEF void pix_mesh_subdivide(pix_mesh_data& mesh, int iterations = 1);
 PIXDEF void pix_mesh_transform(pix_mesh_data& mesh, const mat4& m);
+// Tangents for normal mapping, from the uvs. load_mesh_data does this by itself
+// for any vertex whose tangent is zero, so this is only for a mesh you keep on
+// the CPU or edit after loading.
+PIXDEF void pix_mesh_compute_tangents(pix_mesh_data& mesh);
+// The same on any vertex layout that starts position, normal, uv (vertex and
+// vertex_rigged both do). only_missing leaves tangents that are already set.
+PIXDEF void pix_compute_tangents(void* vertices, size_t vertex_count, size_t stride, size_t tangent_offset,
+                                 const uint32_t* indices, size_t index_count, bool only_missing = false);
+// true if any vertex's tangent is still zero
+PIXDEF bool pix_tangents_missing(const void* vertices, size_t vertex_count, size_t stride, size_t tangent_offset);
 // Several meshes into one (each with its own transform, or null for identity).
 PIXDEF pix_mesh_data pix_mesh_merge(const pix_mesh_data* meshes, const mat4* transforms, int count,
                                     unsigned mem = PIX_MEM_GLOBAL);
@@ -438,6 +448,9 @@ void pix_mesh_subdivide(pix_mesh_data& m, int iterations) {
                 v.position = v3scale(v3add(a.position, b.position), 0.5f);
                 v.normal = v3norm(v3add(a.normal, b.normal));
                 v.uv = v2scale(v2add(a.uv, b.uv), 0.5f);
+                vec3 t = v3add(v3(a.tangent.x, a.tangent.y, a.tangent.z), v3(b.tangent.x, b.tangent.y, b.tangent.z));
+                t = v3dot(t, t) > 1e-12f ? v3norm(t) : t;   // zero stays zero: derived again at load
+                v.tangent = v4(t.x, t.y, t.z, a.tangent.w);
                 mid[e] = (uint32_t)vc;
                 nv[vc++] = v;
             }
@@ -455,10 +468,86 @@ void pix_mesh_subdivide(pix_mesh_data& m, int iterations) {
 void pix_mesh_transform(pix_mesh_data& m, const mat4& t) {
     // normals go through the inverse transpose, so non-uniform scale keeps them perpendicular
     mat4 nt = mat4_transpose(mat4_inverse(t));
+    // tangents follow the surface (the plain transform); a mirroring transform
+    // flips the bitangent's side, so the handedness sign flips with it
+    const float* d = t.data;
+    float det = d[0] * (d[5] * d[10] - d[9] * d[6]) - d[4] * (d[1] * d[10] - d[9] * d[2])
+              + d[8] * (d[1] * d[6] - d[5] * d[2]);
+    float flip = det < 0.0f ? -1.0f : 1.0f;
     for (size_t i = 0; i < m.vertex_count; i++) {
-        m.vertices[i].position = mat4_mul_point(t, m.vertices[i].position);
-        m.vertices[i].normal = v3norm(mat4_mul_dir(nt, m.vertices[i].normal));
+        vertex& v = m.vertices[i];
+        v.position = mat4_mul_point(t, v.position);
+        v.normal = v3norm(mat4_mul_dir(nt, v.normal));
+        vec3 tg = mat4_mul_dir(t, v3(v.tangent.x, v.tangent.y, v.tangent.z));
+        if (v3dot(tg, tg) > 1e-12f) tg = v3norm(tg);
+        v.tangent = v4(tg.x, tg.y, tg.z, v.tangent.w * flip);
     }
+}
+
+// Lengyel's method: each triangle's direction of increasing u (and v) in
+// space, summed per vertex, then made perpendicular to the normal.
+void pix_compute_tangents(void* vertices, size_t vertex_count, size_t stride, size_t tangent_offset,
+                          const uint32_t* indices, size_t index_count, bool only_missing) {
+    if (!vertex_count) return;
+    vec3* acc = pix_alloc<vec3>(vertex_count * 2);   // sum of u directions, then of v directions
+    if (!acc) return;
+    vec3* sdir = acc;
+    vec3* tdir = acc + vertex_count;
+    char* base = (char*)vertices;
+    #define PIX__VPOS(i) (*(vec3*)(base + (i) * stride))
+    #define PIX__VNRM(i) (*(vec3*)(base + (i) * stride + 12))
+    #define PIX__VUV(i)  (*(vec2*)(base + (i) * stride + 24))
+    #define PIX__VTAN(i) (*(vec4*)(base + (i) * stride + tangent_offset))
+    for (size_t t = 0; t + 2 < index_count; t += 3) {
+        uint32_t i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
+        if (i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count) continue;
+        vec3 e1 = v3sub(PIX__VPOS(i1), PIX__VPOS(i0)), e2 = v3sub(PIX__VPOS(i2), PIX__VPOS(i0));
+        vec2 w1 = v2sub(PIX__VUV(i1), PIX__VUV(i0)), w2 = v2sub(PIX__VUV(i2), PIX__VUV(i0));
+        float det = w1.x * w2.y - w2.x * w1.y;
+        if (fabsf(det) < 1e-12f) continue;   // no uv area: says nothing about direction
+        float k = 1.0f / det;
+        // not normalised: bigger triangles (in uv) weigh more, as they should
+        vec3 s = v3scale(v3sub(v3scale(e1, w2.y), v3scale(e2, w1.y)), k);
+        vec3 u = v3scale(v3sub(v3scale(e2, w1.x), v3scale(e1, w2.x)), k);
+        sdir[i0] = v3add(sdir[i0], s); sdir[i1] = v3add(sdir[i1], s); sdir[i2] = v3add(sdir[i2], s);
+        tdir[i0] = v3add(tdir[i0], u); tdir[i1] = v3add(tdir[i1], u); tdir[i2] = v3add(tdir[i2], u);
+    }
+    for (size_t i = 0; i < vertex_count; i++) {
+        vec4& out = PIX__VTAN(i);
+        if (only_missing && (out.x != 0.0f || out.y != 0.0f || out.z != 0.0f)) continue;
+        vec3 n = PIX__VNRM(i);
+        vec3 t = v3sub(sdir[i], v3scale(n, v3dot(n, sdir[i])));   // Gram-Schmidt
+        if (v3dot(t, t) < 1e-12f) {
+            // no usable uvs here: any direction along the surface beats none
+            t = fabsf(n.y) < 0.99f ? v3cross(v3(0, 1, 0), n) : v3cross(n, v3(1, 0, 0));
+            if (v3dot(t, t) < 1e-12f) t = v3(1, 0, 0);
+        }
+        t = v3norm(t);
+        // pix's uvs start top-left (glTF's convention; OBJ is flipped on load), so
+        // +v runs down the image while a normal map's green points up it: the
+        // bitangent is the one against tdir. glTF TANGENT data means the same.
+        float w = v3dot(v3cross(n, t), tdir[i]) < 0.0f ? 1.0f : -1.0f;
+        out = v4(t.x, t.y, t.z, w);
+    }
+    #undef PIX__VPOS
+    #undef PIX__VNRM
+    #undef PIX__VUV
+    #undef PIX__VTAN
+    pix_free(acc);
+}
+
+bool pix_tangents_missing(const void* vertices, size_t vertex_count, size_t stride, size_t tangent_offset) {
+    const char* base = (const char*)vertices;
+    for (size_t i = 0; i < vertex_count; i++) {
+        const vec4& t = *(const vec4*)(base + i * stride + tangent_offset);
+        if (t.x == 0.0f && t.y == 0.0f && t.z == 0.0f) return true;
+    }
+    return false;
+}
+
+void pix_mesh_compute_tangents(pix_mesh_data& m) {
+    pix_compute_tangents(m.vertices, m.vertex_count, sizeof(vertex), offsetof(vertex, tangent),
+                         m.indices, m.index_count, false);
 }
 
 pix_mesh_data pix_mesh_merge(const pix_mesh_data* meshes, const mat4* transforms, int count, unsigned mem) {

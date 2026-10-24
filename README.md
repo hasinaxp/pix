@@ -133,6 +133,7 @@ animator  anim   = pix_model_animator(knight);            // every clip it shipp
 | field | meaning |
 |---|---|
 | `texture`, `color`, `metallic`, `roughness`, `emissive` | the usual metal/rough PBR inputs; emissive over 1 blooms |
+| `normal_map`, `orm_map`, `emissive_map` | glTF's maps: bumps, occlusion/roughness/metallic, glow (`pix_load_model` fills them) |
 | `alpha`, `blend` | `PIX_BLEND_ALPHA` / `PIX_BLEND_ADDITIVE`; blended materials are sorted back to front |
 | `alpha_cutoff`, `double_sided` | cut-out foliage, fences, cloth |
 | `unlit`, `cast_shadows` | |
@@ -160,7 +161,7 @@ These are plain data you edit in place. A change applies at the next frame and
 reallocates only what it has to.
 
 ```cpp
-pix_set_quality(PIX_QUALITY_HIGH);        // LOW..ULTRA: shadow res + softness, bloom, FXAA, reflection probe
+pix_set_quality(PIX_QUALITY_HIGH);        // LOW..ULTRA: shadow res + softness, bloom, temporal AA, reflection probe
 
 pix_shadows().distance   = 80.0f;         // world units the cascades cover
 pix_shadows().resolution = 4096;          // per cascade
@@ -369,10 +370,10 @@ pix_draw_model_animated(knight, anim.pose, transform);
 | `platform` | window (resizable, fullscreen, DPI aware), GL 4.4 context, keyboard/mouse/gamepad, time |
 | `opengl_api`, `opengl_utils` | GL loader, shaders, textures, uniform buffers |
 | `texture`, `font`, `draw2d`, `sprite`, `text` | 2D |
-| `renderer`, `shader_sources`, `lighting`, `framebuffer`, `animation` | 3D |
+| `renderer`, `shader_sources`, `lighting`, `framebuffer`, `animation` | 3D: PBR + toon, shadows, reflections, HDR environments, LODs, billboards, TAA / MSAA |
 | `platform_audio`, `sound` | waveOut device, mixer, voices with pitch and pan |
-| `loader/*` | PNG, OBJ/MTL, glTF 2.0 (skins, animation), WAV |
-| `physics` | all physics in one include: `colliders` (shape tests), `physics_common` (layers), `physics2d`, `physics3d` (rigid bodies: joints, sleeping, queries), `physics3d_flat` (characters and crowds on the ground); `physics_debug` draws them |
+| `loader/*` | PNG, Radiance HDR, OBJ/MTL, glTF 2.0 (skins, animation, PBR maps), WAV |
+| `physics` | all physics in one include: `colliders` (shape tests), `physics_common` (layers), `physics2d` (polygons, joints), `physics3d` (convex hulls, compounds, joints, vehicles, a character controller, continuous collision), `physics3d_flat` (characters and crowds on the ground); `physics_debug` draws them |
 | `jobs`, `profile` | thread pool / parallel-for, section profiler |
 | `compute` | compute shaders, GPU buffers, indirect draws, storage images |
 | `meshops` | weld, normals, simplify, subdivide, merge, transform |
@@ -380,8 +381,10 @@ pix_draw_model_animated(knight, anim.pose, transform);
 
 ## Current limits
 
-* **Physics** has no convex hulls or compound bodies yet, and runs on one thread.
-* Images are PNG only (no JPEG yet, so glTF files with JPEG textures load untextured); audio is WAV only.
-* No automatic mesh-LOD switching in the renderer yet: generate LODs with pix_mesh_simplify and pick one by distance.
-* No normal maps yet, because the vertex format has no tangents.
+* **Physics** runs on one thread. 2D has no compound bodies, character
+  controller or wheel/gear/pulley joints yet (3D has them).
+* Images are PNG (and HDR environments); JPEG is not supported, so glTF files
+  with JPEG textures load untextured. Audio is WAV only.
+* Skinned meshes have no automatic LODs, and under temporal AA they follow
+  only the camera's motion.
 * Windows + OpenGL 4.4 only, by design.

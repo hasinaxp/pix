@@ -252,6 +252,15 @@ idx load_model_gltf_file(pix_data_loader& loader, const char* filepath, int only
         mf->image_is_palette = res.image_is_palette;
         loader.image_files[loader.image_file_count++] = res.image;
     }
+    mf->pbr = res.pbr;
+    const image_file_data* maps[3] = { &res.normal_image, &res.orm_image, &res.emissive_image };
+    int32_t* slots[3] = { &mf->pbr.normal_image, &mf->pbr.orm_image, &mf->pbr.emissive_image };
+    for (int i = 0; i < 3; i++) {
+        *slots[i] = -1;
+        if (!maps[i]->data || loader.image_file_count >= MAX_IMAGE_FILES) continue;
+        *slots[i] = (int32_t)loader.image_file_count;
+        loader.image_files[loader.image_file_count++] = *maps[i];
+    }
     return id;
 }
 

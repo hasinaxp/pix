@@ -12,7 +12,7 @@
 // A 2D rigid-body world for side-on and top-down games, in the coordinates the
 // 2D drawing uses: x right, y down, units are whatever you draw in (the
 // defaults assume pixels). Bodies are circles, axis-aligned boxes, rotated
-// boxes and capsules; they fall, slide, bounce, spin, stack and rest.
+// boxes, capsules and convex polygons; they fall, slide, bounce, spin, stack and rest.
 //
 //   phys2d_world w;
 //   phys2d_create_world(w);
@@ -62,7 +62,7 @@
 // Layers: a pair collides only when each accepts the other -
 // phys_layers_collide in physics_common.hpp, the same rule in every world.
 //
-// Not here yet: threading, polygon shapes beyond boxes.
+// Not here yet: threading, compound bodies.
 
 #ifndef PHYS2D_MAX_BODIES
 #define PHYS2D_MAX_BODIES 4096      // capacity; the array is heap allocated
@@ -82,6 +82,9 @@
 #define PHYS2D_AABB    1     // a box that never rotates; `angle` is ignored
 #define PHYS2D_BOX     2     // a box that rotates with the body
 #define PHYS2D_CAPSULE 3     // upright: a vertical segment with round ends
+#define PHYS2D_POLYGON 4     // any convex outline of up to 8 corners (phys2d_polygon)
+
+#define PHYS2D_MAX_POLYGON 8
 
 // event types
 #define PHYS2D_CONTACT_BEGIN 0   // two solid bodies started touching
@@ -107,9 +110,14 @@
 
 struct phys2d_shape {
     uint8_t type;          // PHYS2D_CIRCLE ...
-    float   radius;        // circle, capsule
+    float   radius;        // circle, capsule; polygon: rounds its corners
     vec2    half;          // box / aabb half extents
     float   half_length;   // capsule: half the straight part, along local y
+    // polygon: corners counter-clockwise on screen around its centre of mass,
+    // and where that centre was among the points you gave (for drawing)
+    vec2    verts[PHYS2D_MAX_POLYGON];
+    int     count;
+    vec2    offset;
 };
 
 // shape constructors: sizes are full widths and heights
@@ -122,6 +130,11 @@ static inline phys2d_shape phys2d_aabb(float width, float height) {
 static inline phys2d_shape phys2d_box(float width, float height) {
     phys2d_shape s = {}; s.type = PHYS2D_BOX; s.half = v2(width * 0.5f, height * 0.5f); return s;
 }
+// The convex hull of `points` (any order, any count; at most 8 corners are
+// kept - the ones that matter most), re-centred on its centre of mass:
+// `offset` says where that was. `radius` rounds the corners. A shape with
+// count 0 comes back for fewer than three distinct, non-collinear points.
+PIXDEF phys2d_shape phys2d_polygon(const vec2* points, int count, float radius = 0.0f);
 // `height` overall, caps included; under 2 * radius it is just a circle
 static inline phys2d_shape phys2d_capsule(float radius, float height) {
     phys2d_shape s = {}; s.type = PHYS2D_CAPSULE; s.radius = radius;
@@ -251,9 +264,9 @@ struct phys2d_ray_hit {
 
 // a shape in world space: a convex core (point, segment or box) plus a radius
 struct phys2d__poly {
-    vec2  v[4];
-    vec2  n[4];      // n[i] is the outward normal of edge v[i] -> v[i+1]
-    int   count;     // 1 point, 2 segment, 4 box
+    vec2  v[PHYS2D_MAX_POLYGON];
+    vec2  n[PHYS2D_MAX_POLYGON];   // n[i] is the outward normal of edge v[i] -> v[i+1]
+    int   count;     // 1 point, 2 segment, 3..8 polygon (4: box)
     float radius;
 };
 
@@ -423,6 +436,12 @@ static void phys2d__make_poly(const phys2d_shape& s, vec2 p, float angle, phys2d
         out.n[1] = -out.n[0];
         return;
     }
+    if (s.type == PHYS2D_POLYGON) {
+        out.count = s.count; out.radius = s.radius;
+        for (int i = 0; i < s.count; i++) out.v[i] = v2(p.x + c * s.verts[i].x - sn * s.verts[i].y, p.y + sn * s.verts[i].x + c * s.verts[i].y);
+        for (int i = 0; i < s.count; i++) out.n[i] = v2norm(phys2d__perp(out.v[(i + 1) % s.count] - out.v[i]));
+        return;
+    }
     static const float sx[4] = { -1, 1, 1, -1 }, sy[4] = { -1, -1, 1, 1 };
     static const float nx[4] = { 0, 1, 0, -1 },  ny[4] = { -1, 0, 1, 0 };
     out.count = 4;
@@ -467,9 +486,8 @@ static bool phys2d__cores_disjoint(const phys2d__poly& a, const phys2d__poly& b)
         if (p.count == 2) {
             if (phys2d__axis_gap(a, b, p.n[0]) > 0.0f) return true;
             if (phys2d__axis_gap(a, b, v2norm(p.v[1] - p.v[0])) > 0.0f) return true;
-        } else if (p.count == 4) {
-            if (phys2d__axis_gap(a, b, p.n[0]) > 0.0f) return true;
-            if (phys2d__axis_gap(a, b, p.n[1]) > 0.0f) return true;
+        } else if (p.count >= 3) {
+            for (int e = 0; e < p.count; e++) if (phys2d__axis_gap(a, b, p.n[e]) > 0.0f) return true;
         }
     }
     return false;
@@ -482,14 +500,14 @@ static inline vec2 phys2d__closest_on_segment(vec2 a, vec2 b, vec2 p) {
     return a + ab * clampf(v2dot(p - a, ab) / len2, 0.0f, 1.0f);
 }
 
-// Closest points between two disjoint cores. With at most four vertices a
+// Closest points between two disjoint cores. With at most eight vertices a
 // side, testing every vertex against every edge is cheaper than GJK.
 static float phys2d__core_distance(const phys2d__poly& a, const phys2d__poly& b, vec2* pa, vec2* pb) {
     float best = 1e30f;
     for (int pass = 0; pass < 2; pass++) {
         const phys2d__poly& p = pass ? b : a;    // vertices from p
         const phys2d__poly& q = pass ? a : b;    // edges from q
-        int edges = q.count == 4 ? 4 : 1;
+        int edges = q.count >= 3 ? q.count : 1;
         for (int i = 0; i < p.count; i++)
             for (int e = 0; e < edges; e++) {
                 vec2 c = phys2d__closest_on_segment(q.v[e], q.v[q.count == 1 ? 0 : (e + 1) % q.count], p.v[i]);
@@ -607,6 +625,77 @@ static int phys2d__collide(const phys2d__poly& a, const phys2d__poly& b, float s
     return flip ? phys2d__clip(b, edge_b, a, true, margin, m) : phys2d__clip(a, edge_a, b, false, margin, m);
 }
 
+// ---- polygons ----
+
+static inline float phys2d__cross3(vec2 o, vec2 a, vec2 b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); }
+
+// Andrew's monotone chain: the hull counter-clockwise (in y-down screen
+// terms: the order phys2d__make_poly's normals expect), collinear points dropped.
+static int phys2d__hull(const vec2* in, int n, vec2* out) {
+    vec2* pts = pix_new<vec2>((size_t)n);
+    vec2* h = pix_new<vec2>((size_t)n * 2 + 2);
+    if (!pts || !h) { pix_free(pts); pix_free(h); return 0; }
+    memcpy(pts, in, (size_t)n * sizeof(vec2));
+    for (int i = 1; i < n; i++) {   // sort by x then y (insertion: polygons are small)
+        vec2 x = pts[i];
+        int j = i - 1;
+        while (j >= 0 && (pts[j].x > x.x || (pts[j].x == x.x && pts[j].y > x.y))) { pts[j + 1] = pts[j]; j--; }
+        pts[j + 1] = x;
+    }
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        while (k >= 2 && phys2d__cross3(h[k - 2], h[k - 1], pts[i]) <= 1e-9f) k--;
+        h[k++] = pts[i];
+    }
+    for (int i = n - 2, lower = k + 1; i >= 0; i--) {
+        while (k >= lower && phys2d__cross3(h[k - 2], h[k - 1], pts[i]) <= 1e-9f) k--;
+        h[k++] = pts[i];
+    }
+    int count = k > 1 ? k - 1 : k;   // the last point repeats the first
+    for (int i = 0; i < count; i++) out[i] = h[i];
+    pix_free(pts);
+    pix_free(h);
+    return count;
+}
+
+phys2d_shape phys2d_polygon(const vec2* points, int count, float radius) {
+    phys2d_shape s = {};
+    s.type = PHYS2D_POLYGON;
+    s.radius = radius > 0.0f ? radius : 0.0f;
+    if (!points || count < 3) return s;
+    vec2* hull = pix_new<vec2>((size_t)count);
+    if (!hull) return s;
+    int n = phys2d__hull(points, count, hull);
+    // too many corners: drop the ones whose removal loses the least area
+    while (n > PHYS2D_MAX_POLYGON) {
+        int worst = 0;
+        float least = 1e30f;
+        for (int i = 0; i < n; i++) {
+            float a = fabsf(phys2d__cross3(hull[(i + n - 1) % n], hull[i], hull[(i + 1) % n]));
+            if (a < least) { least = a; worst = i; }
+        }
+        for (int i = worst; i < n - 1; i++) hull[i] = hull[i + 1];
+        n--;
+    }
+    if (n < 3) { pix_free(hull); return s; }
+    // centroid of the area, not of the corners
+    float area = 0.0f;
+    vec2 c = v2(0, 0);
+    for (int i = 0; i < n; i++) {
+        vec2 a = hull[i], b = hull[(i + 1) % n];
+        float cr = a.x * b.y - a.y * b.x;
+        area += cr * 0.5f;
+        c = c + (a + b) * (cr / 6.0f);
+    }
+    if (fabsf(area) < 1e-9f) { pix_free(hull); return s; }
+    c = c / area;
+    s.count = n;
+    s.offset = c;
+    for (int i = 0; i < n; i++) s.verts[i] = hull[i] - c;
+    pix_free(hull);
+    return s;
+}
+
 // ---- mass ----
 
 static void phys2d__compute_mass(phys2d_body& b) {
@@ -626,6 +715,19 @@ static void phys2d__compute_mass(phys2d_body& b) {
         float lc = 4.0f * r / (3.0f * PIX_PI);
         mass = box_mass + circle_mass;
         inertia = circle_mass * (0.5f * rr + h * h + 2.0f * h * lc) + box_mass * (4.0f * rr + 4.0f * h * h) / 12.0f;
+    } else if (s.type == PHYS2D_POLYGON) {
+        // triangles fanned from the centre (Box2D's polygon mass); the corners
+        // are already centred on the centre of mass
+        mass = 0.0f; inertia = 0.0f;
+        for (int i = 0; i < s.count; i++) {
+            vec2 e1 = s.verts[i], e2 = s.verts[(i + 1) % s.count];
+            float cr = e1.x * e2.y - e1.y * e2.x;
+            mass += 0.5f * cr;
+            float intx2 = e1.x * e1.x + e2.x * e1.x + e2.x * e2.x, inty2 = e1.y * e1.y + e2.y * e1.y + e2.y * e2.y;
+            inertia += (0.25f / 3.0f) * cr * (intx2 + inty2);
+        }
+        mass *= d;
+        inertia *= d;
     } else {
         mass = d * 4.0f * s.half.x * s.half.y;
         inertia = mass * (s.half.x * s.half.x + s.half.y * s.half.y) / 3.0f;
@@ -1829,19 +1931,16 @@ static bool phys2d__ray_poly(const phys2d__poly& p, vec2 o, vec2 d, float* out_t
         *out_t = best; *out_n = bn;
         return true;
     }
-    // box: slabs along its two face normals
-    vec2 c = (p.v[0] + p.v[2]) * 0.5f;
+    // a polygon (a box too): inside every edge's line between entering and leaving
+    // (Cyrus-Beck); a rounded polygon's edges pushed out by its radius
     float t0 = -1e30f, t1 = 1e30f; vec2 n0 = v2(0, 0);
-    for (int k = 0; k < 2; k++) {
-        vec2 ax = p.n[k + 1];   // n[1] = +x, n[2] = +y in local terms
-        float h = v2dot(p.v[2] - c, ax);
-        float oo = v2dot(o - c, ax), dd = v2dot(d, ax);
-        if (fabsf(dd) < 1e-9f) { if (oo < -h || oo > h) return false; continue; }
-        float ta = (-h - oo) / dd, tb = (h - oo) / dd;
-        vec2 na = -ax;
-        if (ta > tb) { float s = ta; ta = tb; tb = s; na = ax; }
-        if (ta > t0) { t0 = ta; n0 = na; }
-        t1 = minf(t1, tb);
+    for (int k = 0; k < p.count; k++) {
+        vec2 n = p.n[k];
+        float dist = v2dot(n, p.v[k]) + p.radius - v2dot(n, o), dd = v2dot(n, d);
+        if (fabsf(dd) < 1e-9f) { if (dist < 0.0f) return false; continue; }
+        float t = dist / dd;
+        if (dd < 0.0f) { if (t > t0) { t0 = t; n0 = n; } }
+        else t1 = minf(t1, t);
         if (t0 > t1) return false;
     }
     if (t0 < 0.0f) return false;   // inside, or behind

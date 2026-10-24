@@ -9,10 +9,11 @@
 #include "colliders.hpp"
 #include "physics_common.hpp"
 
-// A 3D rigid-body world: boxes, spheres and capsules that tumble, roll,
-// stack and rest, on static planes, boxes and triangle meshes, with joints
-// for doors, chains, ragdolls and vehicles. Units are metres, y is up,
-// gravity is 9.81 down.
+// A 3D rigid-body world: boxes, spheres, capsules, convex hulls and compounds
+// that tumble, roll, stack and rest, on static planes, boxes and triangle
+// meshes, with joints for doors, chains, ragdolls and machines, a raycast
+// vehicle and a character controller. Units are metres, y is up, gravity is
+// 9.81 down.
 //
 //   phys3d_world w;
 //   phys3d_create_world(w);
@@ -45,15 +46,21 @@
 //                step); restitution after the solve.
 //   joints       ball (with swing cone and twist limits: ragdolls), hinge
 //                (limits, motor), slider (limits, motor), fixed, distance
-//                (rod, spring, rope) and mouse - Bullet's basic set, as soft
-//                constraints.
+//                (rod, spring, rope), mouse, wheel, motor, gear, pulley and
+//                a generic 6-DOF - Bullet's set, as soft constraints.
 //   sleeping     islands by union-find; an island that stays still for
 //                `time_to_sleep` stops simulating until touched.
+//   continuous   conservative advancement (Mirtich) for fast and spinning
+//                bodies against static and kinematic ones.
+//   hulls        quickhull; SAT with Gauss-map pruning of edge pairs
+//                (Gregorius, GDC 2013) and reference-face clipping.
+//   vehicles     Bullet's raycast vehicle; the character controller is
+//                collide-and-slide with step-up and snap-down.
 //
 // Layers work as in every pix world: phys_layers_collide (physics_common.hpp).
 //
-// Not here yet: convex hulls, compound bodies, gyroscopic torque, threading,
-// continuous collision for spinning bodies, internal-edge smoothing on meshes.
+// Not here yet: gyroscopic torque, threading, continuous collision between two
+// moving bodies, internal-edge smoothing on meshes.
 
 #ifndef PHYS3D_MAX_BODIES
 #define PHYS3D_MAX_BODIES 4096
@@ -75,6 +82,13 @@
 #define PHYS3D_CAPSULE 2     // upright along the body's local y
 #define PHYS3D_PLANE   3     // infinite; static or kinematic only
 #define PHYS3D_MESH    4     // triangles; static or kinematic only, one-sided (front = counter-clockwise)
+#define PHYS3D_HULL    5     // any convex shape, from points (phys3d_create_hull)
+#define PHYS3D_COMPOUND 6    // several shapes glued into one body (phys3d_create_compound)
+
+#ifndef PHYS3D_MAX_HULL_VERTICES
+#define PHYS3D_MAX_HULL_VERTICES 256   // a hull keeps at most this many corners
+#endif
+#define PHYS3D_MAX_FACE_VERTICES 64    // corners on one hull face
 
 // events
 #define PHYS3D_CONTACT_BEGIN 0
@@ -90,6 +104,16 @@
 #define PHYS3D_JOINT_FIXED    3   // glues two bodies (springy if hertz > 0); breakable things
 #define PHYS3D_JOINT_DISTANCE 4   // rod, spring or rope between two points
 #define PHYS3D_JOINT_MOUSE    5   // drags a point of a body toward `target`
+#define PHYS3D_JOINT_WHEEL    6   // a car wheel: suspension spring, steering, spin with a motor
+#define PHYS3D_JOINT_MOTOR    7   // drives b toward a pose relative to a, within a force and torque
+#define PHYS3D_JOINT_GEAR     8   // two spins locked in a ratio: gears, belts, differentials
+#define PHYS3D_JOINT_PULLEY   9   // two ropes over fixed points: len_a + ratio * len_b stays the same
+#define PHYS3D_JOINT_GENERIC  10  // six axes, each free, locked or limited (Bullet's 6-DOF): anything else
+
+// generic joint axes: linear x, y, z then angular x, y, z of its frame
+#define PHYS3D_AXIS_LOCKED  0
+#define PHYS3D_AXIS_FREE    1
+#define PHYS3D_AXIS_LIMITED 2
 
 // debug draw flags
 #define PHYS3D_DRAW_SHAPES   1
@@ -117,6 +141,26 @@ struct phys3d_mesh {
     aabb      bounds;
 };
 
+// A convex shape built from any points (the corners of a rock, a crate's
+// model, a car body): their convex hull. Build once, keep it alive while
+// bodies use it; it owns copies of its data. Its corners are moved so the
+// centre of mass is at the origin - `offset` is where that centre was in the
+// points you gave, which drawing needs (phys3d_body_draw_transform does it).
+struct phys3d_hull_edge { uint16_t v0, v1, f0, f1; };   // corners, and the faces either side
+struct phys3d_hull {
+    vec3*  vertices;  int vertex_count;     // centred on the centre of mass
+    vec4*  planes;    int face_count;       // xyz outward normal, w: dot(normal, p) on the face
+    int*   face_start;                      // face f's corners: face_verts[face_start[f] .. face_start[f + 1])
+    uint16_t* face_verts;                   // counter-clockwise seen from outside
+    phys3d_hull_edge* edges; int edge_count;
+    vec3   offset;                          // the centre of mass in your points' frame
+    float  volume;
+    mat3   inertia;                         // per unit density, about the centre of mass
+    aabb   bounds;                          // local
+};
+
+struct phys3d_compound;
+
 struct phys3d_shape {
     uint8_t type;
     float   radius;             // sphere, capsule
@@ -124,6 +168,27 @@ struct phys3d_shape {
     float   half_length;        // capsule: half the straight part
     vec3    normal;             // plane, in the body's frame
     const phys3d_mesh* mesh;
+    const phys3d_hull* hull;
+    const phys3d_compound* compound;
+};
+
+// One part of a compound: a sphere, box, capsule or hull, placed in the
+// compound's frame.
+struct phys3d_compound_child {
+    phys3d_shape shape;
+    vec3 position;
+    quat rotation;
+};
+// Several shapes moving as one rigid body: a table (top and legs), a hammer, a
+// boat. Like a hull it is re-centred on its centre of mass: `offset` is where
+// that sat in your frame. Build once, keep alive while bodies use it.
+struct phys3d_compound {
+    phys3d_compound_child* children;
+    int   count;
+    vec3  offset;
+    float volume;
+    mat3  inertia;              // per unit density, about the centre of mass
+    aabb  bounds;               // local
 };
 
 static inline phys3d_shape phys3d_sphere(float radius) {
@@ -145,6 +210,22 @@ static inline phys3d_shape phys3d_plane(vec3 normal) {
 }
 static inline phys3d_shape phys3d_mesh_shape(const phys3d_mesh& mesh) {
     phys3d_shape s = {}; s.type = PHYS3D_MESH; s.mesh = &mesh; return s;
+}
+static inline phys3d_shape phys3d_hull_shape(const phys3d_hull& hull) {
+    phys3d_shape s = {}; s.type = PHYS3D_HULL; s.hull = &hull; return s;
+}
+static inline phys3d_shape phys3d_compound_shape(const phys3d_compound& compound) {
+    phys3d_shape s = {}; s.type = PHYS3D_COMPOUND; s.compound = &compound; return s;
+}
+static inline phys3d_compound_child phys3d_child(phys3d_shape shape, vec3 position, quat rotation = quat_identity()) {
+    phys3d_compound_child c; c.shape = shape; c.position = position; c.rotation = rotation; return c;
+}
+// where a shape's own origin sits relative to the body: hulls and compounds
+// are centred on their centre of mass, so this is minus their offset
+static inline vec3 phys3d_shape_offset(const phys3d_shape& s) {
+    if (s.type == PHYS3D_HULL && s.hull) return s.hull->offset;
+    if (s.type == PHYS3D_COMPOUND && s.compound) return s.compound->offset;
+    return v3(0, 0, 0);
 }
 
 struct phys3d_body {
@@ -177,7 +258,7 @@ struct phys3d_body {
     vec3  ground_normal;
     vec3  force, torque;         // accumulated, cleared each step
     float inv_mass;
-    vec3  inv_inertia_local;     // diagonal, in the body's frame
+    mat3  inv_inertia_local;     // in the body's frame (full: hulls and compounds are not symmetric)
     mat3  inv_inertia;           // world space, kept current by the solver
     vec3  prev_position;
     quat  prev_rotation;
@@ -248,9 +329,18 @@ struct phys3d_joint {
     bool  enable_spring;         // distance: spring at `length` (hertz 0 = rope held by the limits)
     float length;
     float hertz, damping_ratio;  // springs, soft fixed joints, mouse
-    vec3  target;                // mouse
-    float max_force;             // mouse
+    vec3  target;                // mouse: where to drag; motor: b's offset in a's frame
+    float max_force;             // mouse, motor
     float break_force;           // 0 = unbreakable
+    float steer;                 // wheel: steering angle about the suspension axis, radians
+    float ratio;                 // gear, pulley
+    vec3  ground_a, ground_b;    // pulley: the fixed points the ropes run over (world)
+    // generic: per axis (linear x y z, angular x y z of the joint frame) a
+    // PHYS3D_AXIS_* mode, limits (metres / radians) and an optional motor
+    uint8_t axis_mode[6];
+    float   axis_lower[6], axis_upper[6];
+    float   axis_motor_speed[6], axis_motor_force[6];   // force 0 = no motor
+    quat    frame_a, frame_b;    // generic: the joint frame in each body
 
     // ---- written by the world ----
     float reaction;
@@ -259,7 +349,15 @@ struct phys3d_joint {
     vec3  ra, rb, d, axis, perp1, perp2;
     vec3  linear_impulse, angular_impulse;
     float axial_impulse, motor_impulse, lower_impulse, upper_impulse, swing_impulse;
+    float axis_impulse[6];       // generic: each axis's lock / limit impulse (lower - upper), for warm starting
+    float axis_motor_impulse[6]; // generic: each axis's motor
 };
+
+struct phys3d_world;
+// Code that runs inside every fixed step, before the solver: vehicles, custom
+// forces, buoyancy. `dt` is the step's.
+typedef void (*phys3d_action_fn)(phys3d_world& w, float dt, void* user);
+#define PHYS3D_MAX_ACTIONS 32
 
 struct phys3d__cell_item { int32_t cx, cy, cz; idx body; };
 struct phys3d__grid {
@@ -283,6 +381,10 @@ struct phys3d_world {
     float correction;            // 0.2
     float joint_hertz, joint_damping;   // 60, 2
     bool  allow_sleep;
+    // Fast or fast-spinning bodies are swept against static and kinematic
+    // bodies each step and stopped where they would first touch, so a bullet
+    // or a whirling blade cannot pass through a thin wall.
+    bool  continuous;            // true
     float sleep_linear;          // 0.05 m/s
     float sleep_angular;         // 0.05 rad/s
     float time_to_sleep;         // 0.5 s
@@ -320,6 +422,9 @@ struct phys3d_world {
 
     phys3d_event* events;
     size_t        event_count, event_capacity;
+
+    struct { phys3d_action_fn fn; void* user; } actions[PHYS3D_MAX_ACTIONS];
+    int action_count;
 };
 
 // ---- meshes ----
@@ -329,6 +434,16 @@ PIXDEF bool phys3d_create_mesh(phys3d_mesh& m, const vec3* vertices, size_t vert
 // first sample at (0, h, 0), columns along +x and rows along +z
 PIXDEF bool phys3d_create_heightfield(phys3d_mesh& m, const float* heights, int columns, int rows, float spacing);
 PIXDEF void phys3d_destroy_mesh(phys3d_mesh& m);
+
+// ---- hulls and compounds ----
+// The convex hull of `points` (quickhull; coplanar triangles merged into one
+// face). False when the points are flat or fewer than four.
+PIXDEF bool phys3d_create_hull(phys3d_hull& h, const vec3* points, size_t count);
+PIXDEF void phys3d_destroy_hull(phys3d_hull& h);
+// Children: spheres, boxes, capsules, hulls (they reference the hull, which must
+// outlive the compound). False for none or an unsupported child.
+PIXDEF bool phys3d_create_compound(phys3d_compound& c, const phys3d_compound_child* children, int count);
+PIXDEF void phys3d_destroy_compound(phys3d_compound& c);
 
 // ---- world ----
 PIXDEF void phys3d_create_world(phys3d_world& w);
@@ -363,6 +478,12 @@ static inline quat phys3d_lerp_rotation(const phys3d_world& w, const phys3d_body
 static inline mat4 phys3d_body_transform(const phys3d_world& w, const phys3d_body& b) {
     return mat4_from_trs(phys3d_lerp_position(w, b), phys3d_lerp_rotation(w, b), v3(1, 1, 1));
 }
+// The same for a model made in the shape's own frame: for a hull or compound
+// this undoes its centring, so the model you built it from lines up.
+static inline mat4 phys3d_body_draw_transform(const phys3d_world& w, const phys3d_body& b) {
+    vec3 o = phys3d_shape_offset(b.shape);
+    return phys3d_body_transform(w, b) * mat4_translate(-o.x, -o.y, -o.z);
+}
 
 // ---- joints ----
 // Anchors and axes in world space, at the bodies' current poses; a or b may be
@@ -373,6 +494,23 @@ PIXDEF idx phys3d_add_slider(phys3d_world& w, idx a, idx b, vec3 anchor, vec3 ax
 PIXDEF idx phys3d_add_fixed(phys3d_world& w, idx a, idx b, vec3 anchor);
 PIXDEF idx phys3d_add_distance(phys3d_world& w, idx a, idx b, vec3 anchor_a, vec3 anchor_b);
 PIXDEF idx phys3d_add_mouse(phys3d_world& w, idx body, vec3 grab, float max_force = 0.0f);
+// A wheel on a chassis: `centre` the wheel's centre, `suspension` the way the
+// spring works (usually up), `spin` the axle. Springy (hertz 5, damping 0.7),
+// steer with j->steer, drive with enable_motor / motor_speed / max_motor_force.
+PIXDEF idx phys3d_add_wheel(phys3d_world& w, idx chassis, idx wheel, vec3 centre, vec3 suspension, vec3 spin);
+// Holds b where it is relative to a (target / relative_rotation) with at most
+// `max_force` and `max_torque`: moving platforms carrying things, a character's
+// root following its animation, a soft-follow camera rig.
+PIXDEF idx phys3d_add_motor_joint(phys3d_world& w, idx a, idx b, float max_force, float max_torque);
+// a's spin about axis_a and b's about axis_b (world) kept as ratio * a + b = 0.
+PIXDEF idx phys3d_add_gear(phys3d_world& w, idx a, idx b, vec3 axis_a, vec3 axis_b, float ratio = 1.0f);
+// Ropes from anchor_a over ground_a and from anchor_b over ground_b:
+// length_a + ratio * length_b stays what it is now.
+PIXDEF idx phys3d_add_pulley(phys3d_world& w, idx a, idx b, vec3 ground_a, vec3 ground_b, vec3 anchor_a, vec3 anchor_b,
+                             float ratio = 1.0f);
+// Every axis locked to start with (a weld); open the ones you want with
+// axis_mode / axis_lower / axis_upper. `frame` turns the joint's axes in the world.
+PIXDEF idx phys3d_add_generic(phys3d_world& w, idx a, idx b, vec3 anchor, quat frame = quat_identity());
 PIXDEF idx phys3d_add_joint(phys3d_world& w, const phys3d_joint& joint);
 PIXDEF phys3d_joint* phys3d_get_joint(phys3d_world& w, idx id);
 PIXDEF void phys3d_remove_joint(phys3d_world& w, idx id);
@@ -388,6 +526,111 @@ PIXDEF bool phys3d_shape_cast(phys3d_world& w, phys3d_shape shape, vec3 position
                               uint16_t mask = PHYS_LAYER_ALL, idx ignore = PIX_INVALID);
 PIXDEF size_t phys3d_overlap(phys3d_world& w, phys3d_shape shape, vec3 position, quat rotation,
                              idx* out, size_t capacity, uint16_t mask = PHYS_LAYER_ALL);
+
+// ---- actions ----
+// Runs `fn` every fixed step; returns a handle for phys3d_remove_action (-1 when full).
+PIXDEF int  phys3d_add_action(phys3d_world& w, phys3d_action_fn fn, void* user);
+PIXDEF void phys3d_remove_action(phys3d_world& w, int handle);
+
+// ---- raycast vehicle ----
+//
+// A car the way most games make one (Bullet's btRaycastVehicle): one rigid
+// body for the chassis, and each wheel a ray down from the chassis with a
+// spring and damper. Tyres grip sideways and drive forward through impulses
+// at the contact, limited together by a friction circle, so it skids,
+// drifts and spins out. Cheap and stable at any speed.
+//
+//   phys3d_vehicle car = phys3d_make_vehicle(chassis_body);
+//   for each corner: phys3d_vehicle_add_wheel(car, v3(+-0.8f, 0, +-1.3f), 0.35f, 0.3f);
+//   phys3d_add_vehicle(world, car);           // keep `car` alive while added
+//   each frame: car.wheels[i].engine_force / brake / steer, then phys3d_update as usual
+//   draw wheel i with phys3d_vehicle_wheel_transform(world, car, i)
+#define PHYS3D_MAX_VEHICLE_WHEELS 8
+struct phys3d_vehicle_wheel {
+    vec3  attach;            // where the suspension hangs from, in the chassis frame
+    float radius;
+    float rest_length;       // suspension length with no load
+    float max_travel;        // how far it compresses or extends from rest
+    float stiffness;         // spring, N/m (default: holds a quarter of the chassis 10 cm compressed)
+    float damping;           // N*s/m
+    float friction;          // tyre grip (1.0 dry tarmac)
+    float roll_influence;    // 0..1: side forces applied this high up the body (lower = harder to roll over)
+    float steer;             // radians, about the chassis up
+    float engine_force;      // newtons, along where the wheel points
+    float brake;             // newtons of braking
+    // ---- written by the vehicle ----
+    bool  contact;
+    vec3  contact_point, contact_normal;
+    idx   ground;
+    float suspension_length;
+    float suspension_force;
+    float spin, spin_speed;  // the wheel's own rotation, for drawing
+    float skid;              // 0 gripping .. 1 sliding (for skid marks, tyre squeal)
+};
+struct phys3d_vehicle {
+    idx   chassis;
+    vec3  up_local, forward_local;   // the chassis's own up and forward ((0,1,0), (0,0,1))
+    int   wheel_count;
+    phys3d_vehicle_wheel wheels[PHYS3D_MAX_VEHICLE_WHEELS];
+    int   action;                    // its handle while added
+};
+PIXDEF phys3d_vehicle phys3d_make_vehicle(idx chassis);
+PIXDEF int  phys3d_vehicle_add_wheel(phys3d_vehicle& v, vec3 attach, float radius, float rest_length);
+PIXDEF void phys3d_add_vehicle(phys3d_world& w, phys3d_vehicle& v);
+PIXDEF void phys3d_remove_vehicle(phys3d_world& w, phys3d_vehicle& v);
+// the step itself (phys3d_add_vehicle runs it for you every fixed step)
+PIXDEF void phys3d_vehicle_step(phys3d_world& w, phys3d_vehicle& v, float dt);
+// where to draw wheel i: on its suspension, steered and spinning (interpolated with the chassis)
+PIXDEF mat4 phys3d_vehicle_wheel_transform(const phys3d_world& w, const phys3d_vehicle& v, int i);
+// forward speed, m/s (negative reversing)
+PIXDEF float phys3d_vehicle_speed(phys3d_world& w, const phys3d_vehicle& v);
+
+// ---- character controller ----
+//
+// A walking capsule that is not simulated: you say where it wants to go, it
+// goes as far as the world lets it and slides along whatever it meets (the
+// collide-and-slide method). It climbs steps up to step_height, walks up
+// slopes up to max_slope and is stopped by anything steeper, stays on the
+// ground going down slopes and stairs, rides moving platforms and shoves
+// dynamic bodies it walks into.
+//
+//   phys3d_character hero = phys3d_make_character(v3(0, 0, 0));   // feet position
+//   phys3d_add_character_body(world, hero);                      // optional: others bump into it
+//   ...
+//   phys3d_character_update(world, hero, walk_velocity, pix_key_pressed(KEY_SPACE), dt);
+//   draw at hero.position (the feet)
+struct phys3d_character {
+    vec3  position;          // the feet: the bottom of the capsule
+    float radius, height;    // the capsule, height overall
+    float max_slope;         // radians: steeper ground is a wall (default 50 degrees)
+    float step_height;       // ledges it walks up without jumping (0.35)
+    float snap_distance;     // how far down it follows the ground when walking off a slope or step (0.35)
+    float skin;              // gap kept to surfaces (0.01)
+    float jump_speed;        // phys3d_character_update: upward speed of a jump (5)
+    float push_force;        // newtons it shoves dynamic bodies with (600: a person leaning in)
+    float frame_dt;          // the time a move covers, for pushing (update sets it; 1/60)
+    uint16_t mask;           // what stops it (PHYS_LAYER_ALL)
+    idx   body;              // its kinematic body, when added (PIX_INVALID)
+
+    // ---- written by the controller ----
+    vec3  velocity;          // what it really moved in the last update, per second
+    float vertical_speed;    // along up: jumps and falls, kept between updates
+    vec3  last_move;         // what the last phys3d_character_move really moved it
+    bool  on_ground;
+    vec3  ground_normal;
+    idx   ground_body;       // what it stands on (PIX_INVALID when airborne)
+};
+
+PIXDEF phys3d_character phys3d_make_character(vec3 feet, float radius = 0.35f, float height = 1.8f);
+// Moves by `displacement` (world units, this frame), sliding and stepping.
+PIXDEF void phys3d_character_move(phys3d_world& w, phys3d_character& c, vec3 displacement);
+// The usual loop in one call: gravity (the world's), a jump when `jump` and on
+// the ground, walking at `walk_velocity` (its vertical part is ignored), riding
+// whatever it stands on.
+PIXDEF void phys3d_character_update(phys3d_world& w, phys3d_character& c, vec3 walk_velocity, bool jump, float dt);
+// A kinematic capsule that follows the character, so dynamic bodies collide
+// with it and raycasts see it. The controller ignores it when moving.
+PIXDEF idx phys3d_add_character_body(phys3d_world& w, phys3d_character& c);
 static inline size_t phys3d_overlap_sphere(phys3d_world& w, vec3 centre, float radius, idx* out, size_t capacity,
                                            uint16_t mask = PHYS_LAYER_ALL) {
     return phys3d_overlap(w, phys3d_sphere(radius), centre, quat_identity(), out, capacity, mask);
@@ -404,19 +647,6 @@ static inline size_t phys3d_overlap_sphere(phys3d_world& w, vec3 centre, float r
 // ---- small helpers ----
 
 static inline float phys3d__m(const mat3& m, int row, int col) { return m.data[col * 3 + row]; }
-
-// R * diag(d) * R^T: a body's inverse inertia turned into world space
-static mat3 phys3d__rotated_inertia(quat q, vec3 d) {
-    mat3 r = mat3_from_quat(q), out;
-    float dv[3] = { d.x, d.y, d.z };
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++) {
-            float s = 0.0f;
-            for (int k = 0; k < 3; k++) s += phys3d__m(r, i, k) * dv[k] * phys3d__m(r, j, k);
-            out.data[j * 3 + i] = s;
-        }
-    return out;
-}
 
 static inline mat3 phys3d__add(const mat3& a, const mat3& b) {
     mat3 r; for (int i = 0; i < 9; i++) r.data[i] = a.data[i] + b.data[i]; return r;
@@ -535,6 +765,394 @@ void phys3d_destroy_mesh(phys3d_mesh& m) {
     memset(&m, 0, sizeof(m));
 }
 
+// ---- convex hulls ----
+//
+// Quickhull, incrementally: start from four extreme points, then for every
+// point outside the hull, find the faces it can see (a flood fill from the
+// one it sees best, so the region stays connected), cut them out and close
+// the hole with a fan of triangles from the point to the region's border.
+// Triangles that turn out coplanar are merged into polygon faces afterwards,
+// so a box comes out with 6 faces, not 12 - which is what the contact
+// clipping wants.
+
+struct phys3d__qh_face { int v[3]; vec3 n; float d; bool alive; };
+
+static void phys3d__qh_plane(phys3d__qh_face& f, const vec3* p) {
+    f.n = v3norm(v3cross(p[f.v[1]] - p[f.v[0]], p[f.v[2]] - p[f.v[0]]));
+    f.d = v3dot(f.n, p[f.v[0]]);
+}
+
+// the live face holding directed edge a -> b
+static int phys3d__qh_owner(const phys3d__qh_face* f, int count, int a, int b) {
+    for (int i = 0; i < count; i++) {
+        if (!f[i].alive) continue;
+        for (int e = 0; e < 3; e++) if (f[i].v[e] == a && f[i].v[(e + 1) % 3] == b) return i;
+    }
+    return -1;
+}
+
+static uint32_t phys3d__qh_root(uint32_t* parent, uint32_t i) {
+    while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+    return i;
+}
+
+bool phys3d_create_hull(phys3d_hull& h, const vec3* pts, size_t n) {
+    memset(&h, 0, sizeof(h));
+    if (!pts || n < 4) return false;
+    // ---- the starting tetrahedron ----
+    int ext[6] = { 0, 0, 0, 0, 0, 0 };
+    for (size_t i = 1; i < n; i++)
+        for (int a = 0; a < 3; a++) {
+            const float* p = &pts[i].x;
+            if (p[a] < (&pts[ext[a * 2]].x)[a]) ext[a * 2] = (int)i;
+            if (p[a] > (&pts[ext[a * 2 + 1]].x)[a]) ext[a * 2 + 1] = (int)i;
+        }
+    int i0 = ext[0], i1 = ext[1];
+    float spread = v3dist(pts[i0], pts[i1]);
+    for (int a = 1; a < 3; a++)
+        if (v3dist(pts[ext[a * 2]], pts[ext[a * 2 + 1]]) > spread) {
+            i0 = ext[a * 2]; i1 = ext[a * 2 + 1]; spread = v3dist(pts[i0], pts[i1]);
+        }
+    float eps = 1e-5f * spread;
+    if (spread < 1e-6f) return false;
+    int i2 = -1; float best = eps;
+    vec3 line = v3norm(pts[i1] - pts[i0]);
+    for (size_t i = 0; i < n; i++) {
+        vec3 d = pts[i] - pts[i0];
+        float dist = v3len(d - line * v3dot(d, line));
+        if (dist > best) { best = dist; i2 = (int)i; }
+    }
+    if (i2 < 0) return false;
+    vec3 pn = v3norm(v3cross(pts[i1] - pts[i0], pts[i2] - pts[i0]));
+    int i3 = -1; best = eps;
+    for (size_t i = 0; i < n; i++) {
+        float dist = fabsf(v3dot(pn, pts[i] - pts[i0]));
+        if (dist > best) { best = dist; i3 = (int)i; }
+    }
+    if (i3 < 0) return false;   // flat
+
+    size_t cap = 8 + n * 4;
+    phys3d__qh_face* f = pix_alloc<phys3d__qh_face>(cap);
+    int* stack = pix_alloc<int>(cap);
+    int* visible = pix_alloc<int>(cap);
+    uint8_t* seen = pix_alloc<uint8_t>(cap);
+    int* horizon = pix_alloc<int>(cap * 2);
+    if (!f || !stack || !visible || !seen || !horizon) {
+        pix_free(f); pix_free(stack); pix_free(visible); pix_free(seen); pix_free(horizon);
+        return false;
+    }
+    int fc = 0;
+    vec3 inside = (pts[i0] + pts[i1] + pts[i2] + pts[i3]) * 0.25f;
+    int tet[4][3] = { { i0, i1, i2 }, { i0, i3, i1 }, { i1, i3, i2 }, { i2, i3, i0 } };
+    for (int t = 0; t < 4; t++) {
+        phys3d__qh_face& nf = f[fc++];
+        nf.v[0] = tet[t][0]; nf.v[1] = tet[t][1]; nf.v[2] = tet[t][2];
+        nf.alive = true;
+        phys3d__qh_plane(nf, pts);
+        if (v3dot(nf.n, inside) > nf.d) {   // facing in: flip
+            int s = nf.v[1]; nf.v[1] = nf.v[2]; nf.v[2] = s;
+            phys3d__qh_plane(nf, pts);
+        }
+    }
+
+    // ---- add points, one at a time ----
+    bool ok = true;
+    for (size_t pi = 0; pi < n && ok; pi++) {
+        int p = (int)pi;
+        if (p == i0 || p == i1 || p == i2 || p == i3) continue;
+        int start = -1; float furthest = eps;
+        for (int i = 0; i < fc; i++) {
+            if (!f[i].alive) continue;
+            float dist = v3dot(f[i].n, pts[p]) - f[i].d;
+            if (dist > furthest) { furthest = dist; start = i; }
+        }
+        if (start < 0) continue;   // inside
+        // flood fill the faces the point sees, through shared edges
+        int sp = 0, vc = 0, hc = 0;
+        memset(seen, 0, (size_t)fc);
+        stack[sp++] = start;
+        seen[start] = 1;
+        while (sp) {
+            int cur = stack[--sp];
+            visible[vc++] = cur;
+            for (int e = 0; e < 3; e++) {
+                int a = f[cur].v[e], b = f[cur].v[(e + 1) % 3];
+                int nb = phys3d__qh_owner(f, fc, b, a);
+                if (nb < 0) { ok = false; break; }
+                if (seen[nb] == 1) continue;
+                if (seen[nb] == 2 || v3dot(f[nb].n, pts[p]) - f[nb].d <= eps) {
+                    seen[nb] = 2;              // not visible: a -> b is on the border
+                    horizon[hc * 2] = a; horizon[hc * 2 + 1] = b; hc++;
+                } else {
+                    seen[nb] = 1;
+                    stack[sp++] = nb;
+                }
+            }
+            if (!ok) break;
+        }
+        if (!ok || (size_t)(fc + hc) > cap) { ok = false; break; }
+        for (int i = 0; i < vc; i++) f[visible[i]].alive = false;
+        for (int e = 0; e < hc; e++) {
+            phys3d__qh_face& nf = f[fc++];
+            nf.v[0] = horizon[e * 2]; nf.v[1] = horizon[e * 2 + 1]; nf.v[2] = p;
+            nf.alive = true;
+            phys3d__qh_plane(nf, pts);
+        }
+        // compact now and then, so the scans stay proportional to the live hull
+        if (fc > (int)cap / 2) {
+            int k = 0;
+            for (int i = 0; i < fc; i++) if (f[i].alive) f[k++] = f[i];
+            fc = k;
+        }
+    }
+    pix_free(stack); pix_free(visible); pix_free(horizon);
+    if (!ok) { pix_free(f); pix_free(seen); pix_log("phys3d: hull construction failed (degenerate points?)\n"); return false; }
+    int k = 0;
+    for (int i = 0; i < fc; i++) if (f[i].alive) f[k++] = f[i];
+    fc = k;
+
+    // ---- merge coplanar neighbours into polygon faces ----
+    uint32_t* group = pix_alloc<uint32_t>((size_t)fc);
+    int* remap = pix_alloc<int>(n);
+    int* tri_twin = pix_alloc<int>((size_t)fc * 3);
+    if (!group || !remap || !tri_twin) { pix_free(f); pix_free(seen); pix_free(group); pix_free(remap); pix_free(tri_twin); return false; }
+    for (int i = 0; i < fc; i++) group[i] = (uint32_t)i;
+    for (int i = 0; i < fc; i++)
+        for (int e = 0; e < 3; e++) {
+            int t = phys3d__qh_owner(f, fc, f[i].v[(e + 1) % 3], f[i].v[e]);
+            tri_twin[i * 3 + e] = t;
+            if (t > i && v3dot(f[i].n, f[t].n) > 0.9999f) {
+                uint32_t ra = phys3d__qh_root(group, (uint32_t)i), rb = phys3d__qh_root(group, (uint32_t)t);
+                if (ra != rb) group[rb] = ra;
+            }
+        }
+    for (int i = 0; i < fc; i++) group[i] = phys3d__qh_root(group, (uint32_t)i);
+    // used vertices, compacted
+    for (size_t i = 0; i < n; i++) remap[i] = -1;
+    int vcount = 0;
+    for (int i = 0; i < fc; i++)
+        for (int e = 0; e < 3; e++) if (remap[f[i].v[e]] < 0) remap[f[i].v[e]] = vcount++;
+    if (vcount > PHYS3D_MAX_HULL_VERTICES) {
+        pix_log("phys3d: hull has %d corners, more than PHYS3D_MAX_HULL_VERTICES (%d)\n", vcount, PHYS3D_MAX_HULL_VERTICES);
+        pix_free(f); pix_free(seen); pix_free(group); pix_free(remap); pix_free(tri_twin);
+        return false;
+    }
+    int faces = 0;
+    for (int i = 0; i < fc; i++) if (group[i] == (uint32_t)i) faces++;
+    h.vertices = pix_alloc<vec3>((size_t)vcount);
+    h.planes = pix_alloc<vec4>((size_t)faces);
+    h.face_start = pix_alloc<int>((size_t)faces + 1);
+    h.face_verts = pix_alloc<uint16_t>((size_t)fc * 3);
+    h.edges = pix_alloc<phys3d_hull_edge>((size_t)fc * 3);
+    if (!h.vertices || !h.planes || !h.face_start || !h.face_verts || !h.edges) {
+        pix_free(f); pix_free(seen); pix_free(group); pix_free(remap); pix_free(tri_twin);
+        phys3d_destroy_hull(h);
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) if (remap[i] >= 0) h.vertices[remap[i]] = pts[i];
+    h.vertex_count = vcount;
+    // each group's border, walked edge to edge into one loop
+    int fv = 0;
+    for (int g = 0; g < fc; g++) {
+        if (group[g] != (uint32_t)g) continue;
+        int face = h.face_count++;
+        h.face_start[face] = fv;
+        vec3 nsum = v3(0, 0, 0);
+        int first_tri = -1, first_e = -1;
+        for (int i = 0; i < fc; i++) {
+            if (group[i] != (uint32_t)g) continue;
+            nsum += f[i].n * v3len(v3cross(pts[f[i].v[1]] - pts[f[i].v[0]], pts[f[i].v[2]] - pts[f[i].v[0]]));
+            for (int e = 0; e < 3 && first_tri < 0; e++) {
+                int t = tri_twin[i * 3 + e];
+                if (t < 0 || group[t] != (uint32_t)g) { first_tri = i; first_e = e; }
+            }
+        }
+        vec3 nrm = v3norm(nsum);
+        int start_v = f[first_tri].v[first_e];
+        int cur_v = start_v;
+        int guard = 0;
+        do {
+            // the border edge leaving cur_v
+            int next_v = -1;
+            for (int i = 0; i < fc && next_v < 0; i++) {
+                if (group[i] != (uint32_t)g) continue;
+                for (int e = 0; e < 3; e++) {
+                    int t = tri_twin[i * 3 + e];
+                    if (f[i].v[e] == cur_v && (t < 0 || group[t] != (uint32_t)g)) { next_v = f[i].v[(e + 1) % 3]; break; }
+                }
+            }
+            if (next_v < 0 || fv >= fc * 3) break;
+            h.face_verts[fv++] = (uint16_t)remap[cur_v];
+            cur_v = next_v;
+        } while (cur_v != start_v && ++guard < PHYS3D_MAX_FACE_VERTICES);
+        if (fv - h.face_start[face] > PHYS3D_MAX_FACE_VERTICES) fv = h.face_start[face] + PHYS3D_MAX_FACE_VERTICES;
+        // the plane through the face's furthest corner: conservative if not exactly flat
+        float d = -1e30f;
+        for (int i = h.face_start[face]; i < fv; i++) d = maxf(d, v3dot(nrm, h.vertices[h.face_verts[i]]));
+        h.planes[face] = v4(nrm.x, nrm.y, nrm.z, d);
+    }
+    h.face_start[h.face_count] = fv;
+    // edges: each border edge with the face on its other side, once
+    for (int a = 0; a < h.face_count; a++)
+        for (int i = h.face_start[a]; i < h.face_start[a + 1]; i++) {
+            int u = h.face_verts[i];
+            int v = h.face_verts[i + 1 < h.face_start[a + 1] ? i + 1 : h.face_start[a]];
+            if (u > v) continue;   // the twin direction records it
+            for (int b = 0; b < h.face_count; b++) {
+                if (b == a) continue;
+                bool found = false;
+                for (int j = h.face_start[b]; j < h.face_start[b + 1] && !found; j++) {
+                    int u2 = h.face_verts[j];
+                    int v2 = h.face_verts[j + 1 < h.face_start[b + 1] ? j + 1 : h.face_start[b]];
+                    if (u2 == v && v2 == u) found = true;
+                }
+                if (found) {
+                    phys3d_hull_edge& e = h.edges[h.edge_count++];
+                    e.v0 = (uint16_t)u; e.v1 = (uint16_t)v; e.f0 = (uint16_t)a; e.f1 = (uint16_t)b;
+                    break;
+                }
+            }
+        }
+    pix_free(f); pix_free(seen); pix_free(group); pix_free(remap); pix_free(tri_twin);
+
+    // ---- mass properties: tetrahedra from a point inside to every face ----
+    vec3 ref = v3(0, 0, 0);
+    for (int i = 0; i < h.vertex_count; i++) ref += h.vertices[i];
+    ref = ref * (1.0f / h.vertex_count);
+    double vol = 0.0, cx = 0, cy = 0, cz = 0, C[3][3] = {};
+    for (int a = 0; a < h.face_count; a++) {
+        int s = h.face_start[a], e = h.face_start[a + 1];
+        for (int i = s + 1; i + 1 < e; i++) {
+            vec3 p0 = h.vertices[h.face_verts[s]] - ref, p1 = h.vertices[h.face_verts[i]] - ref, p2 = h.vertices[h.face_verts[i + 1]] - ref;
+            double det = v3dot(p0, v3cross(p1, p2));    // six times the tetrahedron's signed volume
+            vol += det / 6.0;
+            cx += det / 24.0 * (p0.x + p1.x + p2.x);
+            cy += det / 24.0 * (p0.y + p1.y + p2.y);
+            cz += det / 24.0 * (p0.z + p1.z + p2.z);
+            // covariance of the tetrahedron (Blow & Binstock): det/120 * sum over vertex pairs
+            const float* q[3] = { &p0.x, &p1.x, &p2.x };
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) {
+                    double sum = 0.0;
+                    for (int x = 0; x < 3; x++) {
+                        sum += 2.0 * q[x][r] * q[x][c];
+                        for (int y = 0; y < 3; y++) if (y != x) sum += q[x][r] * q[y][c];
+                    }
+                    C[r][c] += det / 120.0 * sum;
+                }
+        }
+    }
+    if (vol <= 1e-12) { phys3d_destroy_hull(h); return false; }
+    vec3 com = v3((float)(cx / vol), (float)(cy / vol), (float)(cz / vol));
+    // move the covariance to the centre of mass, then I = trace(C) * 1 - C
+    double cm[3] = { com.x, com.y, com.z };
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) C[r][c] -= vol * cm[r] * cm[c];
+    double tr = C[0][0] + C[1][1] + C[2][2];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) h.inertia.data[c * 3 + r] = (float)((r == c ? tr : 0.0) - C[r][c]);
+    h.volume = (float)vol;
+    h.offset = ref + com;
+    h.bounds = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+    for (int i = 0; i < h.vertex_count; i++) {
+        h.vertices[i] = h.vertices[i] - h.offset;
+        h.bounds.min = v3min(h.bounds.min, h.vertices[i]);
+        h.bounds.max = v3max(h.bounds.max, h.vertices[i]);
+    }
+    for (int a = 0; a < h.face_count; a++) {
+        vec4& pl = h.planes[a];
+        pl.w -= pl.x * h.offset.x + pl.y * h.offset.y + pl.z * h.offset.z;
+    }
+    return true;
+}
+
+void phys3d_destroy_hull(phys3d_hull& h) {
+    pix_free(h.vertices);
+    pix_free(h.planes);
+    pix_free(h.face_start);
+    pix_free(h.face_verts);
+    pix_free(h.edges);
+    memset(&h, 0, sizeof(h));
+}
+
+// ---- compounds ----
+
+static void phys3d__shape_mass(const phys3d_shape& s, float d, float* out_mass, mat3* out_inertia);
+
+// a radius around the shape's centre that holds all of it
+static float phys3d__shape_reach(const phys3d_shape& s) {
+    if (s.type == PHYS3D_SPHERE) return s.radius;
+    if (s.type == PHYS3D_CAPSULE) return s.radius + s.half_length;
+    if (s.type == PHYS3D_BOX) return v3len(s.half);
+    if (s.type == PHYS3D_HULL && s.hull) {
+        float r = 0.0f;
+        for (int i = 0; i < s.hull->vertex_count; i++) r = maxf(r, v3len(s.hull->vertices[i]));
+        return r;
+    }
+    return 0.0f;
+}
+
+bool phys3d_create_compound(phys3d_compound& c, const phys3d_compound_child* children, int count) {
+    memset(&c, 0, sizeof(c));
+    if (!children || count <= 0) return false;
+    for (int i = 0; i < count; i++) {
+        uint8_t t = children[i].shape.type;
+        if (t != PHYS3D_SPHERE && t != PHYS3D_BOX && t != PHYS3D_CAPSULE && !(t == PHYS3D_HULL && children[i].shape.hull)) {
+            pix_log("phys3d: compound child %d must be a sphere, box, capsule or hull\n", i);
+            return false;
+        }
+    }
+    c.children = pix_alloc<phys3d_compound_child>((size_t)count);
+    if (!c.children) return false;
+    c.count = count;
+    // the parts' masses at unit density: the centre of mass, then every part's
+    // inertia turned into the compound's frame and moved there (parallel axes)
+    float total = 0.0f;
+    vec3 com = v3(0, 0, 0);
+    for (int i = 0; i < count; i++) {
+        c.children[i] = children[i];
+        c.children[i].rotation = quat_norm(children[i].rotation);
+        float m; mat3 I;
+        phys3d__shape_mass(children[i].shape, 1.0f, &m, &I);
+        // a hull part's own centre is its centre of mass, `offset` from its points' origin
+        vec3 at = children[i].position + quat_rotate(c.children[i].rotation, phys3d_shape_offset(children[i].shape));
+        c.children[i].position = at;
+        total += m;
+        com += at * m;
+    }
+    if (total <= 0.0f) { phys3d_destroy_compound(c); return false; }
+    com = com * (1.0f / total);
+    mat3 I = {};
+    for (int i = 0; i < count; i++) {
+        float m; mat3 Ic;
+        phys3d__shape_mass(c.children[i].shape, 1.0f, &m, &Ic);
+        mat3 r = mat3_from_quat(c.children[i].rotation);
+        mat3 rot = r * Ic * mat3_transpose(r);
+        vec3 d = c.children[i].position - com;
+        float dd = v3dot(d, d);
+        const float dv[3] = { d.x, d.y, d.z };
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 3; col++)
+                I.data[col * 3 + row] += rot.data[col * 3 + row] + m * ((row == col ? dd : 0.0f) - dv[row] * dv[col]);
+        c.children[i].position = d;   // re-centred
+    }
+    c.bounds = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+    for (int i = 0; i < count; i++) {
+        float reach = phys3d__shape_reach(c.children[i].shape);
+        vec3 r = v3(reach, reach, reach);
+        c.bounds.min = v3min(c.bounds.min, c.children[i].position - r);
+        c.bounds.max = v3max(c.bounds.max, c.children[i].position + r);
+    }
+    c.volume = total;
+    c.inertia = I;
+    c.offset = com;
+    return true;
+}
+
+void phys3d_destroy_compound(phys3d_compound& c) {
+    pix_free(c.children);
+    memset(&c, 0, sizeof(c));
+}
+
 // every triangle whose bounds overlap `box` (in the mesh's own frame)
 template <typename F>
 static void phys3d__mesh_query(const phys3d_mesh& m, const aabb& box, F&& visit) {
@@ -563,18 +1181,25 @@ static void phys3d__mesh_query(const phys3d_mesh& m, const aabb& box, F&& visit)
 #define PHYS3D__SEGMENT  1
 #define PHYS3D__BOX      2
 #define PHYS3D__TRIANGLE 3
-#define PHYS3D__PLANE    4
+#define PHYS3D__HULL     4
+#define PHYS3D__PLANE    5
 
 struct phys3d__core {
     uint8_t kind;
-    int     count;        // vertices in v
+    int     count;        // vertices in v (a hull's: hull->vertex_count, read through phys3d__vert)
     vec3    v[8];
     vec3    centre;
     vec3    axis[3];      // box: its axes; triangle: axis[0] is the face normal
     vec3    half;
     float   radius;
     float   offset;       // plane: dot(normal, p) == offset; normal in axis[0]
+    quat    q;            // hull: its rotation (centre is its position)
+    const phys3d_hull* hull;
 };
+
+static inline vec3 phys3d__vert(const phys3d__core& c, int i) {
+    return c.kind == PHYS3D__HULL ? c.centre + quat_rotate(c.q, c.hull->vertices[i]) : c.v[i];
+}
 
 static void phys3d__make_core(const phys3d_shape& s, vec3 p, quat q, phys3d__core& c) {
     c.radius = 0.0f;
@@ -597,6 +1222,22 @@ static void phys3d__make_core(const phys3d_shape& s, vec3 p, quat q, phys3d__cor
         c.kind = PHYS3D__PLANE; c.count = 0;
         c.axis[0] = quat_rotate(q, s.normal);
         c.offset = v3dot(c.axis[0], p);
+    } else if (s.type == PHYS3D_HULL) {
+        c.kind = PHYS3D__HULL; c.hull = s.hull; c.q = q;
+        c.count = s.hull->vertex_count;
+    }
+}
+
+// Every convex piece of a body as a core, with its part number: one for a
+// plain shape, one per child for a compound.
+template <typename F>
+static void phys3d__for_each_core(const phys3d_shape& s, vec3 p, quat q, F&& visit) {
+    phys3d__core c;
+    if (s.type != PHYS3D_COMPOUND) { phys3d__make_core(s, p, q, c); visit(c, 0u); return; }
+    for (int i = 0; i < s.compound->count; i++) {
+        const phys3d_compound_child& ch = s.compound->children[i];
+        phys3d__make_core(ch.shape, p + quat_rotate(q, ch.position), quat_mul(q, ch.rotation), c);
+        visit(c, (uint32_t)i);
     }
 }
 
@@ -609,6 +1250,17 @@ static void phys3d__triangle_core(vec3 a, vec3 b, vec3 c, phys3d__core& out) {
 
 static aabb phys3d__core_bounds(const phys3d__core& c) {
     if (c.kind == PHYS3D__PLANE) return aabb_make(v3(-1e30f, -1e30f, -1e30f), v3(1e30f, 1e30f, 1e30f));
+    if (c.kind == PHYS3D__HULL) {
+        // the local box turned with it: a little loose, but eight points instead of all of them
+        const aabb& lb = c.hull->bounds;
+        aabb b = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+        for (int i = 0; i < 8; i++) {
+            vec3 p = c.centre + quat_rotate(c.q, v3((i & 1) ? lb.max.x : lb.min.x, (i & 2) ? lb.max.y : lb.min.y,
+                                                   (i & 4) ? lb.max.z : lb.min.z));
+            b.min = v3min(b.min, p); b.max = v3max(b.max, p);
+        }
+        return b;
+    }
     aabb b = aabb_make(c.v[0], c.v[0]);
     for (int i = 1; i < c.count; i++) { b.min = v3min(b.min, c.v[i]); b.max = v3max(b.max, c.v[i]); }
     vec3 r = v3(c.radius, c.radius, c.radius);
@@ -621,6 +1273,14 @@ static vec3 phys3d__support(const phys3d__core& c, vec3 d) {
         return c.centre + c.axis[0] * (v3dot(d, c.axis[0]) >= 0.0f ? c.half.x : -c.half.x)
                         + c.axis[1] * (v3dot(d, c.axis[1]) >= 0.0f ? c.half.y : -c.half.y)
                         + c.axis[2] * (v3dot(d, c.axis[2]) >= 0.0f ? c.half.z : -c.half.z);
+    if (c.kind == PHYS3D__HULL) {
+        vec3 ld = quat_rotate(quat_conjugate(c.q), d);
+        const vec3* v = c.hull->vertices;
+        int best = 0;
+        float bd = v3dot(v[0], ld);
+        for (int i = 1; i < c.count; i++) { float x = v3dot(v[i], ld); if (x > bd) { bd = x; best = i; } }
+        return c.centre + quat_rotate(c.q, v[best]);
+    }
     int best = 0;
     float bd = v3dot(c.v[0], d);
     for (int i = 1; i < c.count; i++) { float x = v3dot(c.v[i], d); if (x > bd) { bd = x; best = i; } }
@@ -788,6 +1448,13 @@ static int phys3d__reduce(const vec3* pts, const float* seps, int n, int* keep) 
 // A face of a box (6) or a triangle (1): its outward normal, a point on it and
 // its corners in order.
 static int phys3d__face(const phys3d__core& c, int f, vec3* n, vec3* poly) {
+    if (c.kind == PHYS3D__HULL) {
+        const phys3d_hull& h = *c.hull;
+        *n = quat_rotate(c.q, v3(h.planes[f].x, h.planes[f].y, h.planes[f].z));
+        int k = 0;
+        for (int i = h.face_start[f]; i < h.face_start[f + 1]; i++) poly[k++] = c.centre + quat_rotate(c.q, h.vertices[h.face_verts[i]]);
+        return k;
+    }
     if (c.kind == PHYS3D__TRIANGLE) {
         *n = c.axis[0];
         poly[0] = c.v[0]; poly[1] = c.v[1]; poly[2] = c.v[2];
@@ -802,14 +1469,17 @@ static int phys3d__face(const phys3d__core& c, int f, vec3* n, vec3* poly) {
     poly[0] = fc + u + v; poly[1] = fc - u + v; poly[2] = fc - u - v; poly[3] = fc + u - v;
     return 4;
 }
-static inline int phys3d__face_count(const phys3d__core& c) { return c.kind == PHYS3D__TRIANGLE ? 1 : 6; }
+static inline int phys3d__face_count(const phys3d__core& c) {
+    return c.kind == PHYS3D__HULL ? c.hull->face_count : (c.kind == PHYS3D__TRIANGLE ? 1 : 6);
+}
 
 // Clips polygon `in` (n points) to the reference face's side planes, then
 // keeps the points within `margin` of the face. `ref_n` points out of the
 // reference shape; `flip` means the reference is b, so the a->b normal is -ref_n.
+#define PHYS3D__CLIP_MAX (2 * PHYS3D_MAX_FACE_VERTICES + 8)   // each clipping plane adds at most one corner
 static int phys3d__clip_to_face(const vec3* ref_poly, int ref_n_count, vec3 ref_n, const vec3* in, int n,
                                 float r_ref, float r_inc, bool flip, float margin, phys3d_contact& m) {
-    vec3 buf_a[16], buf_b[16];
+    vec3 buf_a[PHYS3D__CLIP_MAX], buf_b[PHYS3D__CLIP_MAX];
     for (int i = 0; i < n; i++) buf_a[i] = in[i];
     vec3* cur = buf_a; vec3* next = buf_b;
     vec3 centre = v3(0, 0, 0);
@@ -835,14 +1505,14 @@ static int phys3d__clip_to_face(const vec3* ref_poly, int ref_n_count, vec3 ref_
                 vec3 a = cur[i], b = cur[(i + 1) % n];
                 float da = v3dot(side, a) - off, db = v3dot(side, b) - off;
                 if (da <= 0.0f) next[k++] = a;
-                if ((da < 0.0f) != (db < 0.0f) && k < 16) next[k++] = a + (b - a) * (da / (da - db));
-                if (k >= 16) break;
+                if ((da < 0.0f) != (db < 0.0f) && k < PHYS3D__CLIP_MAX) next[k++] = a + (b - a) * (da / (da - db));
+                if (k >= PHYS3D__CLIP_MAX) break;
             }
         }
         vec3* t = cur; cur = next; next = t;
         n = k;
     }
-    vec3 pts[16]; float seps[16];
+    vec3 pts[PHYS3D__CLIP_MAX]; float seps[PHYS3D__CLIP_MAX];
     int count = 0;
     float plane = v3dot(ref_n, ref_poly[0]);
     for (int i = 0; i < n; i++) {
@@ -900,7 +1570,7 @@ static int phys3d__collide_rounded(const phys3d__core& a, const phys3d__core& b,
 static int phys3d__collide_rounded_poly(const phys3d__core& a, const phys3d__core& b, float margin, phys3d_contact& m) {
     vec3 pa, pb;
     float d = phys3d__gjk(a, b, &pa, &pb);
-    vec3 poly[4], fn;
+    vec3 poly[PHYS3D_MAX_FACE_VERTICES], fn;
     m.count = 0;
     if (d > 1e-5f) {
         if (d - a.radius > margin) return 0;
@@ -1039,15 +1709,208 @@ static int phys3d__collide_polys(const phys3d__core& a, const phys3d__core& b, f
     return phys3d__clip_to_face(poly, rc, fn, inc_poly, ic, 0.0f, 0.0f, flip, margin, m);
 }
 
+// ---- hulls against boxes, triangles and hulls ----
+//
+// Each shape seen the same way, in world space: corners, face planes and
+// polygons, and edges with the face either side. Candidate separating axes are
+// every face normal of both, and the cross product of every edge pair - but an
+// edge pair can only separate the shapes when its two arcs cross on the Gauss
+// map (it is then a face of the Minkowski difference), which rules out nearly
+// all of them cheaply (Gregorius, "The Separating Axis Test between Convex
+// Polyhedra", GDC 2013). A triangle skips that test: its two sides face
+// opposite ways, which the arc test cannot handle, and it has three edges.
+
+struct phys3d__poly_view {
+    const vec3* v; int nv;
+    const vec3* n; const float* d; int nf;
+    const int* fstart; const uint16_t* fverts;
+    const phys3d_hull_edge* e; int ne;
+    bool prune;
+    vec3 centre;
+};
+
+// world-space copies of the two shapes in a test (thread-local: not on the stack)
+static thread_local vec3  phys3d__pv_verts[2][PHYS3D_MAX_HULL_VERTICES];
+static thread_local vec3  phys3d__pv_norms[2][2 * PHYS3D_MAX_HULL_VERTICES];
+static thread_local float phys3d__pv_offs[2][2 * PHYS3D_MAX_HULL_VERTICES];
+
+// a box's faces in phys3d__face's order (+x, -x, +y, -y, +z, -z) and its edges
+static int phys3d__box_fstart[7];
+static uint16_t phys3d__box_fverts[24];
+static phys3d_hull_edge phys3d__box_edges[12];
+static const phys3d_hull_edge phys3d__tri_edges[3] = { { 0, 1, 0, 0 }, { 1, 2, 0, 0 }, { 2, 0, 0, 0 } };
+static const int phys3d__tri_fstart[2] = { 0, 3 };
+static const uint16_t phys3d__tri_fverts[3] = { 0, 1, 2 };
+
+static void phys3d__box_tables() {
+    static bool done = false;
+    if (done) return;
+    int fv = 0, ec = 0;
+    for (int f = 0; f < 6; f++) {
+        int i = f >> 1, j = (i + 1) % 3, k = (i + 2) % 3;
+        int side = (f & 1) ? 0 : 1;
+        static const int cycle[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+        phys3d__box_fstart[f] = fv;
+        for (int c = 0; c < 4; c++)
+            phys3d__box_fverts[fv++] = (uint16_t)((side << i) | (cycle[c][0] << j) | (cycle[c][1] << k));
+    }
+    phys3d__box_fstart[6] = fv;
+    for (int e = 0; e < 3; e++) {
+        int j = (e + 1) % 3, k = (e + 2) % 3;
+        for (int bj = 0; bj < 2; bj++)
+            for (int bk = 0; bk < 2; bk++) {
+                phys3d_hull_edge& ed = phys3d__box_edges[ec++];
+                ed.v0 = (uint16_t)((bj << j) | (bk << k));
+                ed.v1 = (uint16_t)(ed.v0 | (1 << e));
+                ed.f0 = (uint16_t)(2 * j + (bj ? 0 : 1));
+                ed.f1 = (uint16_t)(2 * k + (bk ? 0 : 1));
+            }
+    }
+    done = true;
+}
+
+static phys3d__poly_view phys3d__make_view(const phys3d__core& c, int slot) {
+    phys3d__poly_view v = {};
+    v.centre = c.centre;
+    if (c.kind == PHYS3D__HULL) {
+        const phys3d_hull& h = *c.hull;
+        for (int i = 0; i < h.vertex_count; i++) phys3d__pv_verts[slot][i] = c.centre + quat_rotate(c.q, h.vertices[i]);
+        for (int f = 0; f < h.face_count; f++) {
+            vec3 n = quat_rotate(c.q, v3(h.planes[f].x, h.planes[f].y, h.planes[f].z));
+            phys3d__pv_norms[slot][f] = n;
+            phys3d__pv_offs[slot][f] = h.planes[f].w + v3dot(n, c.centre);
+        }
+        v.v = phys3d__pv_verts[slot]; v.nv = h.vertex_count;
+        v.n = phys3d__pv_norms[slot]; v.d = phys3d__pv_offs[slot]; v.nf = h.face_count;
+        v.fstart = h.face_start; v.fverts = h.face_verts;
+        v.e = h.edges; v.ne = h.edge_count;
+        v.prune = true;
+    } else if (c.kind == PHYS3D__BOX) {
+        phys3d__box_tables();
+        const float hh[3] = { c.half.x, c.half.y, c.half.z };
+        for (int f = 0; f < 6; f++) {
+            vec3 n = c.axis[f >> 1] * ((f & 1) ? -1.0f : 1.0f);
+            phys3d__pv_norms[slot][f] = n;
+            phys3d__pv_offs[slot][f] = v3dot(n, c.centre) + hh[f >> 1];
+        }
+        v.v = c.v; v.nv = 8;
+        v.n = phys3d__pv_norms[slot]; v.d = phys3d__pv_offs[slot]; v.nf = 6;
+        v.fstart = phys3d__box_fstart; v.fverts = phys3d__box_fverts;
+        v.e = phys3d__box_edges; v.ne = 12;
+        v.prune = true;
+    } else {   // triangle: its front only
+        phys3d__pv_norms[slot][0] = c.axis[0];
+        phys3d__pv_offs[slot][0] = v3dot(c.axis[0], c.v[0]);
+        v.v = c.v; v.nv = 3;
+        v.n = phys3d__pv_norms[slot]; v.d = phys3d__pv_offs[slot]; v.nf = 1;
+        v.fstart = phys3d__tri_fstart; v.fverts = phys3d__tri_fverts;
+        v.e = phys3d__tri_edges; v.ne = 3;
+        v.prune = false;
+    }
+    return v;
+}
+
+// do edge (a, b normals) of A and edge (c, d normals) of B form a face of the
+// Minkowski difference? (B's normals are negated by the caller)
+static inline bool phys3d__minkowski_face(vec3 a, vec3 b, vec3 c, vec3 d) {
+    vec3 bxa = v3cross(b, a), dxc = v3cross(d, c);
+    float cba = v3dot(c, bxa), dba = v3dot(d, bxa), adc = v3dot(a, dxc), bdc = v3dot(b, dxc);
+    return cba * dba < 0.0f && adc * bdc < 0.0f && cba * bdc > 0.0f;
+}
+
+static int phys3d__view_poly(const phys3d__poly_view& v, int f, vec3* out) {
+    int k = 0;
+    for (int i = v.fstart[f]; i < v.fstart[f + 1]; i++) out[k++] = v.v[v.fverts[i]];
+    return k;
+}
+
+static int phys3d__collide_views(const phys3d__poly_view& A, const phys3d__poly_view& B, float slop, float margin,
+                                 phys3d_contact& m) {
+    m.count = 0;
+    float sep_a = -1e30f, sep_b = -1e30f;
+    int face_a = 0, face_b = 0;
+    for (int f = 0; f < A.nf; f++) {
+        float s = 1e30f;
+        for (int i = 0; i < B.nv; i++) s = minf(s, v3dot(A.n[f], B.v[i]));
+        s -= A.d[f];
+        if (s > margin) return 0;
+        if (s > sep_a) { sep_a = s; face_a = f; }
+    }
+    for (int f = 0; f < B.nf; f++) {
+        float s = 1e30f;
+        for (int i = 0; i < A.nv; i++) s = minf(s, v3dot(B.n[f], A.v[i]));
+        s -= B.d[f];
+        if (s > margin) return 0;
+        if (s > sep_b) { sep_b = s; face_b = f; }
+    }
+    float sep_e = -1e30f;
+    int edge_i = -1, edge_j = -1;
+    vec3 edge_axis = v3(0, 1, 0);
+    bool prune = A.prune && B.prune;
+    vec3 dcent = B.centre - A.centre;
+    for (int i = 0; i < A.ne; i++) {
+        const phys3d_hull_edge& ea = A.e[i];
+        vec3 pa = A.v[ea.v0], da = A.v[ea.v1] - pa;
+        for (int j = 0; j < B.ne; j++) {
+            const phys3d_hull_edge& eb = B.e[j];
+            if (prune && !phys3d__minkowski_face(A.n[ea.f0], A.n[ea.f1], -B.n[eb.f0], -B.n[eb.f1])) continue;
+            vec3 pb = B.v[eb.v0], db = B.v[eb.v1] - pb;
+            vec3 ax = v3cross(da, db);
+            float l2 = v3dot(ax, ax);
+            if (l2 < 1e-8f * v3dot(da, da) * v3dot(db, db)) continue;   // parallel edges
+            ax = ax / sqrtf(l2);
+            float s;
+            if (prune) {
+                // a Minkowski face: the distance between the two edges' lines along it
+                if (v3dot(ax, pa - A.centre) < 0.0f) ax = -ax;
+                s = v3dot(ax, pb - pa);
+            } else {
+                if (v3dot(ax, dcent) < 0.0f) ax = -ax;
+                float amax = -1e30f, bmin = 1e30f;
+                for (int k = 0; k < A.nv; k++) amax = maxf(amax, v3dot(ax, A.v[k]));
+                for (int k = 0; k < B.nv; k++) bmin = minf(bmin, v3dot(ax, B.v[k]));
+                s = bmin - amax;
+            }
+            if (s > margin) return 0;
+            if (s > sep_e) { sep_e = s; edge_i = i; edge_j = j; edge_axis = ax; }
+        }
+    }
+    // faces win near-ties, as for boxes: no flicker between a face and an edge normal
+    float face_best = maxf(sep_a, sep_b);
+    if (edge_i >= 0 && sep_e > face_best + 0.5f * slop) {
+        vec3 ca, cb;
+        closest_points_segments(A.v[A.e[edge_i].v0], A.v[A.e[edge_i].v1], B.v[B.e[edge_j].v0], B.v[B.e[edge_j].v1], &ca, &cb);
+        m.normal = edge_axis;
+        phys3d__add_point(m, (ca + cb) * 0.5f, sep_e);
+        return 1;
+    }
+    bool flip = sep_b > sep_a + 0.1f * slop;
+    const phys3d__poly_view& ref = flip ? B : A;
+    const phys3d__poly_view& inc = flip ? A : B;
+    int rf = flip ? face_b : face_a;
+    vec3 rn = ref.n[rf];
+    vec3 ref_poly[PHYS3D_MAX_FACE_VERTICES], inc_poly[PHYS3D_MAX_FACE_VERTICES];
+    int rc = phys3d__view_poly(ref, rf, ref_poly);
+    int best = 0;
+    float lowest = 2.0f;
+    for (int f = 0; f < inc.nf; f++) {
+        float x = v3dot(inc.n[f], rn);
+        if (x < lowest) { lowest = x; best = f; }
+    }
+    int ic = phys3d__view_poly(inc, best, inc_poly);
+    return phys3d__clip_to_face(ref_poly, rc, rn, inc_poly, ic, 0.0f, 0.0f, flip, margin, m);
+}
+
 // any core against an infinite plane (b)
 static int phys3d__collide_plane(const phys3d__core& a, const phys3d__core& p, float margin, phys3d_contact& m) {
     vec3 n = p.axis[0];
-    vec3 pts[8]; float seps[8];
+    vec3 pts[PHYS3D_MAX_HULL_VERTICES]; float seps[PHYS3D_MAX_HULL_VERTICES];
     int count = 0;
     for (int i = 0; i < a.count; i++) {
-        float sep = v3dot(n, a.v[i]) - p.offset - a.radius;
+        vec3 v = phys3d__vert(a, i);
+        float sep = v3dot(n, v) - p.offset - a.radius;
         if (sep > margin) continue;
-        pts[count] = a.v[i] - n * (a.radius + 0.5f * sep);
+        pts[count] = v - n * (a.radius + 0.5f * sep);
         seps[count++] = sep;
     }
     if (!count) return 0;
@@ -1070,23 +1933,21 @@ static int phys3d__collide(const phys3d__core& a, const phys3d__core& b, float s
     if (b.kind == PHYS3D__PLANE) return a.kind == PHYS3D__PLANE ? 0 : phys3d__collide_plane(a, b, margin, m);
     if (b.kind <= PHYS3D__SEGMENT) return phys3d__collide_rounded(a, b, margin, m);
     if (a.kind <= PHYS3D__SEGMENT) return phys3d__collide_rounded_poly(a, b, margin, m);
+    if (b.kind == PHYS3D__HULL)   // with a box, triangle or hull
+        return phys3d__collide_views(phys3d__make_view(a, 0), phys3d__make_view(b, 1), slop, margin, m);
     return phys3d__collide_polys(a, b, slop, margin, m);
 }
 
 // ---- mass ----
 
-static void phys3d__compute_mass(phys3d_body& b) {
-    b.inv_mass = 0.0f;
-    b.inv_inertia_local = v3(0, 0, 0);
-    if (b.type != PHYS3D_DYNAMIC) return;
-    float d = b.density > 0.0f ? b.density : 1.0f;
-    const phys3d_shape& s = b.shape;
-    float mass;
-    vec3 inertia;
+// A shape's mass and inertia tensor about its own centre, in its own frame.
+static void phys3d__shape_mass(const phys3d_shape& s, float d, float* out_mass, mat3* out_inertia) {
+    float mass = 0.0f;
+    mat3 I = {};
     if (s.type == PHYS3D_SPHERE) {
         mass = d * (4.0f / 3.0f) * PIX_PI * s.radius * s.radius * s.radius;
         float i = 0.4f * mass * s.radius * s.radius;
-        inertia = v3(i, i, i);
+        I = mat3_scale(i, i, i);
     } else if (s.type == PHYS3D_CAPSULE) {
         // a cylinder plus a sphere split into two caps pushed out to the ends
         float r = s.radius, h = 2.0f * s.half_length, rr = r * r;
@@ -1094,25 +1955,46 @@ static void phys3d__compute_mass(phys3d_body& b) {
         mass = mc + ms;
         float iy = mc * rr * 0.5f + ms * rr * 0.4f;
         float ix = mc * (h * h / 12.0f + rr * 0.25f) + ms * (rr * 0.4f + h * h * 0.25f + 0.375f * h * r);
-        inertia = v3(ix, iy, ix);
-    } else {
+        I = mat3_scale(ix, iy, ix);
+    } else if (s.type == PHYS3D_BOX) {
         vec3 h = s.half;
         mass = d * 8.0f * h.x * h.y * h.z;
-        inertia = v3(h.y * h.y + h.z * h.z, h.x * h.x + h.z * h.z, h.x * h.x + h.y * h.y) * (mass / 3.0f);
+        I = mat3_scale((h.y * h.y + h.z * h.z) * mass / 3.0f, (h.x * h.x + h.z * h.z) * mass / 3.0f,
+                       (h.x * h.x + h.y * h.y) * mass / 3.0f);
+    } else if (s.type == PHYS3D_HULL && s.hull) {
+        mass = d * s.hull->volume;
+        for (int k = 0; k < 9; k++) I.data[k] = s.hull->inertia.data[k] * d;
+    } else if (s.type == PHYS3D_COMPOUND && s.compound) {
+        mass = d * s.compound->volume;
+        for (int k = 0; k < 9; k++) I.data[k] = s.compound->inertia.data[k] * d;
     }
-    if (mass > 0.0f) b.inv_mass = 1.0f / mass;
-    if (!b.fixed_rotation && inertia.x > 0.0f && inertia.y > 0.0f && inertia.z > 0.0f)
-        b.inv_inertia_local = v3(1.0f / inertia.x, 1.0f / inertia.y, 1.0f / inertia.z);
+    *out_mass = mass;
+    *out_inertia = I;
 }
 
+static void phys3d__compute_mass(phys3d_body& b) {
+    b.inv_mass = 0.0f;
+    b.inv_inertia_local = mat3();
+    if (b.type != PHYS3D_DYNAMIC) return;
+    float mass;
+    mat3 inertia;
+    phys3d__shape_mass(b.shape, b.density > 0.0f ? b.density : 1.0f, &mass, &inertia);
+    if (mass > 0.0f) b.inv_mass = 1.0f / mass;
+    if (!b.fixed_rotation && mat3_determinant(inertia) > 1e-12f * mass * mass * mass)
+        b.inv_inertia_local = mat3_inverse(inertia);
+}
+
+// R * M * R^T: a body's inverse inertia turned into world space
 static inline void phys3d__update_inertia(phys3d_body& b) {
-    b.inv_inertia = phys3d__rotated_inertia(b.rotation, b.inv_inertia_local);
+    mat3 r = mat3_from_quat(b.rotation);
+    b.inv_inertia = r * b.inv_inertia_local * mat3_transpose(r);
 }
 
 // ---- world ----
 
 void phys3d_create_world(phys3d_world& w) {
     memset(&w, 0, sizeof(w));
+    w.continuous = true;
     w.gravity = v3(0.0f, -9.81f, 0.0f);
     w.fixed_dt = 1.0f / 60.0f;
     w.max_steps = 4;
@@ -1312,6 +2194,7 @@ idx phys3d_add_joint(phys3d_world& w, const phys3d_joint& joint) {
     j.active = true;
     j.linear_impulse = j.angular_impulse = v3(0, 0, 0);
     j.axial_impulse = j.motor_impulse = j.lower_impulse = j.upper_impulse = j.swing_impulse = 0.0f;
+    for (int k = 0; k < 6; k++) j.axis_impulse[k] = j.axis_motor_impulse[k] = 0.0f;
     j.next_a = j.next_b = PIX_INVALID;
     if (j.a != PIX_INVALID) { j.next_a = w.bodies[j.a].joint_list; w.bodies[j.a].joint_list = id; phys3d__wake_body(w.bodies[j.a]); }
     if (j.b != PIX_INVALID) { j.next_b = w.bodies[j.b].joint_list; w.bodies[j.b].joint_list = id; phys3d__wake_body(w.bodies[j.b]); }
@@ -1367,6 +2250,51 @@ idx phys3d_add_mouse(phys3d_world& w, idx body, vec3 grab, float max_force) {
     const phys3d_body* b = phys3d_get_body(w, body);
     float mass = b && b->inv_mass > 0.0f ? 1.0f / b->inv_mass : 1.0f;
     j.max_force = max_force > 0.0f ? max_force : 50.0f * mass * maxf(v3len(w.gravity), 1.0f);
+    return phys3d_add_joint(w, j);
+}
+
+idx phys3d_add_wheel(phys3d_world& w, idx chassis, idx wheel, vec3 centre, vec3 suspension, vec3 spin) {
+    phys3d_joint j = phys3d__joint_base(w, PHYS3D_JOINT_WHEEL, chassis, wheel, centre, centre, suspension);
+    spin = v3dot(spin, spin) > 1e-12f ? v3norm(spin) : v3(1, 0, 0);
+    j.local_ref_a = phys3d__dir_to_local(phys3d__jbody(w, chassis), spin);   // the axle in the chassis
+    j.local_axis_b = phys3d__dir_to_local(phys3d__jbody(w, wheel), spin);    // and in the wheel
+    j.enable_spring = true;
+    j.hertz = 5.0f;
+    j.damping_ratio = 0.7f;
+    return phys3d_add_joint(w, j);
+}
+idx phys3d_add_motor_joint(phys3d_world& w, idx a, idx b, float max_force, float max_torque) {
+    const phys3d_body& A = phys3d__jbody(w, a);
+    const phys3d_body& B = phys3d__jbody(w, b);
+    phys3d_joint j = phys3d__joint_base(w, PHYS3D_JOINT_MOTOR, a, b, B.position, B.position, v3(0, 1, 0));
+    j.local_a = j.local_b = v3(0, 0, 0);
+    j.target = phys3d__to_local(A, B.position);
+    j.max_force = max_force;
+    j.max_motor_force = max_torque;
+    return phys3d_add_joint(w, j);
+}
+idx phys3d_add_gear(phys3d_world& w, idx a, idx b, vec3 axis_a, vec3 axis_b, float ratio) {
+    phys3d_joint j = phys3d__joint_base(w, PHYS3D_JOINT_GEAR, a, b, phys3d__jbody(w, a).position, phys3d__jbody(w, b).position, axis_a);
+    j.local_axis_b = phys3d__dir_to_local(phys3d__jbody(w, b), v3norm(axis_b));
+    j.ratio = ratio;
+    j.collide_connected = true;   // geared parts are separate things that may touch
+    return phys3d_add_joint(w, j);
+}
+idx phys3d_add_pulley(phys3d_world& w, idx a, idx b, vec3 ground_a, vec3 ground_b, vec3 anchor_a, vec3 anchor_b, float ratio) {
+    phys3d_joint j = phys3d__joint_base(w, PHYS3D_JOINT_PULLEY, a, b, anchor_a, anchor_b, v3(0, 1, 0));
+    j.ground_a = ground_a;
+    j.ground_b = ground_b;
+    j.ratio = ratio > 1e-3f ? ratio : 1e-3f;
+    j.length = v3dist(anchor_a, ground_a) + j.ratio * v3dist(anchor_b, ground_b);
+    j.collide_connected = true;
+    return phys3d_add_joint(w, j);
+}
+idx phys3d_add_generic(phys3d_world& w, idx a, idx b, vec3 anchor, quat frame) {
+    phys3d_joint j = phys3d__joint_base(w, PHYS3D_JOINT_GENERIC, a, b, anchor, anchor, v3(0, 1, 0));
+    frame = quat_norm(frame);
+    j.frame_a = quat_mul(quat_conjugate(phys3d__jbody(w, a).rotation), frame);
+    j.frame_b = quat_mul(quat_conjugate(phys3d__jbody(w, b).rotation), frame);
+    for (int i = 0; i < 6; i++) j.axis_mode[i] = PHYS3D_AXIS_LOCKED;
     return phys3d_add_joint(w, j);
 }
 
@@ -1512,6 +2440,68 @@ static float phys3d__limit(float C, float cdot, float mass, float inv_h, phys3d_
     return imp;
 }
 
+// one equality row, soft: drives C to 0 and the row's speed to 0
+static float phys3d__row_solve(phys3d_body& A, phys3d_body& B, vec3 lin, vec3 angA, vec3 angB, float C, phys3d__soft s, float* acc) {
+    float m = phys3d__row_mass(A, B, lin, angA, angB);
+    if (m <= 0.0f) return 0.0f;
+    float imp = -m * s.mass_scale * (phys3d__row_speed(A, B, lin, angA, angB) + s.bias_rate * C) - s.impulse_scale * *acc;
+    *acc += imp;
+    phys3d__apply_row(A, B, lin, angA, angB, imp);
+    return imp;
+}
+// a motor on one row: toward `speed`, within +-max_impulse in total
+static void phys3d__row_motor(phys3d_body& A, phys3d_body& B, vec3 lin, vec3 angA, vec3 angB, float speed, float max_impulse, float* acc) {
+    float m = phys3d__row_mass(A, B, lin, angA, angB);
+    if (m <= 0.0f) return;
+    float old = *acc;
+    *acc = clampf(old + m * (speed - phys3d__row_speed(A, B, lin, angA, angB)), -max_impulse, max_impulse);
+    phys3d__apply_row(A, B, lin, angA, angB, *acc - old);
+}
+// both limits of one row; `acc` collects lower - upper
+static void phys3d__row_limits(phys3d_body& A, phys3d_body& B, vec3 lin, vec3 angA, vec3 angB, float value, float lower, float upper,
+                               float inv_h, phys3d__soft rigid, float* lower_acc, float* upper_acc) {
+    float m = phys3d__row_mass(A, B, lin, angA, angB);
+    if (m <= 0.0f) return;
+    float imp = phys3d__limit(value - lower, phys3d__row_speed(A, B, lin, angA, angB), m, inv_h, rigid, lower_acc);
+    phys3d__apply_row(A, B, lin, angA, angB, imp);
+    imp = phys3d__limit(upper - value, -phys3d__row_speed(A, B, lin, angA, angB), m, inv_h, rigid, upper_acc);
+    phys3d__apply_row(A, B, lin, angA, angB, -imp);
+}
+
+// The generic joint's angles: b's frame seen from a's as X-Y-Z Euler angles,
+// and the three axes those angles turn about (Bullet's btGeneric6DofConstraint).
+static void phys3d__generic_angles(const phys3d_body& A, const phys3d_body& B, const phys3d_joint& j, vec3 axes[3], float angles[3]) {
+    mat3 fa = mat3_from_quat(quat_mul(A.rotation, j.frame_a)), fb = mat3_from_quat(quat_mul(B.rotation, j.frame_b));
+    mat3 rel = mat3_transpose(fa) * fb;
+    float m02 = phys3d__m(rel, 0, 2);
+    if (m02 < 1.0f) {
+        if (m02 > -1.0f) {
+            angles[0] = atan2f(-phys3d__m(rel, 1, 2), phys3d__m(rel, 2, 2));
+            angles[1] = asinf(m02);
+            angles[2] = atan2f(-phys3d__m(rel, 0, 1), phys3d__m(rel, 0, 0));
+        } else {   // gimbal lock
+            angles[0] = -atan2f(phys3d__m(rel, 1, 0), phys3d__m(rel, 1, 1));
+            angles[1] = -0.5f * PIX_PI;
+            angles[2] = 0.0f;
+        }
+    } else {
+        angles[0] = atan2f(phys3d__m(rel, 1, 0), phys3d__m(rel, 1, 1));
+        angles[1] = 0.5f * PIX_PI;
+        angles[2] = 0.0f;
+    }
+    vec3 axis0 = mat3_col(fb, 0), axis2 = mat3_col(fa, 2);
+    axes[1] = v3cross(axis2, axis0);
+    axes[0] = v3cross(axes[1], axis2);
+    axes[2] = v3cross(axis0, axes[1]);
+    for (int i = 0; i < 3; i++) axes[i] = v3dot(axes[i], axes[i]) > 1e-12f ? v3norm(axes[i]) : v3(0, 0, 0);
+}
+
+// the wheel's axle as the chassis wants it: its spin axis turned by the steering
+static inline vec3 phys3d__wheel_axle(const phys3d_body& A, const phys3d_joint& j) {
+    vec3 axle = quat_rotate(quat_from_axis_angle(j.local_axis_a, j.steer), j.local_ref_a);
+    return quat_rotate(A.rotation, axle);
+}
+
 static void phys3d__joints_prepare(phys3d_world& w) {
     for (size_t i = 0; i < w.joint_count; i++) {
         phys3d_joint& j = w.joints[i];
@@ -1576,6 +2566,45 @@ static void phys3d__joints_warm(phys3d_world& w) {
         case PHYS3D_JOINT_DISTANCE:
             phys3d__apply_row(A, B, j.axis, v3cross(j.ra, j.axis), v3cross(j.rb, j.axis), axial);
             break;
+        case PHYS3D_JOINT_WHEEL: {
+            vec3 dra = j.d + j.ra;
+            phys3d__apply_row(A, B, j.perp1, v3cross(dra, j.perp1), v3cross(j.rb, j.perp1), j.linear_impulse.x);
+            phys3d__apply_row(A, B, j.perp2, v3cross(dra, j.perp2), v3cross(j.rb, j.perp2), j.linear_impulse.y);
+            phys3d__apply_row(A, B, j.axis, v3cross(dra, j.axis), v3cross(j.rb, j.axis), j.axial_impulse + j.lower_impulse - j.upper_impulse);
+            vec3 axle = phys3d__wheel_axle(A, j), q1, q2;
+            phys3d__basis(axle, &q1, &q2);
+            vec3 spin = quat_rotate(B.rotation, j.local_axis_b);
+            phys3d__apply_angular(A, B, v3cross(spin, q1) * j.angular_impulse.x + v3cross(spin, q2) * j.angular_impulse.y
+                                        + spin * j.motor_impulse);
+        } break;
+        case PHYS3D_JOINT_MOTOR:
+            phys3d__apply_at(A, B, v3(0, 0, 0), v3(0, 0, 0), j.linear_impulse);
+            phys3d__apply_angular(A, B, j.angular_impulse);
+            break;
+        case PHYS3D_JOINT_GEAR: {
+            vec3 axa = quat_rotate(A.rotation, j.local_axis_a), axb = quat_rotate(B.rotation, j.local_axis_b);
+            phys3d__apply_row(A, B, v3(0, 0, 0), axa * -j.ratio, axb, j.axial_impulse);
+        } break;
+        case PHYS3D_JOINT_PULLEY: {
+            vec3 pa = A.position + j.ra, pb = B.position + j.rb;
+            vec3 ua = v3norm(pa - j.ground_a), ub = v3norm(pb - j.ground_b);
+            float imp = j.axial_impulse;
+            A.velocity += ua * (imp * A.inv_mass);
+            A.angular_velocity += A.inv_inertia * (v3cross(j.ra, ua) * imp);
+            B.velocity += ub * (imp * j.ratio * B.inv_mass);
+            B.angular_velocity += B.inv_inertia * (v3cross(j.rb, ub) * (imp * j.ratio));
+        } break;
+        case PHYS3D_JOINT_GENERIC: {
+            vec3 dra = j.d + j.ra, axes[3];
+            float angles[3];
+            mat3 fa = mat3_from_quat(quat_mul(A.rotation, j.frame_a));
+            for (int k = 0; k < 3; k++) {
+                vec3 ax = mat3_col(fa, k);
+                phys3d__apply_row(A, B, ax, v3cross(dra, ax), v3cross(j.rb, ax), j.axis_impulse[k] + j.axis_motor_impulse[k]);
+            }
+            phys3d__generic_angles(A, B, j, axes, angles);
+            for (int k = 0; k < 3; k++) phys3d__apply_angular(A, B, axes[k] * (j.axis_impulse[3 + k] + j.axis_motor_impulse[3 + k]));
+        } break;
         }
     }
 }
@@ -1708,6 +2737,90 @@ static void phys3d__joints_solve(phys3d_world& w, float h, bool use_bias) {
                           - rigid.impulse_scale * acc;
                 if (k) j.linear_impulse.y += imp; else j.linear_impulse.x += imp;
                 phys3d__apply_row(A, B, p, pa, pb, imp);
+            }
+        } else if (j.type == PHYS3D_JOINT_WHEEL) {
+            vec3 dra = j.d + j.ra;
+            vec3 axle = phys3d__wheel_axle(A, j), q1, q2;
+            phys3d__basis(axle, &q1, &q2);
+            vec3 spin = quat_rotate(B.rotation, j.local_axis_b);
+            // drive: about the wheel's own axle
+            if (j.enable_motor)
+                phys3d__row_motor(A, B, v3(0, 0, 0), spin, spin, j.motor_speed, j.max_motor_force * h, &j.motor_impulse);
+            // suspension: a spring along its axis (rigid without one), and its travel
+            vec3 sA = v3cross(dra, j.axis), sB = v3cross(j.rb, j.axis);
+            phys3d__soft spring = j.enable_spring && j.hertz > 0.0f ? phys3d__make_soft(j.hertz, j.damping_ratio, h) : rigid;
+            phys3d__row_solve(A, B, j.axis, sA, sB, v3dot(j.d, j.axis), spring, &j.axial_impulse);
+            if (j.enable_limit)
+                phys3d__row_limits(A, B, j.axis, sA, sB, v3dot(j.d, j.axis), j.lower, j.upper, inv_h, rigid, &j.lower_impulse, &j.upper_impulse);
+            // the axle stays where the steering puts it: two angular rows, free to spin
+            phys3d__row_solve(A, B, v3(0, 0, 0), v3cross(spin, q1), v3cross(spin, q1), v3dot(spin, q1), rigid, &j.angular_impulse.x);
+            phys3d__row_solve(A, B, v3(0, 0, 0), v3cross(spin, q2), v3cross(spin, q2), v3dot(spin, q2), rigid, &j.angular_impulse.y);
+            // and the wheel's centre stays on the suspension line
+            phys3d__row_solve(A, B, j.perp1, v3cross(dra, j.perp1), v3cross(j.rb, j.perp1), v3dot(j.d, j.perp1), rigid, &j.linear_impulse.x);
+            phys3d__row_solve(A, B, j.perp2, v3cross(dra, j.perp2), v3cross(j.rb, j.perp2), v3dot(j.d, j.perp2), rigid, &j.linear_impulse.y);
+        } else if (j.type == PHYS3D_JOINT_MOTOR) {
+            // toward the target pose, the total held within the force and torque caps
+            phys3d__soft soft = phys3d__make_soft(j.hertz > 0.0f ? j.hertz : 5.0f, j.damping_ratio, h);
+            vec3 L = phys3d__lock_impulse(A, B, j.relative_rotation, soft, j.angular_impulse);
+            vec3 oldL = j.angular_impulse;
+            j.angular_impulse += L;
+            float maxL = j.max_motor_force * h, lenL = v3len(j.angular_impulse);
+            if (lenL > maxL) j.angular_impulse *= maxL / lenL;
+            phys3d__apply_angular(A, B, j.angular_impulse - oldL);
+            vec3 C = B.position - (A.position + quat_rotate(A.rotation, j.target));
+            vec3 P = phys3d__point_impulse(A, B, v3(0, 0, 0), v3(0, 0, 0), C, soft, j.linear_impulse);
+            vec3 oldP = j.linear_impulse;
+            j.linear_impulse += P;
+            float maxP = j.max_force * h, lenP = v3len(j.linear_impulse);
+            if (lenP > maxP) j.linear_impulse *= maxP / lenP;
+            phys3d__apply_at(A, B, v3(0, 0, 0), v3(0, 0, 0), j.linear_impulse - oldP);
+        } else if (j.type == PHYS3D_JOINT_GEAR) {
+            // velocity only, like a real gear train: no drift correction to fight
+            vec3 axa = quat_rotate(A.rotation, j.local_axis_a), axb = quat_rotate(B.rotation, j.local_axis_b);
+            phys3d__soft none = { 0.0f, 1.0f, 0.0f };
+            phys3d__row_solve(A, B, v3(0, 0, 0), axa * -j.ratio, axb, 0.0f, none, &j.axial_impulse);
+        } else if (j.type == PHYS3D_JOINT_PULLEY) {
+            vec3 pa = A.position + j.ra, pb = B.position + j.rb;
+            vec3 ua = pa - j.ground_a, ub = pb - j.ground_b;
+            float la = v3len(ua), lb = v3len(ub);
+            if (la > 1e-6f && lb > 1e-6f) {
+                ua = ua / la; ub = ub / lb;
+                vec3 ca = v3cross(j.ra, ua), cb = v3cross(j.rb, ub);
+                float k = A.inv_mass + v3dot(ca, A.inv_inertia * ca) + j.ratio * j.ratio * (B.inv_mass + v3dot(cb, B.inv_inertia * cb));
+                if (k > 0.0f) {
+                    float cdot = v3dot(ua, A.velocity + v3cross(A.angular_velocity, j.ra))
+                               + j.ratio * v3dot(ub, B.velocity + v3cross(B.angular_velocity, j.rb));
+                    float C = la + j.ratio * lb - j.length;
+                    float imp = -(1.0f / k) * rigid.mass_scale * (cdot + rigid.bias_rate * C) - rigid.impulse_scale * j.axial_impulse;
+                    j.axial_impulse += imp;
+                    A.velocity += ua * (imp * A.inv_mass);
+                    A.angular_velocity += A.inv_inertia * (ca * imp);
+                    B.velocity += ub * (imp * j.ratio * B.inv_mass);
+                    B.angular_velocity += B.inv_inertia * (cb * (imp * j.ratio));
+                }
+            }
+        } else if (j.type == PHYS3D_JOINT_GENERIC) {
+            vec3 dra = j.d + j.ra, axes[3];
+            float angles[3];
+            mat3 fa = mat3_from_quat(quat_mul(A.rotation, j.frame_a));
+            phys3d__generic_angles(A, B, j, axes, angles);
+            for (int k = 0; k < 6; k++) {
+                bool linear = k < 3;
+                vec3 ax = linear ? mat3_col(fa, k) : axes[k - 3];
+                if (v3dot(ax, ax) < 0.5f) continue;   // gimbal lock: that axis is not defined
+                vec3 lin = linear ? ax : v3(0, 0, 0);
+                vec3 angA = linear ? v3cross(dra, ax) : ax, angB = linear ? v3cross(j.rb, ax) : ax;
+                float value = linear ? v3dot(j.d, ax) : angles[k - 3];
+                if (j.axis_motor_force[k] > 0.0f)
+                    phys3d__row_motor(A, B, lin, angA, angB, j.axis_motor_speed[k], j.axis_motor_force[k] * h, &j.axis_motor_impulse[k]);
+                if (j.axis_mode[k] == PHYS3D_AXIS_LOCKED) {
+                    phys3d__row_solve(A, B, lin, angA, angB, value, rigid, &j.axis_impulse[k]);
+                } else if (j.axis_mode[k] == PHYS3D_AXIS_LIMITED) {
+                    // one accumulator holds both sides: only one limit can push at a time
+                    float lo = maxf(j.axis_impulse[k], 0.0f), hi = maxf(-j.axis_impulse[k], 0.0f);
+                    phys3d__row_limits(A, B, lin, angA, angB, value, j.axis_lower[k], j.axis_upper[k], inv_h, rigid, &lo, &hi);
+                    j.axis_impulse[k] = lo - hi;
+                }
             }
         } else if (j.type == PHYS3D_JOINT_DISTANCE) {
             vec3 axA = v3cross(j.ra, j.axis), axB = v3cross(j.rb, j.axis);
@@ -1891,6 +3004,24 @@ static void phys3d__push_event(phys3d_world& w, uint8_t type, idx a, idx b, vec3
 
 // Fills in a freshly collided contact and warm starts it from last step's
 // points that sit (in a's frame) within reach of the new ones.
+// how far any part of a shape reaches from the body's centre: how far a
+// turning body can sweep, for speculative margins and continuous collision
+static float phys3d__reach(const phys3d_shape& s) {
+    if (s.type == PHYS3D_HULL || s.type == PHYS3D_COMPOUND) {
+        const aabb& b = s.type == PHYS3D_HULL ? s.hull->bounds : s.compound->bounds;
+        return v3len(v3max(v3(fabsf(b.min.x), fabsf(b.min.y), fabsf(b.min.z)), v3(fabsf(b.max.x), fabsf(b.max.y), fabsf(b.max.z))));
+    }
+    return phys3d__shape_reach(s);
+}
+
+// how round a shape is, for rolling friction: its smallest half-extent
+static float phys3d__roll_radius(const phys3d_shape& s) {
+    if (s.type == PHYS3D_BOX) return minf(s.half.x, minf(s.half.y, s.half.z));
+    if (s.type == PHYS3D_HULL) { vec3 e = aabb_half(s.hull->bounds); return minf(e.x, minf(e.y, e.z)); }
+    if (s.type == PHYS3D_COMPOUND) { vec3 e = aabb_half(s.compound->bounds); return minf(e.x, minf(e.y, e.z)); }
+    return s.radius;
+}
+
 static void phys3d__finish_contact(phys3d_world& w, phys3d_contact& c, idx ia, idx ib, uint32_t sub, bool trigger, uint32_t prev) {
     const phys3d_body& a = w.bodies[ia];
     const phys3d_body& b = w.bodies[ib];
@@ -1900,8 +3031,7 @@ static void phys3d__finish_contact(phys3d_world& w, phys3d_contact& c, idx ia, i
     c.restitution = maxf(a.restitution, b.restitution);
     // a resisting torque of rolling_friction * normal force * contact radius;
     // the radius is the rounder body's (the one that can actually roll)
-    float ra = a.shape.type == PHYS3D_BOX ? minf(a.shape.half.x, minf(a.shape.half.y, a.shape.half.z)) : a.shape.radius;
-    float rb = b.shape.type == PHYS3D_BOX ? minf(b.shape.half.x, minf(b.shape.half.y, b.shape.half.z)) : b.shape.radius;
+    float ra = phys3d__roll_radius(a.shape), rb = phys3d__roll_radius(b.shape);
     if (a.type != PHYS3D_DYNAMIC) ra = rb;
     if (b.type != PHYS3D_DYNAMIC) rb = ra;
     c.rolling = maxf(a.rolling_friction, b.rolling_friction) * minf(ra, rb);
@@ -1954,6 +3084,8 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
         }
         return;
     }
+    // linear only: a turning body is caught by the continuous pass (a speculative
+    // margin wide enough for rotation makes contact points far from the real touch, and those fling)
     float margin = trigger ? 0.0f : w.speculative + v3len(b.velocity - a.velocity) * dt;
     // one of them a mesh: a contact per nearby triangle
     const phys3d_body* mesh_body = a.shape.type == PHYS3D_MESH ? &a : (b.shape.type == PHYS3D_MESH ? &b : 0);
@@ -1961,8 +3093,6 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
         if (a.shape.type == PHYS3D_MESH && b.shape.type == PHYS3D_MESH) return;
         const phys3d_body& other = mesh_body == &a ? b : a;
         bool mesh_is_a = mesh_body == &a;
-        phys3d__core oc;
-        phys3d__make_core(other.shape, other.position, other.rotation, oc);
         const phys3d_mesh& mesh = *mesh_body->shape.mesh;
         quat inv = quat_conjugate(mesh_body->rotation);
         // the other body's bounds, in the mesh's frame
@@ -1980,33 +3110,41 @@ static void phys3d__narrowphase(phys3d_world& w, idx ia, idx ib, float dt) {
             vec3 v2 = mesh_body->position + quat_rotate(mesh_body->rotation, mesh.vertices[mesh.indices[t * 3 + 2]]);
             phys3d__core tri;
             phys3d__triangle_core(v0, v1, v2, tri);
-            // one-sided: a body behind the surface passes through rather than snagging
-            if (v3dot(oc.centre - v0, tri.axis[0]) < 0.0f) return;
-            phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
-            phys3d_contact& c = w.contacts[w.contact_count];
-            bool hit = mesh_is_a ? phys3d__collide(tri, oc, w.slop, margin, c) : phys3d__collide(oc, tri, w.slop, margin, c);
-            if (!hit) return;
-            float min_sep = 1e30f;
-            for (int i = 0; i < c.count; i++) min_sep = minf(min_sep, c.points[i].separation);
-            if (trigger && min_sep >= 0.0f) return;
-            phys3d__finish_contact(w, c, ia, ib, t, trigger, prev);
-            if (!first) c.prev = 0xFFFFFFFFu;   // only a pair's first contact carries the link for events
-            first = false;
-            w.contact_count++;
+            phys3d__for_each_core(other.shape, other.position, other.rotation, [&](const phys3d__core& oc, uint32_t part) {
+                // one-sided: a body behind the surface passes through rather than snagging
+                if (v3dot(oc.centre - v0, tri.axis[0]) < 0.0f) return;
+                phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
+                phys3d_contact& c = w.contacts[w.contact_count];
+                bool hit = mesh_is_a ? phys3d__collide(tri, oc, w.slop, margin, c) : phys3d__collide(oc, tri, w.slop, margin, c);
+                if (!hit) return;
+                float min_sep = 1e30f;
+                for (int i = 0; i < c.count; i++) min_sep = minf(min_sep, c.points[i].separation);
+                if (trigger && min_sep >= 0.0f) return;
+                // which triangle, and in the top byte which part of a compound
+                phys3d__finish_contact(w, c, ia, ib, t | (part << 24), trigger, prev);
+                if (!first) c.prev = 0xFFFFFFFFu;   // only a pair's first contact carries the link for events
+                first = false;
+                w.contact_count++;
+            });
         });
         return;
     }
-    phys3d__core ca, cb;
-    phys3d__make_core(a.shape, a.position, a.rotation, ca);
-    phys3d__make_core(b.shape, b.position, b.rotation, cb);
-    phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
-    phys3d_contact& c = w.contacts[w.contact_count];
-    if (!phys3d__collide(ca, cb, w.slop, margin, c)) return;
-    float min_sep = 1e30f;
-    for (int i = 0; i < c.count; i++) min_sep = minf(min_sep, c.points[i].separation);
-    if (trigger && min_sep >= 0.0f) return;
-    phys3d__finish_contact(w, c, ia, ib, 0, trigger, prev);
-    w.contact_count++;
+    // a manifold per pair of parts (one pair unless a compound is involved)
+    bool first = true;
+    phys3d__for_each_core(a.shape, a.position, a.rotation, [&](const phys3d__core& ca, uint32_t pa) {
+        phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& cb, uint32_t pb) {
+            phys3d__reserve(w.contacts, w.contact_capacity, w.contact_count + 1);
+            phys3d_contact& c = w.contacts[w.contact_count];
+            if (!phys3d__collide(ca, cb, w.slop, margin, c)) return;
+            float min_sep = 1e30f;
+            for (int i = 0; i < c.count; i++) min_sep = minf(min_sep, c.points[i].separation);
+            if (trigger && min_sep >= 0.0f) return;
+            phys3d__finish_contact(w, c, ia, ib, (pa << 12) | pb, trigger, prev);
+            if (!first) c.prev = 0xFFFFFFFFu;
+            first = false;
+            w.contact_count++;
+        });
+    });
 }
 
 static void phys3d__find_contacts(phys3d_world& w, float dt) {
@@ -2259,15 +3397,42 @@ static aabb phys3d__body_bounds(const phys3d_body& b) {
         }
         return r;
     }
-    phys3d__core c;
-    phys3d__make_core(b.shape, b.position, b.rotation, c);
-    return phys3d__core_bounds(c);
+    aabb r = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+    phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& c, uint32_t) {
+        aabb cb = phys3d__core_bounds(c);
+        r.min = v3min(r.min, cb.min); r.max = v3max(r.max, cb.max);
+    });
+    return r;
+}
+
+static void phys3d__continuous(phys3d_world& w);   // after the queries, which it uses
+
+// Joint settings are plain fields, so nothing wakes an island when a motor is
+// switched on: a motor that wants to turn (or a motor joint away from its
+// target) wakes its bodies here instead.
+static void phys3d__wake_motors(phys3d_world& w) {
+    for (size_t i = 0; i < w.joint_count; i++) {
+        const phys3d_joint& j = w.joints[i];
+        if (!j.active) continue;
+        bool wants = j.enable_motor && j.motor_speed != 0.0f;
+        if (j.type == PHYS3D_JOINT_GENERIC)
+            for (int k = 0; k < 6; k++) wants |= j.axis_motor_force[k] > 0.0f && j.axis_motor_speed[k] != 0.0f;
+        if (j.type == PHYS3D_JOINT_MOTOR) {
+            const phys3d_body& A = phys3d__jbody(w, j.a);
+            const phys3d_body& B = phys3d__jbody(w, j.b);
+            wants = v3dist(B.position, A.position + quat_rotate(A.rotation, j.target)) > w.slop;
+        }
+        if (!wants) continue;
+        if (j.a != PIX_INVALID && w.bodies[j.a].sleeping) phys3d__wake_body(w.bodies[j.a]);
+        if (j.b != PIX_INVALID && w.bodies[j.b].sleeping) phys3d__wake_body(w.bodies[j.b]);
+    }
 }
 
 static void phys3d__step(phys3d_world& w, float dt) {
     if (dt <= 0.0f) return;
     float glen = v3len(w.gravity);
     vec3 gdir = glen > 0.0f ? w.gravity / glen : v3(0, 0, 0);
+    phys3d__wake_motors(w);
 
     for (size_t i = 0; i < w.body_count; i++) {
         phys3d_body& b = w.bodies[i];
@@ -2293,7 +3458,8 @@ static void phys3d__step(phys3d_world& w, float dt) {
         }
         vec3 v = b.velocity;
         if (b.type == PHYS3D_DYNAMIC && !b.sleeping) v += w.gravity * (b.gravity_scale * dt);
-        vec3 move = v * dt, pad = v3(w.speculative, w.speculative, w.speculative);
+        float spin_pad = w.speculative + v3len(b.angular_velocity) * phys3d__reach(b.shape) * dt;
+        vec3 move = v * dt, pad = v3(spin_pad, spin_pad, spin_pad);
         r.min = r.min + v3min(move, v3(0, 0, 0)) - pad;
         r.max = r.max + v3max(move, v3(0, 0, 0)) + pad;
         b.bounds = r;
@@ -2323,6 +3489,7 @@ static void phys3d__step(phys3d_world& w, float dt) {
 
     phys3d__find_contacts(w, dt);
     phys3d__islands_wake(w);
+    for (int i = 0; i < w.action_count; i++) if (w.actions[i].fn) w.actions[i].fn(w, dt, w.actions[i].user);
     phys3d__prepare_contacts(w);
 
     int substeps = w.substeps > 0 ? w.substeps : 1;
@@ -2364,6 +3531,7 @@ static void phys3d__step(phys3d_world& w, float dt) {
             phys3d__solve_contacts(w, inv_h, 0.0f);
         }
     }
+    if (w.continuous) phys3d__continuous(w);
     phys3d__restitution(w);
     phys3d__report(w);
     phys3d__joints_finish(w, h);
@@ -2446,19 +3614,109 @@ static void phys3d__query_box(phys3d_world& w, const aabb& r, F&& visit) {
     }
 }
 
+// ---- continuous collision ----
+//
+// Conservative advancement (Mirtich): along the step's motion from the old
+// pose to the new, measure the gap to the obstacle (GJK), and advance by the
+// longest time in which nothing could close it - the gap divided by the
+// fastest any point of the body can approach (its linear speed toward the
+// obstacle plus its turn rate times its reach). Repeat until touching or
+// through the step. A body that would pass through is left at the first
+// touch; the next step's contacts take it from there.
+
+static float phys3d__toi_core(const phys3d_body& b, const phys3d__core& target, vec3 p0, quat q0, vec3 p1, quat q1,
+                              float reach, float target_gap) {
+    float angle = 2.0f * acosf(clampf(fabsf(q0.x * q1.x + q0.y * q1.y + q0.z * q1.z + q0.w * q1.w), 0.0f, 1.0f));   // how far it turned this step
+    vec3 dp = p1 - p0;
+    float t = 0.0f;
+    for (int iter = 0; iter < 24; iter++) {
+        vec3 p = v3lerp(p0, p1, t);
+        quat q = quat_slerp(q0, q1, t);
+        float gap = 1e30f;
+        vec3 n = v3(0, 1, 0);
+        phys3d__for_each_core(b.shape, p, q, [&](const phys3d__core& c, uint32_t) {
+            float g;
+            vec3 nn;
+            if (target.kind == PHYS3D__PLANE) {
+                float lowest = 1e30f;
+                for (int k = 0; k < c.count; k++) lowest = minf(lowest, v3dot(target.axis[0], phys3d__vert(c, k)) - target.offset);
+                g = lowest - c.radius;
+                nn = target.axis[0];
+            } else {
+                vec3 pa, pb;
+                float d = phys3d__gjk(c, target, &pa, &pb);
+                g = d - c.radius - target.radius;
+                nn = d > 1e-6f ? (pa - pb) / d : v3(0, 1, 0);
+            }
+            if (g < gap) { gap = g; n = nn; }
+        });
+        if (gap <= target_gap) return iter == 0 ? 1.0f : t;   // touching from the start: contacts handle that
+        float approach = maxf(0.0f, -v3dot(dp, n)) + angle * reach;
+        if (approach <= 1e-9f) return 1.0f;
+        t += (gap - 0.5f * target_gap) / approach;
+        if (t >= 1.0f) return 1.0f;
+    }
+    return 1.0f;
+}
+
+static void phys3d__continuous(phys3d_world& w) {
+    for (size_t i = 0; i < w.body_count; i++) {
+        phys3d_body& b = w.bodies[i];
+        if (!b.active || b.type != PHYS3D_DYNAMIC || b.sleeping || b.trigger) continue;
+        float reach = phys3d__reach(b.shape);
+        float angle = 2.0f * acosf(clampf(fabsf(b.prev_rotation.x * b.rotation.x + b.prev_rotation.y * b.rotation.y + b.prev_rotation.z * b.rotation.z + b.prev_rotation.w * b.rotation.w), 0.0f, 1.0f));
+        float sweep = v3len(b.position - b.prev_position) + angle * reach;
+        // slow bodies are caught by speculative contacts; only sweeps longer
+        // than the body is thin can pass through something
+        if (sweep < 0.5f * phys3d__roll_radius(b.shape) + w.speculative) continue;
+        aabb a0 = b.bounds;   // already covers the old pose, the new one and the margin
+        float best = 1.0f;
+        phys3d__query_box(w, a0, [&](idx id, const phys3d_body& o) {
+            if (id == (idx)i || o.type == PHYS3D_DYNAMIC || o.trigger || !phys3d__layers_ok(b, o)) return;
+            if (o.shape.type == PHYS3D_MESH) {
+                const phys3d_mesh& m = *o.shape.mesh;
+                quat inv = quat_conjugate(o.rotation);
+                aabb box = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+                for (int k = 0; k < 8; k++) {
+                    vec3 corner = v3((k & 1) ? a0.max.x : a0.min.x, (k & 2) ? a0.max.y : a0.min.y, (k & 4) ? a0.max.z : a0.min.z);
+                    vec3 l = quat_rotate(inv, corner - o.position);
+                    box.min = v3min(box.min, l); box.max = v3max(box.max, l);
+                }
+                phys3d__mesh_query(m, box, [&](uint32_t t) {
+                    phys3d__core tri;
+                    phys3d__triangle_core(o.position + quat_rotate(o.rotation, m.vertices[m.indices[t * 3]]),
+                                          o.position + quat_rotate(o.rotation, m.vertices[m.indices[t * 3 + 1]]),
+                                          o.position + quat_rotate(o.rotation, m.vertices[m.indices[t * 3 + 2]]), tri);
+                    if (v3dot(b.prev_position - tri.v[0], tri.axis[0]) < 0.0f) return;   // one-sided
+                    best = minf(best, phys3d__toi_core(b, tri, b.prev_position, b.prev_rotation, b.position, b.rotation, reach, w.slop));
+                });
+                return;
+            }
+            phys3d__for_each_core(o.shape, o.position, o.rotation, [&](const phys3d__core& target, uint32_t) {
+                best = minf(best, phys3d__toi_core(b, target, b.prev_position, b.prev_rotation, b.position, b.rotation, reach, w.slop));
+            });
+        });
+        if (best < 1.0f) {
+            b.position = v3lerp(b.prev_position, b.position, best);
+            b.rotation = quat_norm(quat_slerp(b.prev_rotation, b.rotation, best));
+            phys3d__update_inertia(b);
+        }
+    }
+}
+
 // ray against one body; false when it misses or starts inside
-static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_distance, float* out_t, vec3* out_n, uint32_t* out_tri) {
-    const phys3d_shape& s = b.shape;
+static bool phys3d__ray_shape(const phys3d_shape& s, vec3 pos, quat rot, vec3 o, vec3 d, float max_distance,
+                              float* out_t, vec3* out_n, uint32_t* out_tri) {
     *out_tri = 0;
     if (s.type == PHYS3D_SPHERE) {
-        if (v3dot(o - b.position, o - b.position) <= s.radius * s.radius) return false;
-        if (!ray_vs_sphere(o, d, sphere_make(b.position, s.radius), max_distance, out_t)) return false;
-        *out_n = v3norm(o + d * *out_t - b.position);
+        if (v3dot(o - pos, o - pos) <= s.radius * s.radius) return false;
+        if (!ray_vs_sphere(o, d, sphere_make(pos, s.radius), max_distance, out_t)) return false;
+        *out_n = v3norm(o + d * *out_t - pos);
         return true;
     }
     if (s.type == PHYS3D_CAPSULE) {
-        vec3 up = quat_rotate(b.rotation, v3(0, s.half_length, 0));
-        capsule c = capsule_make(b.position - up, b.position + up, s.radius);
+        vec3 up = quat_rotate(rot, v3(0, s.half_length, 0));
+        capsule c = capsule_make(pos - up, pos + up, s.radius);
         vec3 q = closest_point_segment(c.a, c.b, o);
         if (v3dot(o - q, o - q) <= s.radius * s.radius) return false;
         if (!ray_vs_capsule(o, d, c, max_distance, out_t)) return false;
@@ -2468,7 +3726,7 @@ static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_dis
     }
     if (s.type == PHYS3D_BOX) {
         obb box;
-        box.centre = b.position; box.half = s.half; box.axes = mat3_from_quat(b.rotation);
+        box.centre = pos; box.half = s.half; box.axes = mat3_from_quat(rot);
         vec3 l = obb_to_local(box, o);
         if (fabsf(l.x) <= s.half.x && fabsf(l.y) <= s.half.y && fabsf(l.z) <= s.half.z) return false;
         if (!ray_vs_obb(o, d, box, max_distance, out_t)) return false;
@@ -2481,17 +3739,17 @@ static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_dis
         return true;
     }
     if (s.type == PHYS3D_PLANE) {
-        vec3 n = quat_rotate(b.rotation, s.normal);
-        if (!ray_vs_plane(o, d, plane_through(n, b.position), max_distance, false, out_t)) return false;
-        if (v3dot(o - b.position, n) < 0.0f) return false;
+        vec3 n = quat_rotate(rot, s.normal);
+        if (!ray_vs_plane(o, d, plane_through(n, pos), max_distance, false, out_t)) return false;
+        if (v3dot(o - pos, n) < 0.0f) return false;
         *out_n = n;
         return true;
     }
     if (s.type == PHYS3D_MESH) {
         // into the mesh's frame, where its tree lives
         const phys3d_mesh& m = *s.mesh;
-        quat inv = quat_conjugate(b.rotation);
-        vec3 lo = quat_rotate(inv, o - b.position), ld = quat_rotate(inv, d);
+        quat inv = quat_conjugate(rot);
+        vec3 lo = quat_rotate(inv, o - pos), ld = quat_rotate(inv, d);
         vec3 inv_d = v3(ld.x != 0.0f ? 1.0f / ld.x : 1e30f, ld.y != 0.0f ? 1.0f / ld.y : 1e30f, ld.z != 0.0f ? 1.0f / ld.z : 1e30f);
         float best = max_distance;
         bool hit = false;
@@ -2509,7 +3767,7 @@ static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_dis
                     float tt;
                     if (ray_vs_triangle(lo, ld, a, bb, c, best, false, &tt)) {
                         best = tt; hit = true; *out_tri = t;
-                        *out_n = quat_rotate(b.rotation, triangle_normal(a, bb, c));
+                        *out_n = quat_rotate(rot, triangle_normal(a, bb, c));
                     }
                 }
             } else if (top < 62) {
@@ -2520,7 +3778,47 @@ static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_dis
         *out_t = best;
         return hit;
     }
+    if (s.type == PHYS3D_HULL) {
+        // clip the ray by every face plane (Cyrus-Beck): it is inside all of them between enter and leave
+        const phys3d_hull& h = *s.hull;
+        quat inv = quat_conjugate(rot);
+        vec3 lo = quat_rotate(inv, o - pos), ld = quat_rotate(inv, d);
+        float enter = 0.0f, leave = max_distance;
+        int enter_face = -1;
+        for (int f = 0; f < h.face_count; f++) {
+            vec3 n = v3(h.planes[f].x, h.planes[f].y, h.planes[f].z);
+            float dist = h.planes[f].w - v3dot(n, lo), den = v3dot(n, ld);
+            if (fabsf(den) < 1e-12f) { if (dist < 0.0f) return false; continue; }
+            float t = dist / den;
+            if (den < 0.0f) { if (t > enter) { enter = t; enter_face = f; } }
+            else if (t < leave) leave = t;
+            if (enter > leave) return false;
+        }
+        if (enter_face < 0) return false;   // starts inside
+        *out_t = enter;
+        *out_n = quat_rotate(rot, v3(h.planes[enter_face].x, h.planes[enter_face].y, h.planes[enter_face].z));
+        return true;
+    }
+    if (s.type == PHYS3D_COMPOUND) {
+        const phys3d_compound& c = *s.compound;
+        bool hit = false;
+        float best = max_distance;
+        for (int i = 0; i < c.count; i++) {
+            const phys3d_compound_child& ch = c.children[i];
+            float t; vec3 n; uint32_t tri;
+            if (phys3d__ray_shape(ch.shape, pos + quat_rotate(rot, ch.position), quat_mul(rot, ch.rotation), o, d, best, &t, &n, &tri)
+                && t <= best) {
+                best = t; *out_n = n; *out_tri = (uint32_t)i; hit = true;
+            }
+        }
+        *out_t = best;
+        return hit;
+    }
     return false;
+}
+
+static bool phys3d__ray_body(const phys3d_body& b, vec3 o, vec3 d, float max_distance, float* out_t, vec3* out_n, uint32_t* out_tri) {
+    return phys3d__ray_shape(b.shape, b.position, b.rotation, o, d, max_distance, out_t, out_n, out_tri);
 }
 
 // Walks the grid cells along the ray in order (Amanatides & Woo), testing the
@@ -2581,7 +3879,7 @@ bool phys3d_raycast(phys3d_world& w, vec3 origin, vec3 direction, float max_dist
 bool phys3d_shape_cast(phys3d_world& w, phys3d_shape shape, vec3 position, quat rotation,
                        vec3 direction, float max_distance, phys3d_ray_hit* hit, uint16_t mask, idx ignore) {
     float len = v3len(direction);
-    if (len <= 0.0f || shape.type == PHYS3D_PLANE || shape.type == PHYS3D_MESH) return false;
+    if (len <= 0.0f || shape.type == PHYS3D_PLANE || shape.type == PHYS3D_MESH || shape.type == PHYS3D_COMPOUND) return false;
     vec3 d = direction / len;
     phys3d__core start;
     phys3d__make_core(shape, position, quat_norm(rotation), start);
@@ -2595,12 +3893,12 @@ bool phys3d_shape_cast(phys3d_world& w, phys3d_shape shape, vec3 position, quat 
         for (int iter = 0; iter < 32; iter++) {
             phys3d__core moved = start;
             moved.centre += d * t;
-            for (int k = 0; k < moved.count; k++) moved.v[k] += d * t;
+            if (moved.kind != PHYS3D__HULL) for (int k = 0; k < moved.count; k++) moved.v[k] += d * t;
             vec3 pa, pb, n = -d;
             float gap;
             if (target.kind == PHYS3D__PLANE) {
                 float lowest = 1e30f;
-                for (int k = 0; k < moved.count; k++) lowest = minf(lowest, v3dot(target.axis[0], moved.v[k]) - target.offset);
+                for (int k = 0; k < moved.count; k++) lowest = minf(lowest, v3dot(target.axis[0], phys3d__vert(moved, k)) - target.offset);
                 gap = lowest - moved.radius;
                 n = target.axis[0];
                 pb = moved.centre - n * (gap + moved.radius);
@@ -2641,16 +3939,16 @@ bool phys3d_shape_cast(phys3d_world& w, phys3d_shape shape, vec3 position, quat 
             });
             return;
         }
-        phys3d__core target;
-        phys3d__make_core(b.shape, b.position, b.rotation, target);
-        cast_core(target, id, 0);
+        phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& target, uint32_t part) {
+            cast_core(target, id, part);
+        });
     });
     return found;
 }
 
 size_t phys3d_overlap(phys3d_world& w, phys3d_shape shape, vec3 position, quat rotation,
                       idx* out, size_t capacity, uint16_t mask) {
-    if (shape.type == PHYS3D_PLANE || shape.type == PHYS3D_MESH) return 0;
+    if (shape.type == PHYS3D_PLANE || shape.type == PHYS3D_MESH || shape.type == PHYS3D_COMPOUND) return 0;
     phys3d__core q;
     phys3d__make_core(shape, position, quat_norm(rotation), q);
     size_t count = 0;
@@ -2681,15 +3979,447 @@ size_t phys3d_overlap(phys3d_world& w, phys3d_shape shape, vec3 position, quat r
                 hit = phys3d__collide(q, tri, w.slop, 0.0f, m) && inside();
             });
         } else {
-            phys3d__core c;
-            phys3d__make_core(b.shape, b.position, b.rotation, c);
-            hit = phys3d__collide(q, c, w.slop, 0.0f, m) && inside();
+            phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& c, uint32_t) {
+                if (!hit) hit = phys3d__collide(q, c, w.slop, 0.0f, m) && inside();
+            });
         }
         if (!hit) return;
         if (count < capacity) out[count] = id;
         count++;
     });
     return count;
+}
+
+// ---- actions ----
+
+int phys3d_add_action(phys3d_world& w, phys3d_action_fn fn, void* user) {
+    for (int i = 0; i < w.action_count; i++)
+        if (!w.actions[i].fn) { w.actions[i].fn = fn; w.actions[i].user = user; return i; }
+    if (w.action_count >= PHYS3D_MAX_ACTIONS) { pix_log("phys3d: action limit (%d) reached\n", PHYS3D_MAX_ACTIONS); return -1; }
+    w.actions[w.action_count].fn = fn;
+    w.actions[w.action_count].user = user;
+    return w.action_count++;
+}
+
+void phys3d_remove_action(phys3d_world& w, int handle) {
+    if (handle >= 0 && handle < w.action_count) { w.actions[handle].fn = 0; w.actions[handle].user = 0; }
+}
+
+// ---- raycast vehicle ----
+
+phys3d_vehicle phys3d_make_vehicle(idx chassis) {
+    phys3d_vehicle v;
+    memset(&v, 0, sizeof(v));
+    v.chassis = chassis;
+    v.up_local = v3(0, 1, 0);
+    v.forward_local = v3(0, 0, 1);
+    v.action = -1;
+    return v;
+}
+
+int phys3d_vehicle_add_wheel(phys3d_vehicle& v, vec3 attach, float radius, float rest_length) {
+    if (v.wheel_count >= PHYS3D_MAX_VEHICLE_WHEELS) return -1;
+    phys3d_vehicle_wheel& wh = v.wheels[v.wheel_count];
+    memset(&wh, 0, sizeof(wh));
+    wh.attach = attach;
+    wh.radius = radius;
+    wh.rest_length = rest_length;
+    wh.max_travel = rest_length * 0.8f;
+    wh.friction = 1.0f;
+    wh.roll_influence = 0.1f;
+    wh.suspension_length = rest_length;
+    wh.ground = PIX_INVALID;
+    return v.wheel_count++;
+}
+
+static void phys3d__vehicle_action(phys3d_world& w, float dt, void* user) { phys3d_vehicle_step(w, *(phys3d_vehicle*)user, dt); }
+
+void phys3d_add_vehicle(phys3d_world& w, phys3d_vehicle& v) {
+    if (v.action < 0) v.action = phys3d_add_action(w, phys3d__vehicle_action, &v);
+}
+void phys3d_remove_vehicle(phys3d_world& w, phys3d_vehicle& v) {
+    phys3d_remove_action(w, v.action);
+    v.action = -1;
+}
+
+static inline vec3 phys3d__vehicle_axle(const phys3d_vehicle& v, const phys3d_vehicle_wheel& wh) {
+    vec3 axle = v3cross(v.up_local, v.forward_local);
+    return quat_rotate(quat_from_axis_angle(v3norm(v.up_local), wh.steer), axle);
+}
+
+void phys3d_vehicle_step(phys3d_world& w, phys3d_vehicle& v, float dt) {
+    phys3d_body* cb = phys3d_get_body(w, v.chassis);
+    if (!cb || cb->type != PHYS3D_DYNAMIC || dt <= 0.0f) return;
+    phys3d_body& c = *cb;
+    float mass = c.inv_mass > 0.0f ? 1.0f / c.inv_mass : 1.0f;
+    vec3 up = v3norm(quat_rotate(c.rotation, v.up_local));
+    float g = v3len(w.gravity);
+    bool awake = false;
+    for (int i = 0; i < v.wheel_count; i++) {
+        phys3d_vehicle_wheel& wh = v.wheels[i];
+        if (wh.engine_force != 0.0f || wh.steer != 0.0f) awake = true;
+        // a spring that holds its share of the chassis 10 cm compressed, damped near critically
+        if (wh.stiffness <= 0.0f) wh.stiffness = mass * maxf(g, 1.0f) / (float)v.wheel_count / 0.1f;
+        if (wh.damping <= 0.0f) wh.damping = 2.0f * 0.4f * sqrtf(wh.stiffness * mass / (float)v.wheel_count);
+    }
+    if (awake && c.sleeping) phys3d_wake(w, v.chassis);
+    if (c.sleeping) return;
+
+    // ---- suspension: a ray per wheel, a spring and damper where it lands ----
+    for (int i = 0; i < v.wheel_count; i++) {
+        phys3d_vehicle_wheel& wh = v.wheels[i];
+        vec3 hard = c.position + quat_rotate(c.rotation, wh.attach);
+        float reach = wh.rest_length + wh.max_travel + wh.radius;
+        phys3d_ray_hit h;
+        wh.contact = phys3d_raycast(w, hard, -up, reach, &h, c.mask, v.chassis);
+        wh.suspension_force = 0.0f;
+        if (!wh.contact) { wh.suspension_length = wh.rest_length + wh.max_travel; wh.ground = PIX_INVALID; continue; }
+        wh.contact_point = h.point;
+        wh.contact_normal = h.normal;
+        wh.ground = h.body;
+        wh.suspension_length = clampf(h.distance - wh.radius, wh.rest_length - wh.max_travel, wh.rest_length + wh.max_travel);
+        float facing = -v3dot(h.normal, -up);   // how square the ground is to the suspension
+        if (facing < 0.1f) { wh.contact = false; continue; }
+        vec3 rel = h.point - c.position;
+        vec3 vel = c.velocity + v3cross(c.angular_velocity, rel);
+        float closing = v3dot(h.normal, vel) / facing;   // the suspension's own speed (negative compressing)
+        float force = wh.stiffness * (wh.rest_length - wh.suspension_length) - wh.damping * closing;
+        wh.suspension_force = maxf(force, 0.0f);         // a spring cannot pull the car down
+        phys3d_apply_impulse(c, h.normal * (wh.suspension_force * dt), h.point);
+    }
+
+    // ---- tyres: sideways grip and forward drive, sharing a friction circle ----
+    // Solved together over a few passes (sequential impulses, accumulated and
+    // clamped per tyre) so no wheel's order biases the car to one side.
+    struct tyre { vec3 axle, forward, ra, rb, side_at; phys3d_body* ground; bool moves; float grip, side, drive; };
+    tyre t[PHYS3D_MAX_VEHICLE_WHEELS];
+    for (int i = 0; i < v.wheel_count; i++) {
+        phys3d_vehicle_wheel& wh = v.wheels[i];
+        tyre& T = t[i];
+        T.grip = 0.0f;
+        wh.skid = 0.0f;
+        if (!wh.contact) continue;
+        vec3 n = wh.contact_normal;
+        vec3 axle = quat_rotate(c.rotation, phys3d__vehicle_axle(v, wh));
+        axle = axle - n * v3dot(axle, n);
+        if (v3dot(axle, axle) < 1e-8f) continue;
+        T.axle = v3norm(axle);
+        T.forward = v3norm(v3cross(n, T.axle));
+        if (v3dot(T.forward, quat_rotate(c.rotation, v.forward_local)) < 0.0f) T.forward = -T.forward;
+        T.ground = wh.ground != PIX_INVALID ? phys3d_get_body(w, wh.ground) : 0;
+        T.moves = T.ground && T.ground->type == PHYS3D_DYNAMIC;
+        T.ra = wh.contact_point - c.position;
+        T.rb = T.ground ? wh.contact_point - T.ground->position : v3(0, 0, 0);
+        // side forces act lower down (roll_influence) so cornering does not tip it over
+        T.side_at = T.ra - up * (v3dot(T.ra, up) * (1.0f - wh.roll_influence));
+        T.grip = wh.suspension_force * dt * wh.friction;
+        T.side = 0.0f;
+        T.drive = 0.0f;
+    }
+    auto rel_vel = [&](const tyre& T) {
+        vec3 vel = c.velocity + v3cross(c.angular_velocity, T.ra);
+        if (T.ground) vel -= T.ground->velocity + v3cross(T.ground->angular_velocity, T.rb);
+        return vel;
+    };
+    auto inv_mass_along = [&](const tyre& T, vec3 at, vec3 d) {
+        float k = c.inv_mass + v3dot(v3cross(at, d), c.inv_inertia * v3cross(at, d));
+        if (T.moves) k += T.ground->inv_mass + v3dot(v3cross(T.rb, d), T.ground->inv_inertia * v3cross(T.rb, d));
+        return maxf(k, 1e-9f);
+    };
+    auto push = [&](tyre& T, const phys3d_vehicle_wheel& wh, float dside, float ddrive) {
+        vec3 J = T.axle * dside + T.forward * ddrive;
+        c.velocity += J * c.inv_mass;
+        c.angular_velocity += c.inv_inertia * (v3cross(T.side_at, T.axle * dside) + v3cross(T.ra, T.forward * ddrive));
+        if (T.moves) phys3d_apply_impulse(*T.ground, -J, wh.contact_point);
+    };
+    for (int pass = 0; pass < 4; pass++)
+        for (int i = 0; i < v.wheel_count; i++) {
+            phys3d_vehicle_wheel& wh = v.wheels[i];
+            tyre& T = t[i];
+            if (T.grip <= 0.0f) continue;
+            vec3 vel = rel_vel(T);
+            float side = T.side - v3dot(vel, T.axle) / inv_mass_along(T, T.side_at, T.axle);
+            float drive;
+            if (wh.engine_force != 0.0f) drive = wh.engine_force * dt;
+            else {
+                // coasting rolls freely; a brake works against the rolling speed
+                float limit = wh.brake * dt;
+                drive = clampf(T.drive - v3dot(vel, T.forward) / inv_mass_along(T, T.ra, T.forward), -limit, limit);
+            }
+            float total = sqrtf(side * side + drive * drive);
+            if (total > T.grip) {
+                float scale = T.grip / total;
+                side *= scale;
+                drive *= scale;
+                wh.skid = 1.0f - scale;
+            } else {
+                wh.skid = 0.0f;
+            }
+            push(T, wh, side - T.side, drive - T.drive);
+            T.side = side;
+            T.drive = drive;
+        }
+    for (int i = 0; i < v.wheel_count; i++) {
+        phys3d_vehicle_wheel& wh = v.wheels[i];
+        if (t[i].grip <= 0.0f) { wh.spin_speed *= 0.99f; wh.spin += wh.spin_speed * dt; continue; }
+        wh.spin_speed = v3dot(rel_vel(t[i]), t[i].forward) / maxf(wh.radius, 1e-3f);
+        wh.spin += wh.spin_speed * dt;
+    }
+}
+
+mat4 phys3d_vehicle_wheel_transform(const phys3d_world& w, const phys3d_vehicle& v, int i) {
+    if (i < 0 || i >= v.wheel_count || v.chassis >= w.body_count) return mat4_identity();
+    const phys3d_body& c = w.bodies[v.chassis];
+    const phys3d_vehicle_wheel& wh = v.wheels[i];
+    vec3 pos = phys3d_lerp_position(w, c);
+    quat rot = phys3d_lerp_rotation(w, c);
+    vec3 up = v3norm(v.up_local);
+    vec3 centre = wh.attach - up * wh.suspension_length;
+    quat q = quat_mul(rot, quat_mul(quat_from_axis_angle(up, wh.steer), quat_from_axis_angle(v3norm(v3cross(up, v.forward_local)), wh.spin)));
+    return mat4_from_trs(pos + quat_rotate(rot, centre), q, v3(1, 1, 1));
+}
+
+float phys3d_vehicle_speed(phys3d_world& w, const phys3d_vehicle& v) {
+    phys3d_body* c = phys3d_get_body(w, v.chassis);
+    return c ? v3dot(c->velocity, quat_rotate(c->rotation, v.forward_local)) : 0.0f;
+}
+
+// ---- character controller ----
+
+phys3d_character phys3d_make_character(vec3 feet, float radius, float height) {
+    phys3d_character c;
+    memset(&c, 0, sizeof(c));
+    c.position = feet;
+    c.radius = radius > 0.01f ? radius : 0.01f;
+    c.height = maxf(height, 2.0f * c.radius);
+    c.max_slope = 50.0f * PIX_DEG2RAD;
+    c.step_height = 0.35f;
+    c.snap_distance = 0.35f;
+    c.skin = 0.01f;
+    c.jump_speed = 5.0f;
+    c.push_force = 600.0f;
+    c.frame_dt = 1.0f / 60.0f;
+    c.mask = PHYS_LAYER_ALL;
+    c.body = PIX_INVALID;
+    c.ground_body = PIX_INVALID;
+    c.ground_normal = v3(0, 1, 0);
+    return c;
+}
+
+static inline vec3 phys3d__char_up(const phys3d_world& w) {
+    float g = v3len(w.gravity);
+    return g > 1e-6f ? -w.gravity / g : v3(0, 1, 0);
+}
+// the capsule's rotation: its local y along `up`
+static quat phys3d__char_rot(vec3 up) {
+    vec3 y = v3(0, 1, 0);
+    float d = v3dot(y, up);
+    if (d > 0.9999f) return quat_identity();
+    if (d < -0.9999f) return quat_from_axis_angle(v3(1, 0, 0), PIX_PI);
+    return quat_from_axis_angle(v3norm(v3cross(y, up)), acosf(clampf(d, -1.0f, 1.0f)));
+}
+static inline vec3 phys3d__char_centre(const phys3d_character& c, vec3 up) { return c.position + up * (c.height * 0.5f); }
+
+// Pushes the capsule out of anything it overlaps (a platform rose into it, it
+// was placed inside something).
+static void phys3d__char_depenetrate(phys3d_world& w, phys3d_character& c, vec3 up) {
+    phys3d_shape cap = phys3d_capsule(c.radius, c.height);
+    quat q = phys3d__char_rot(up);
+    for (int iter = 0; iter < 4; iter++) {
+        phys3d__core me;
+        phys3d__make_core(cap, phys3d__char_centre(c, up), q, me);
+        vec3 push = v3(0, 0, 0);
+        phys3d_contact m;
+        phys3d__query_box(w, phys3d__core_bounds(me), [&](idx id, const phys3d_body& b) {
+            if (id == c.body || b.trigger || !(b.layer & c.mask) || b.type == PHYS3D_DYNAMIC) return;
+            // out to the skin, not just to touching: a capsule resting exactly
+            // on the floor would see the floor in every sweep, even sideways
+            auto test = [&](const phys3d__core& o) {
+                if (!phys3d__collide(me, o, 0.0f, c.skin, m)) return;
+                float deepest = c.skin;
+                for (int k = 0; k < m.count; k++) deepest = minf(deepest, m.points[k].separation);
+                if (deepest < c.skin * 0.99f) push += m.normal * (deepest - c.skin);   // normal points away from the capsule
+            };
+            if (b.shape.type == PHYS3D_MESH) {
+                const phys3d_mesh& mesh = *b.shape.mesh;
+                aabb mb = phys3d__core_bounds(me);
+                quat inv = quat_conjugate(b.rotation);
+                aabb box = aabb_make(v3(1e30f, 1e30f, 1e30f), v3(-1e30f, -1e30f, -1e30f));
+                for (int k = 0; k < 8; k++) {
+                    vec3 corner = v3((k & 1) ? mb.max.x : mb.min.x, (k & 2) ? mb.max.y : mb.min.y, (k & 4) ? mb.max.z : mb.min.z);
+                    vec3 l = quat_rotate(inv, corner - b.position);
+                    box.min = v3min(box.min, l); box.max = v3max(box.max, l);
+                }
+                phys3d__mesh_query(mesh, box, [&](uint32_t t) {
+                    phys3d__core tri;
+                    phys3d__triangle_core(b.position + quat_rotate(b.rotation, mesh.vertices[mesh.indices[t * 3]]),
+                                          b.position + quat_rotate(b.rotation, mesh.vertices[mesh.indices[t * 3 + 1]]),
+                                          b.position + quat_rotate(b.rotation, mesh.vertices[mesh.indices[t * 3 + 2]]), tri);
+                    test(tri);
+                });
+            } else {
+                phys3d__for_each_core(b.shape, b.position, b.rotation, [&](const phys3d__core& o, uint32_t) { test(o); });
+            }
+        });
+        if (v3dot(push, push) < 1e-10f) return;
+        c.position += push;
+    }
+}
+
+// One sweep along `d`: moves as far as it can (keeping the skin), and reports
+// the surface it stopped at. Returns the fraction of `d` it travelled.
+static float phys3d__char_sweep(phys3d_world& w, phys3d_character& c, vec3 up, vec3 d, phys3d_ray_hit* hit, bool* blocked) {
+    *blocked = false;
+    float len = v3len(d);
+    if (len < 1e-7f) return 1.0f;
+    phys3d_ray_hit h;
+    if (!phys3d_shape_cast(w, phys3d_capsule(c.radius, c.height), phys3d__char_centre(c, up), phys3d__char_rot(up), d,
+                           len + c.skin, &h, c.mask, c.body)) {
+        c.position += d;
+        return 1.0f;
+    }
+    // stop the skin short of the surface measured along its normal, so an
+    // oblique approach keeps the same gap as a head-on one
+    float approach = maxf(-v3dot(d / len, h.normal), 0.1f);
+    float travel = maxf(0.0f, h.distance - c.skin / approach);
+    c.position += d * (travel / len);
+    *hit = h;
+    *blocked = true;
+    return travel / len;
+}
+
+// Slides along everything it meets, up to a few times per move. `walkable`
+// surfaces only redirect; walls also refuse to be climbed (no gain along up).
+static void phys3d__char_slide(phys3d_world& w, phys3d_character& c, vec3 up, vec3 d, float cos_slope, bool horizontal) {
+    vec3 first_wall = v3(0, 0, 0);
+    for (int iter = 0; iter < 4 && v3dot(d, d) > 1e-12f; iter++) {
+        phys3d_ray_hit h;
+        bool blocked;
+        float done = phys3d__char_sweep(w, c, up, d, &h, &blocked);
+        if (!blocked) return;
+        vec3 n = h.normal;
+        // shove what it walked into, with its push force over this frame
+        if (c.push_force > 0.0f && h.body != PIX_INVALID && v3dot(d, n) < 0.0f) {
+            phys3d_body* b = phys3d_get_body(w, h.body);
+            if (b && b->type == PHYS3D_DYNAMIC) phys3d_apply_impulse(*b, -n * (c.push_force * c.frame_dt), h.point);
+        }
+        vec3 rest = d * (1.0f - done);
+        bool walkable = v3dot(n, up) >= cos_slope;
+        if (horizontal && !walkable) {
+            // a wall: slide along it, sideways only
+            n = n - up * v3dot(n, up);
+            if (v3dot(n, n) < 1e-10f) return;
+            n = v3norm(n);
+        }
+        rest = rest - n * v3dot(rest, n);
+        // in a corner between two walls: along their crease
+        if (iter > 0 && v3dot(first_wall, first_wall) > 0.0f) {
+            vec3 crease = v3cross(first_wall, n);
+            if (v3dot(crease, crease) > 1e-8f) {
+                crease = v3norm(crease);
+                rest = crease * v3dot(rest, crease);
+            }
+        }
+        if (iter == 0) first_wall = n;
+        if (horizontal) rest = rest - up * v3dot(rest, up);   // walking never lifts it
+        d = rest;
+    }
+}
+
+void phys3d_character_move(phys3d_world& w, phys3d_character& c, vec3 displacement) {
+    vec3 up = phys3d__char_up(w);
+    float cos_slope = cosf(c.max_slope);
+    vec3 start = c.position;
+    phys3d__char_depenetrate(w, c, up);
+    float vertical = v3dot(displacement, up);
+    vec3 side = displacement - up * vertical;
+    bool was_on_ground = c.on_ground;
+    c.on_ground = false;
+    c.ground_body = PIX_INVALID;
+
+    // 1. up by the step height (only when walking on the ground), 2. across,
+    // 3. down by as much as it went up plus the fall: a ledge lower than the
+    // step is walked onto, a higher one is a wall
+    float lifted = 0.0f;
+    if (was_on_ground && v3dot(side, side) > 1e-12f && c.step_height > 0.0f) {
+        vec3 before = c.position;
+        phys3d_ray_hit h; bool blocked;
+        phys3d__char_sweep(w, c, up, up * c.step_height, &h, &blocked);
+        lifted = v3dot(c.position - before, up);
+    }
+    phys3d__char_slide(w, c, up, side, cos_slope, true);
+    // down: the lift back, the fall, and on the ground a snap to follow slopes and steps
+    float down = lifted - minf(vertical, 0.0f);
+    bool rising = vertical > 0.0f;
+    if (rising) phys3d__char_slide(w, c, up, up * vertical, cos_slope, false);
+    float snap = (was_on_ground && !rising) ? c.snap_distance : 0.0f;
+    if (down + snap > 0.0f) {
+        vec3 before = c.position;
+        phys3d_ray_hit h; bool blocked;
+        phys3d__char_sweep(w, c, up, -up * (down + snap), &h, &blocked);
+        float fallen = v3dot(before - c.position, up);
+        vec3 ground_n = blocked ? h.normal : up;
+        if (blocked && v3dot(ground_n, up) < cos_slope) {
+            // On an edge (the top of a step) the touch normal leans over though
+            // the surface is flat: ask the surface itself, just past the edge
+            // (away from the capsule's axis, onto the thing it touches).
+            vec3 outward = (h.point - c.position) - up * v3dot(h.point - c.position, up);
+            float l = v3len(outward);
+            vec3 probe = h.point + up * 0.05f + (l > 1e-5f ? outward / l * 0.02f : v3(0, 0, 0));
+            phys3d_ray_hit g;
+            if (phys3d_raycast(w, probe, -up, 0.1f, &g, c.mask, c.body) && v3dot(g.normal, up) >= cos_slope) ground_n = g.normal;
+        }
+        if (blocked && v3dot(ground_n, up) >= cos_slope) {
+            c.on_ground = true;
+            c.ground_normal = ground_n;
+            c.ground_body = h.body;
+        } else if (blocked) {
+            // too steep to stand on: the rest of the real fall slides down it
+            if (down > fallen) phys3d__char_slide(w, c, up, -up * (down - fallen), cos_slope, false);
+        } else if (snap > 0.0f) {
+            // no ground within the snap: it walked off an edge, so only the real fall applies
+            c.position = before - up * down;
+        }
+    }
+    c.last_move = c.position - start;
+    if (c.body != PIX_INVALID) {
+        phys3d_body* b = phys3d_get_body(w, c.body);
+        if (b) { b->position = phys3d__char_centre(c, up); b->rotation = phys3d__char_rot(up); }
+    }
+}
+
+void phys3d_character_update(phys3d_world& w, phys3d_character& c, vec3 walk_velocity, bool jump, float dt) {
+    if (dt <= 0.0f) return;
+    c.frame_dt = dt;
+    vec3 up = phys3d__char_up(w);
+    if (c.on_ground) {
+        if (c.vertical_speed < 0.0f) c.vertical_speed = 0.0f;
+        if (jump) c.vertical_speed = c.jump_speed;
+    }
+    c.vertical_speed += v3dot(w.gravity, up) * dt;
+    vec3 walk = walk_velocity - up * v3dot(walk_velocity, up);
+    vec3 move = walk * dt + up * (c.vertical_speed * dt);
+    // standing on something that moves: go with it
+    if (c.on_ground && c.ground_body != PIX_INVALID && c.ground_body != c.body) {
+        const phys3d_body* g = phys3d_get_body(w, c.ground_body);
+        if (g && g->type != PHYS3D_STATIC)
+            move += (g->velocity + v3cross(g->angular_velocity, c.position - g->position)) * dt;
+    }
+    float wanted_up = v3dot(move, up);
+    phys3d_character_move(w, c, move);
+    float got_up = v3dot(c.last_move, up);
+    if (c.on_ground && c.vertical_speed < 0.0f) c.vertical_speed = 0.0f;
+    if (wanted_up > 0.0f && got_up < wanted_up * 0.5f && !c.on_ground) c.vertical_speed = 0.0f;   // hit its head
+    c.velocity = c.last_move / dt;
+}
+
+idx phys3d_add_character_body(phys3d_world& w, phys3d_character& c) {
+    vec3 up = phys3d__char_up(w);
+    phys3d_body b = phys3d_make_body(PHYS3D_KINEMATIC, phys3d_capsule(c.radius, c.height), phys3d__char_centre(c, up));
+    b.rotation = phys3d__char_rot(up);
+    b.layer = PHYS_LAYER_0;
+    c.body = phys3d_add_body(w, b);
+    return c.body;
 }
 
 #endif // PIX_PHYSICS3D_IMPL

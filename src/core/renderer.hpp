@@ -39,6 +39,8 @@
 #include "shader_sources.hpp"
 #include "compute.hpp"
 #include "animation.hpp"
+#include "meshops.hpp"
+#include "../loader/hdr_loader.hpp"
 #include "../loader/asset_types.hpp"
 
 // Capacities. Define any of these before including pix to change them; they
@@ -60,6 +62,9 @@
 #endif
 #ifndef PIX_MAX_LINES
 #define PIX_MAX_LINES      32768
+#endif
+#ifndef PIX_MAX_QUADS
+#define PIX_MAX_QUADS      16384   // billboards + 3D text glyphs per frame
 #endif
 #define MAX_SHADERS        64
 
@@ -104,6 +109,14 @@ struct material {
     float metallic;
     float roughness;
     vec3 emissive;       // linear radiance the surface gives off by itself
+
+    // ---- PBR maps (GL textures, 0 = none) - pix_load_model fills them from glTF ----
+    idx   normal_map;    // tangent-space normals, green = up (OpenGL / glTF convention)
+    float normal_scale;  // bump strength, 1 = as authored
+    idx   orm_map;       // r occlusion, g roughness, b metallic: multiplies the fields above
+    float occlusion;     // how much of the map's occlusion applies, 0..1
+    idx   emissive_map;  // sRGB, multiplies emissive
+
     float alpha;         // opacity multiplier, used by blended materials
     // Opaque materials discard texels whose alpha is below this - foliage,
     // fences, grates. 0 ignores texture alpha entirely.
@@ -172,6 +185,26 @@ struct pix_render_instance {
     // Bit 0 is the default world layer; the rest are yours (first-person arms,
     // minimap icons, reflection-only proxies, ...).
     uint32_t layers = 1;
+    // Set by the renderer while a mesh with LODs cross-fades between two
+    // levels (see pix_set_mesh_lods); leave it 0.
+    float lod_fade = 0.0f;
+    // For temporal AA: a number of your own, the same every frame, for an
+    // object that moves (0 = still, or not worth it). With it the renderer
+    // knows where the object was last frame and moving edges stay sharp
+    // instead of trailing. The camera's own motion needs no ids.
+    uint32_t motion_id = 0;
+};
+
+// ---- anti-aliasing (r.aa) ----
+// TAA jitters the camera by a fraction of a pixel each frame and blends the
+// frames, following motion: smooth edges, thin wires and specular highlights
+// for the price of one pass. MSAA renders the main view with several samples
+// per pixel: sharp, no blending over time, costs fill rate and memory.
+// Both can be on; FXAA (r.post.fxaa) is the cheap fallback.
+struct pix_aa_settings {
+    bool  taa;
+    float taa_feedback;   // 0..0.98: how much of the past each frame keeps (0.9; higher = smoother, more trailing)
+    int   msaa;           // samples on the main view: 1 (off), 2, 4 or 8
 };
 
 // What one particle is once it has stopped being simulation: a point, a size
@@ -180,6 +213,33 @@ struct pix_particle_vertex {
     float centre[3];
     float size;        // half-width in world units
     float color[4];    // rgb linear radiance, a coverage
+};
+
+// A static mesh's simpler stand-ins; see pix_set_mesh_lods.
+#define PIX_MAX_LODS 4
+struct pix_mesh_lods {
+    idx   meshes[PIX_MAX_LODS];   // simpler and simpler
+    float screen[PIX_MAX_LODS];   // meshes[i] is used below this fraction of the screen's height
+    int   count;
+};
+
+// How a world quad (billboard, 3D text) turns.
+#define PIX_FACE_CAMERA  0   // square to every view: labels, impostors, effects
+#define PIX_FACE_UPRIGHT 1   // turns about world y only: trees, characters as sprites
+#define PIX_FACE_FIXED   2   // stays on the given right/up axes: signs, decals
+
+// One textured rectangle in the world. Drawn unlit (fog still applies), after
+// the opaque scene; `cutout` ones alpha-test and write depth instead of blending.
+struct pix_quad3d {
+    vec3  anchor;        // the world point the rectangle hangs off
+    int   facing;        // PIX_FACE_*
+    vec3  right, up;     // PIX_FACE_FIXED only: world axes (their lengths scale the rect)
+    vec4  rect;          // x0, y0, x1, y1 along right/up from the anchor, world units, y up
+    vec4  uv;            // u0, v0 (top-left), u1, v1 (bottom-right)
+    vec4  color;         // linear rgb (can exceed 1 to glow), a = opacity
+    idx   texture;       // GL texture, 0 = plain white
+    bool  sdf;           // the texture's red channel is a signed distance field (text)
+    bool  cutout;
 };
 
 struct camera {
@@ -224,6 +284,8 @@ struct pix_scene_block {
     float fog_height[4];
     float screen_fx[4];
     float shadow_soft[4];
+    float ibl[4];
+    float sh[9 * 4];
 };
 
 #define PIX_MAX_SHADOW_TILES 16   // local light shadow atlas tiles (a spot uses 1, a point 6)
@@ -408,12 +470,18 @@ struct pix_reflection_settings {
 
 enum { PIX_QUALITY_LOW, PIX_QUALITY_MEDIUM, PIX_QUALITY_HIGH, PIX_QUALITY_ULTRA };
 
+// Holes left in a pool by unloaded meshes, sorted by start and never touching
+// each other or the cursor (those merge on free).
+struct pix__range { size_t start, count; };
+struct pix__free_list { pix__range* ranges; size_t count, capacity; };
+
 // A growable pair of vertex + index buffers with one VAO over them.
 struct pix__geometry_pool {
     GLuint vao, vbo, ebo;
     size_t vertex_size;
     size_t vertex_capacity, index_capacity;   // elements
-    size_t vertex_cursor, index_cursor;
+    size_t vertex_cursor, index_cursor;       // high-water marks
+    pix__free_list free_vertices, free_indices;
     bool   skinned;
 };
 
@@ -426,6 +494,7 @@ struct pix__program_uniforms {
     GLint env_map, planar_map, refract_map, planar, refraction;
     GLint scene_depth, params0, params1;
     GLint toon, extra_tex[4];
+    GLint normal_map, orm_map, emissive_map, maps, map_scale;
     GLint skin_base;
     int   clips;        // how many gl_ClipDistance planes its vertex stage writes
 };
@@ -439,7 +508,7 @@ struct pix__draw_list {
 };
 
 struct pix__line_vertex { float pos[3]; pix_color color; };
-struct pix__gpu_instance { mat4 model; vec4 tint; };
+struct pix__gpu_instance { mat4 model; vec4 tint; float lod; };
 
 // ---- render hooks: your own GPU work inside every view ----
 //
@@ -480,6 +549,41 @@ struct pix_renderer {
     mesh*     meshes;        size_t mesh_count;
     mesh*     skinned_meshes; size_t skinned_mesh_count;
     material* materials;     size_t material_count;
+    // slots given back by pix_unload_*, reused before the tables grow
+    idx* free_mesh_ids;     size_t free_mesh_id_count;
+    idx* free_skinned_ids;  size_t free_skinned_id_count;
+    idx* free_material_ids; size_t free_material_id_count;
+    // ---- anti-aliasing ----
+    pix_aa_settings aa;
+    framebuffer taa_history[2];       // the resolved image, ping-ponged
+    int    taa_index;                 // which history holds last frame
+    bool   taa_valid;                 // false: no usable past (first frame, resize, pix_taa_reset)
+    vec2   taa_jitter;                // this frame's sub-pixel offset, pixels
+    bool   taa_jittered;              // the main view drew jittered this frame
+    mat4   taa_view_proj;             // this frame's main camera, unjittered
+    mat4   taa_jittered_view_proj;
+    mat4   taa_prev_view_proj;        // last frame's, unjittered
+    GLuint velocity_fbo, velocity_tex, velocity_vao, velocity_vbo;
+    size_t velocity_capacity;         // instances velocity_vbo holds
+    float* velocity_staging;
+    // motion_id -> last frame's transform: open addressing, entries stamped by frame
+    struct pix__motion_entry { uint32_t id, frame; mat4 cur, prev; }* motion_table;
+    idx    taa_shader, velocity_shader;
+    GLuint msaa_fbo, msaa_color, msaa_depth;
+    int    msaa_samples;              // what msaa_fbo was made with
+    // the HDR environment (pix_set_environment): sky, reflections, diffuse light
+    struct {
+        idx   cube;          // GGX-prefiltered: mip m is roughness m / max_mip
+        int   size, max_mip;
+        float intensity;
+        vec3  sh[9];         // diffuse, as sh_irradiance reads it
+        idx   convert_shader, prefilter_shader;   // built on first use
+    } environment;
+    // LOD chains: lod_of[mesh] is 1 + its chain's index, 0 for none
+    uint16_t*      lod_of;
+    pix_mesh_lods* lod_chains;  size_t lod_chain_count;
+    float lod_band;   // how far past a switch point (fraction of it) the two levels cross-fade; 0 = hard switch
+    float lod_bias;   // multiplies screen sizes: > 1 keeps detail longer, < 1 drops it sooner
     idx       shaders[MAX_SHADERS]; size_t shader_count;
     // Depth-only twins of surface shaders with their own vertex stage, so what
     // a vertex shader moves (wind, waves) casts a shadow that moves with it.
@@ -607,7 +711,13 @@ struct pix_renderer {
     GLint u_post[32];                 // cached uniform locations, see pix__cache_uniforms
     GLint u_bloom[6];
     GLint u_fxaa[2];
-    GLint u_sky, u_particle[2];
+    GLint u_sky, u_particle[2], u_quad[3];
+    pix_quad3d* quads;  size_t quad_count;
+    float*      quad_staging;   // 24 floats per quad, in draw order
+    uint32_t*   quad_order;
+    float*      quad_depth;     // per quad, view z: the blended ones' sort key
+    idx    quad_shader;
+    GLuint quad_vao, quad_vbo;
 
     // reflections and refraction
     GLuint env_cube, env_fbo, env_depth;   // probe cubemap + its render target
@@ -706,6 +816,25 @@ PIXDEF idx load_skinned_mesh(pix_renderer& renderer, skinned_mesh_file_data& mes
 // A skinned mesh file (glTF) with no skeleton, loaded as an ordinary instanced
 // static mesh - how props and scenery from glTF files should be loaded.
 PIXDEF idx load_mesh_from_skinned(pix_renderer& renderer, const skinned_mesh_file_data& mesh_data);
+// Gives the mesh's space in the shared buffers back; the next load reuses it
+// and may reuse the id. Instances already pushed this frame draw nothing.
+PIXDEF void pix_unload_mesh(pix_renderer& renderer, idx mesh);
+PIXDEF void pix_unload_skinned_mesh(pix_renderer& renderer, idx mesh);
+
+// ---- levels of detail (static meshes) ----
+//
+// Give a mesh simpler stand-ins and the renderer swaps them in by itself as the
+// mesh gets smaller on screen: push the base mesh as usual. The switch is a
+// short dithered cross-fade (r.lod_band), so nothing pops. Chosen once per frame
+// from the frame's camera, so shadows and reflections agree with what you see.
+// (pix_mesh_lods is declared with the other public structs, above.)
+// `lods` and `screen` are `count` long, `screen` decreasing (e.g. 0.3, 0.15, 0.07).
+// count 0 removes them. Unloading `base` unloads its LODs too.
+PIXDEF bool pix_set_mesh_lods(pix_renderer& renderer, idx base, const idx* lods, const float* screen, int count);
+// Builds `levels` LODs by simplification (pix_mesh_simplify, each `ratio` of the
+// one before) and sets them with screen sizes 0.3, 0.15, ... Returns how many
+// it made: it stops early when the mesh will not simplify further.
+PIXDEF int pix_generate_mesh_lods(pix_renderer& renderer, idx base, int levels = 3, float ratio = 0.5f);
 
 // Procedural primitives, centred on the origin (planes and boxes sit on y=0
 // only if you move them there). Useful for prototyping, level blockouts and
@@ -721,6 +850,9 @@ PIXDEF idx pix_mesh_cylinder(pix_renderer& renderer, float radius, float height,
 PIXDEF material pix_material_default(void);
 PIXDEF idx pix_add_material(pix_renderer& renderer, const material& m);
 PIXDEF material* pix_get_material(pix_renderer& renderer, idx material_id);
+// Frees the slot for the next pix_add_material. Textures are not deleted:
+// materials can share them (clone_material), so they belong to the caller.
+PIXDEF void pix_unload_material(pix_renderer& renderer, idx material_id);
 
 // `texture_flags` picks the sampling: TEXTURE_BILINEAR (mipmapped, for real
 // uv-mapped textures) or TEXTURE_LINEAR / TEXTURE_PIXELATED for colour-swatch
@@ -848,6 +980,8 @@ PIXDEF idx load_skinned_surface_shader(pix_renderer& renderer, const char* fsrc)
 PIXDEF void pix_setup_scene_program(idx program);// `size` is a half width; `color` is linear radiance, deliberately unclamped
 // so values above 1 glow through the bloom.
 PIXDEF void push_particle(pix_renderer& renderer, vec3 at, float size, vec3 color, float alpha);
+// a billboard, a glyph of 3D text, a sign: see pix_quad3d
+PIXDEF void push_quad3d(pix_renderer& renderer, const pix_quad3d& quad);
 // Debug geometry, depth tested, unlit.
 PIXDEF void push_line(pix_renderer& renderer, vec3 a, vec3 b, pix_color color);
 PIXDEF void push_aabb_lines(pix_renderer& renderer, vec3 min, vec3 max, pix_color color);
@@ -878,7 +1012,8 @@ struct pix_view {
     vec3 clear_color;           // sRGB
     bool sky;
     bool opaque, skinned, transparent, particles, lines;
-    bool shadows;               // receive the sun's shadows (needs pix_render_shadows first)
+    bool quads;                 // billboards and 3D text
+    bool shadows;             // receive the sun's shadows (needs pix_render_shadows first)
     bool reflections;           // sample the probe and planar mirror
     vec4 clip_plane;            // keep geometry with dot(xyz, p) + w >= 0; zero = no clip
     float max_distance;         // skip instances further than this (0 = camera far plane)
@@ -919,6 +1054,28 @@ PIXDEF vec3 pix_screen_to_ray(const pix_renderer& renderer, float x, float y);
 // (the usual 256 x 16 or 1024 x 32 strip): red across each slice, green down,
 // blue from slice to slice. Assign the result to r.post.lut.
 PIXDEF idx pix_load_color_lut(const char* path);
+
+// ---- HDR environment (image-based lighting) ----
+//
+// An equirectangular HDR image (linear RGB floats, rows top to bottom) becomes
+// the sky, the light every surface reflects (prefiltered by roughness) and the
+// diffuse light from all around (spherical harmonics). Replaces the analytic
+// sky and hemisphere ambient; the sun and other lights still add on top.
+// With the reflection probe on, the probe captures this sky and takes over
+// reflections near the camera.
+PIXDEF bool pix_set_environment(pix_renderer& renderer, const float* rgb, int width, int height,
+                                float intensity = 1.0f);
+// the same from a Radiance .hdr file
+PIXDEF bool pix_load_environment(pix_renderer& renderer, const char* hdr_path, float intensity = 1.0f);
+// back to the analytic sky
+PIXDEF void pix_clear_environment(pix_renderer& renderer);
+
+// Temporal AA forgets the past: call on a camera cut or teleport, so the new
+// view does not start blended with the old one.
+PIXDEF void pix_taa_reset(pix_renderer& renderer);
+// The diffuse part on its own: nine coefficients from an equirect image, as
+// sh_irradiance reads them (exposed for tests and for baking your own).
+PIXDEF void pix_environment_sh(const float* rgb, int width, int height, vec3 out_sh[9]);
 
 // ---- timing ----
 PIXDEF void   pix_enable_gpu_timing(pix_renderer& renderer, bool on);
@@ -1014,6 +1171,11 @@ static pix__program_uniforms* pix__uniforms_for(pix_renderer& r, GLuint program)
     u.outline_group = glGetUniformLocation(program, "uOutlineGroup");
     u.outline_width = glGetUniformLocation(program, "uOutlineWidth");
     u.outline_color = glGetUniformLocation(program, "uOutlineColor");
+    u.normal_map  = glGetUniformLocation(program, "uNormalMap");
+    u.orm_map     = glGetUniformLocation(program, "uOrmMap");
+    u.emissive_map = glGetUniformLocation(program, "uEmissiveMap");
+    u.maps        = glGetUniformLocation(program, "uMaps");
+    u.map_scale   = glGetUniformLocation(program, "uMapScale");
     u.patches = false;
     for (size_t i = 0; i < r.patch_program_count; i++)
         if (r.patch_programs[i].program == program) u.patches = true;
@@ -1035,7 +1197,9 @@ static void pix__pool_attribs(pix_renderer& r, pix__geometry_pool& p) {
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex, position));
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex, normal));
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex, uv));
+        glVertexAttribPointer(8, 4, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex, tangent));
         for (int i = 0; i < 3; i++) glEnableVertexAttribArray(i);
+        glEnableVertexAttribArray(8);
         // per-instance model matrix (3..6) and tint (7)
         glBindBuffer(GL_ARRAY_BUFFER, r.instances_vbo);
         for (int c = 0; c < 4; c++) {
@@ -1048,6 +1212,10 @@ static void pix__pool_attribs(pix_renderer& r, pix__geometry_pool& p) {
                               (void*)offsetof(pix__gpu_instance, tint));
         glEnableVertexAttribArray(7);
         glVertexAttribDivisor(7, 1);
+        glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, sizeof(pix__gpu_instance),
+                              (void*)offsetof(pix__gpu_instance, lod));
+        glEnableVertexAttribArray(9);
+        glVertexAttribDivisor(9, 1);
     } else {
         GLsizei s = sizeof(vertex_rigged);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex_rigged, position));
@@ -1055,7 +1223,8 @@ static void pix__pool_attribs(pix_renderer& r, pix__geometry_pool& p) {
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex_rigged, uv));
         glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex_rigged, bone_ids));
         glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex_rigged, bone_weights));
-        for (int i = 0; i < 5; i++) glEnableVertexAttribArray(i);
+        glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, s, (void*)offsetof(vertex_rigged, tangent));
+        for (int i = 0; i < 6; i++) glEnableVertexAttribArray(i);
     }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, p.ebo);
     glBindVertexArray(0);
@@ -1118,15 +1287,80 @@ static void pix__pool_reserve(pix_renderer& r, pix__geometry_pool& p, size_t ver
     }
 }
 
-static void pix__pool_upload(pix__geometry_pool& p, const void* vertices, size_t vertex_count,
-                             const uint32_t* indices, size_t index_count) {
+// First fit: the first hole big enough, trimmed from its front.
+static bool pix__free_take(pix__free_list& f, size_t count, size_t* out) {
+    for (size_t i = 0; i < f.count; i++) {
+        pix__range& h = f.ranges[i];
+        if (h.count < count) continue;
+        *out = h.start;
+        h.start += count;
+        h.count -= count;
+        if (!h.count) { memmove(&f.ranges[i], &f.ranges[i + 1], (f.count - i - 1) * sizeof(pix__range)); f.count--; }
+        return true;
+    }
+    return false;
+}
+
+// Returns [start, start + count) to the list, merging with the holes either
+// side; a hole that reaches the cursor lowers the cursor instead.
+static void pix__free_give(pix__free_list& f, size_t start, size_t count, size_t& cursor) {
+    size_t i = 0;
+    while (i < f.count && f.ranges[i].start < start) i++;
+    bool join_prev = i > 0 && f.ranges[i - 1].start + f.ranges[i - 1].count == start;
+    bool join_next = i < f.count && start + count == f.ranges[i].start;
+    if (join_prev && join_next) {
+        f.ranges[i - 1].count += count + f.ranges[i].count;
+        memmove(&f.ranges[i], &f.ranges[i + 1], (f.count - i - 1) * sizeof(pix__range));
+        f.count--;
+    } else if (join_prev) {
+        f.ranges[i - 1].count += count;
+    } else if (join_next) {
+        f.ranges[i].start = start;
+        f.ranges[i].count += count;
+    } else {
+        if (f.count == f.capacity) {
+            size_t cap = f.capacity ? f.capacity * 2 : 32;
+            pix__range* grown = pix_alloc<pix__range>(cap);
+            if (!grown) return;   // the space is lost, nothing else breaks
+            if (f.count) memcpy(grown, f.ranges, f.count * sizeof(pix__range));
+            pix_free(f.ranges);
+            f.ranges = grown;
+            f.capacity = cap;
+        }
+        memmove(&f.ranges[i + 1], &f.ranges[i], (f.count - i) * sizeof(pix__range));
+        f.ranges[i].start = start;
+        f.ranges[i].count = count;
+        f.count++;
+    }
+    pix__range& last = f.ranges[f.count - 1];
+    if (last.start + last.count == cursor) { cursor = last.start; f.count--; }
+}
+
+// Space for one mesh: holes first, else the end of the pool (growing it).
+static void pix__pool_alloc(pix_renderer& r, pix__geometry_pool& p, size_t vertices, size_t indices,
+                            size_t* vertex_at, size_t* index_at) {
+    bool hole_v = pix__free_take(p.free_vertices, vertices, vertex_at);
+    bool hole_i = pix__free_take(p.free_indices, indices, index_at);
+    pix__pool_reserve(r, p, hole_v ? 0 : vertices, hole_i ? 0 : indices);
+    if (!hole_v) { *vertex_at = p.vertex_cursor; p.vertex_cursor += vertices; }
+    if (!hole_i) { *index_at = p.index_cursor; p.index_cursor += indices; }
+}
+
+static void pix__pool_upload(pix__geometry_pool& p, size_t vertex_at, const void* vertices, size_t vertex_count,
+                             size_t index_at, const uint32_t* indices, size_t index_count) {
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, p.vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(p.vertex_cursor * p.vertex_size),
+    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(vertex_at * p.vertex_size),
                     (GLsizeiptr)(vertex_count * p.vertex_size), vertices);
     glBindBuffer(GL_COPY_WRITE_BUFFER, p.ebo);
-    glBufferSubData(GL_COPY_WRITE_BUFFER, (GLintptr)(p.index_cursor * sizeof(uint32_t)),
+    glBufferSubData(GL_COPY_WRITE_BUFFER, (GLintptr)(index_at * sizeof(uint32_t)),
                     (GLsizeiptr)(index_count * sizeof(uint32_t)), indices);
+}
+
+static void pix__pool_free(pix__geometry_pool& p, mesh& m) {
+    pix__free_give(p.free_vertices, m.vertex_offset, m.vertex_count, p.vertex_cursor);
+    pix__free_give(p.free_indices, m.index_offset, m.index_count, p.index_cursor);
+    m = mesh();
 }
 
 static void pix__mesh_bounds(mesh& m, const void* vertices, size_t count, size_t stride) {
@@ -1160,12 +1394,85 @@ static void pix__destroy_prepass(pix_renderer& r) {
     r.prepass_fbo = r.normal_tex = 0;
 }
 
+static void pix__destroy_aa(pix_renderer& r) {
+    for (int i = 0; i < 2; i++) if (r.taa_history[i].fbo) pix_destroy_framebuffer(r.taa_history[i]);
+    if (r.velocity_fbo) glDeleteFramebuffers(1, &r.velocity_fbo);
+    if (r.velocity_tex) glDeleteTextures(1, &r.velocity_tex);
+    if (r.msaa_fbo) glDeleteFramebuffers(1, &r.msaa_fbo);
+    GLuint rbs[2] = { r.msaa_color, r.msaa_depth };
+    glDeleteRenderbuffers(2, rbs);
+    r.velocity_fbo = r.velocity_tex = r.msaa_fbo = r.msaa_color = r.msaa_depth = 0;
+    r.msaa_samples = 0;
+    r.taa_valid = false;
+}
+
 static void pix__destroy_screen_targets(pix_renderer& r) {
     framebuffer* all[] = { &r.scene_target, &r.ldr_a, &r.ldr_b, &r.bloom_a, &r.bloom_b,
                            &r.fx_a, &r.fx_b, &r.vol_a, &r.vol_b, &r.hdr_a, &r.hdr_b, &r.dof_half };
     for (size_t i = 0; i < PIX_ARRAY_COUNT(all); i++)
         if (all[i]->fbo) pix_destroy_framebuffer(*all[i]);
     pix__destroy_prepass(r);
+    pix__destroy_aa(r);
+}
+
+static framebuffer pix__color_target(int w, int h, GLint internal, GLenum format, GLenum type, bool linear);
+
+// TAA's history pair and velocity buffer (which tests against the scene's
+// depth), and MSAA's multisampled colour + depth: made when asked for,
+// dropped when not.
+static void pix__sync_aa(pix_renderer& r) {
+    pix_aa_settings& a = r.aa;
+    if (a.taa && !r.taa_history[0].fbo) {
+        for (int i = 0; i < 2; i++)
+            r.taa_history[i] = pix__color_target(r.width, r.height, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, true);
+        glGenTextures(1, &r.velocity_tex);
+        glBindTexture(GL_TEXTURE_2D, r.velocity_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, r.width, r.height, 0, GL_RG, GL_FLOAT, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, &r.velocity_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, r.velocity_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r.velocity_tex, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, r.scene_target.depth, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        r.taa_valid = false;
+    } else if (!a.taa && r.taa_history[0].fbo) {
+        for (int i = 0; i < 2; i++) pix_destroy_framebuffer(r.taa_history[i]);
+        glDeleteFramebuffers(1, &r.velocity_fbo);
+        glDeleteTextures(1, &r.velocity_tex);
+        r.velocity_fbo = r.velocity_tex = 0;
+    }
+
+    int samples = a.msaa >= 8 ? 8 : (a.msaa >= 4 ? 4 : (a.msaa >= 2 ? 2 : 1));
+    if (r.msaa_fbo && samples != r.msaa_samples) {
+        glDeleteFramebuffers(1, &r.msaa_fbo);
+        GLuint rbs[2] = { r.msaa_color, r.msaa_depth };
+        glDeleteRenderbuffers(2, rbs);
+        r.msaa_fbo = r.msaa_color = r.msaa_depth = 0;
+        r.msaa_samples = 0;
+    }
+    if (samples > 1 && !r.msaa_fbo) {
+        // the scene target's own formats, so both resolve with a blit
+        GLuint rbs[2];
+        glGenRenderbuffers(2, rbs);
+        glBindRenderbuffer(GL_RENDERBUFFER, rbs[0]);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_R11F_G11F_B10F, r.width, r.height);
+        glBindRenderbuffer(GL_RENDERBUFFER, rbs[1]);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, r.width, r.height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glGenFramebuffers(1, &r.msaa_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, r.msaa_fbo);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbs[0]);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbs[1]);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            pix_log("pix: %dx MSAA target incomplete", samples);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        r.msaa_color = rbs[0];
+        r.msaa_depth = rbs[1];
+        r.msaa_samples = samples;
+    }
 }
 
 // A colour-only target of any format, for the passes whose format the
@@ -1403,6 +1710,7 @@ static void pix__sync_settings(pix_renderer& r) {
         r.planar_target = pix_create_render_target(pw, ph, true, true, true);   // mipmapped: rough mirrors blur
 
     pix__sync_extras(r);
+    pix__sync_aa(r);
 }
 
 // Matches the scene target's format so the copy is a raw GPU-side memcpy.
@@ -1436,12 +1744,23 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     r.meshes             = pix_alloc<mesh>(PIX_MAX_MESHES);
     r.skinned_meshes     = pix_alloc<mesh>(PIX_MAX_MESHES);
     r.materials          = pix_alloc<material>(PIX_MAX_MATERIALS);
-    r.instances          = pix_alloc<pix_render_instance>(PIX_MAX_INSTANCES);
+    r.free_mesh_ids      = pix_alloc<idx>(PIX_MAX_MESHES);
+    r.free_skinned_ids   = pix_alloc<idx>(PIX_MAX_MESHES);
+    r.free_material_ids  = pix_alloc<idx>(PIX_MAX_MATERIALS);
+    r.lod_of             = pix_alloc<uint16_t>(PIX_MAX_MESHES);
+    r.lod_chains         = pix_alloc<pix_mesh_lods>(PIX_MAX_MESHES);
+    r.lod_band = 0.2f;
+    r.lod_bias = 1.0f;
+    r.instances         = pix_alloc<pix_render_instance>(PIX_MAX_INSTANCES);
     r.animated_instances = pix_alloc<pix_render_instance>(PIX_MAX_ANIMATED);
     r.animated_bones     = pix_alloc<const mat4*>(PIX_MAX_ANIMATED);
     r.animated_bone_count = pix_alloc<uint32_t>(PIX_MAX_ANIMATED);
     r.skin_list_staging  = pix_alloc<uint32_t>(PIX_MAX_ANIMATED);
     r.particles          = pix_alloc<pix_particle_vertex>(PIX_MAX_PARTICLES);
+    r.quads              = pix_alloc<pix_quad3d>(PIX_MAX_QUADS);
+    r.quad_staging       = pix_alloc<float>(PIX_MAX_QUADS * 24);
+    r.quad_order         = pix_alloc<uint32_t>(PIX_MAX_QUADS);
+    r.quad_depth         = pix_alloc<float>(PIX_MAX_QUADS);
     r.lines              = pix_alloc<pix__line_vertex>(PIX_MAX_LINES * 2);
     r.lights             = pix_alloc<pix_light_list>(1);
     r.staging            = pix_alloc<pix__gpu_instance>(PIX_MAX_INSTANCES);
@@ -1475,7 +1794,27 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     r.fxaa_shader    = opengl_create_shader(VSHDER_POST, FSHDER_FXAA);
     r.line_shader    = pix__compile(VSHDER_LINE, FSHDER_LINE, false);
     r.particle_shader = pix__compile(VSHDER_PARTICLE, FSHDER_PARTICLE, false);
-    r.depth_shader         = opengl_create_shader(VSHDER_DEPTH, FSHDER_DEPTH);
+    r.quad_shader = pix__compile(VSHDER_QUAD3D, FSHDER_QUAD3D, false);
+    r.taa_shader = opengl_create_shader(VSHDER_POST, FSHDER_TAA);
+    r.velocity_shader = opengl_create_shader(VSHDER_VELOCITY, FSHDER_VELOCITY);
+    glGenVertexArrays(1, &r.velocity_vao);
+    glGenBuffers(1, &r.velocity_vbo);
+    r.u_quad[0] = glGetUniformLocation(r.quad_shader, "uCamRight");
+    r.u_quad[1] = glGetUniformLocation(r.quad_shader, "uCamUp");
+    r.u_quad[2] = glGetUniformLocation(r.quad_shader, "uCutout");
+    {
+        // the built-in static programs carry the LOD cross-fade (see FSHDER_DEPTH)
+        const char* lod[] = { "#define PIX_LOD_FADE\n" };
+        char* df = pix_shader_splice(FSHDER_DEPTH, lod, 1);
+        r.depth_shader = df ? opengl_create_shader(VSHDER_DEPTH, df) : 0;
+        pix_free(df);
+        const char* pre[] = { "#define PIX_LOD_FADE\n", GLSL_SCENE, GLSL_COMMON };
+        char* pv = shader_with_common(VSHDER_BASIC);
+        char* pf = pix_shader_splice(FSHDER_PREPASS, pre, 3);
+        r.prepass_shader = (pv && pf) ? opengl_create_shader(pv, pf) : 0;
+        pix_free(pv);
+        pix_free(pf);
+    }
     r.depth_skinned_shader = pix__compile_skinned(VSHDER_DEPTH_SKINNED, FSHDER_DEPTH, false);
     {
         // the skinning storage buffers; sized on first use and grown as crowds do
@@ -1485,7 +1824,6 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     }
     r.bloom_prefilter_shader = opengl_create_shader(VSHDER_POST, FSHDER_BLOOM_PREFILTER);
     r.bloom_blur_shader      = opengl_create_shader(VSHDER_POST, FSHDER_BLOOM_BLUR);
-    r.prepass_shader         = pix__compile(VSHDER_BASIC, FSHDER_PREPASS, false);
     r.prepass_skinned_shader = pix__compile_skinned_common(VSHDER_SKINNED, FSHDER_PREPASS);
     r.fx_shader              = pix__compile(VSHDER_POST, FSHDER_SCREEN_FX, false);
     r.bilateral_shader       = pix__compile(VSHDER_POST, FSHDER_BILATERAL, false);
@@ -1555,6 +1893,18 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(pix_particle_vertex), (void*)(sizeof(float) * 4));
     glVertexAttribDivisor(1, 1);
 
+    // world quads: six vec4s per instance (see pix__quad_pass), the corner from gl_VertexID
+    glGenVertexArrays(1, &r.quad_vao);
+    glGenBuffers(1, &r.quad_vbo);
+    glBindVertexArray(r.quad_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r.quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(PIX_MAX_QUADS * 24 * sizeof(float)), 0, GL_STREAM_DRAW);
+    for (int i = 0; i < 6; i++) {
+        glEnableVertexAttribArray(i);
+        glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, 24 * sizeof(float), (void*)(i * 4 * sizeof(float)));
+        glVertexAttribDivisor(i, 1);
+    }
+
     glGenVertexArrays(1, &r.line_vao);
     glGenBuffers(1, &r.line_vbo);
     glBindVertexArray(r.line_vao);
@@ -1579,6 +1929,9 @@ pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_c
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
 
     r.default_fovy     = 1.05f;
+    r.aa.taa = true;
+    r.aa.taa_feedback = 0.9f;
+    r.aa.msaa = 1;
     r.projection_matrix = mat4_perspective(r.default_fovy, (float)r.width / (float)r.height, 0.1f, 1000.0f);
     r.view_matrix      = mat4_identity();
     r.view_proj        = r.projection_matrix;
@@ -1690,7 +2043,7 @@ void pix_set_quality(pix_renderer& r, int quality) {
     //                            low    medium  high   ultra
     static const int  res[4]  = { 1024,  1536,   2048,  4096 };
     static const int  soft[4] = { 0,     1,      1,     2 };
-    static const bool fx[4]   = { false, true,   true,  true };
+    static const bool taa[4]  = { false, true,   true,  true };
     static const bool glow[4] = { false, true,   true,  true };
     static const bool probe[4] = { false, false, true,  true };
     static const int  probe_res[4] = { 64, 64,   128,   256 };
@@ -1698,7 +2051,8 @@ void pix_set_quality(pix_renderer& r, int quality) {
     r.shadows.enabled = true;
     r.shadows.resolution = res[q];
     r.shadows.softness = soft[q];
-    r.post.fxaa = fx[q];
+    r.aa.taa = taa[q];
+    r.post.fxaa = false;          // TAA covers it; FXAA stays available on its own
     r.post.bloom = glow[q];
     r.reflections.probe = probe[q];
     r.reflections.probe_resolution = probe_res[q];
@@ -1766,13 +2120,14 @@ void pix_destory_renderer(pix_renderer& r) {
     pix__destroy_screen_targets(r);
     if (r.shadow_map.fbo) pix_destroy_framebuffer(r.shadow_map);
     GLuint bufs[] = { r.instances_vbo, r.pool.vbo, r.pool.ebo, r.skin_pool.vbo, r.skin_pool.ebo,
-                      r.particle_vbo, r.line_vbo, r.scene_ubo, r.lights_ubo,
+                      r.particle_vbo, r.quad_vbo, r.velocity_vbo, r.line_vbo, r.scene_ubo, r.lights_ubo,
                       r.skin_bones_ssbo, r.skin_inst_ssbo, r.skin_list_ssbo };
     glDeleteBuffers((GLsizei)PIX_ARRAY_COUNT(bufs), bufs);
-    GLuint vaos[] = { r.pool.vao, r.skin_pool.vao, r.particle_vao, r.line_vao };
+    GLuint vaos[] = { r.pool.vao, r.skin_pool.vao, r.particle_vao, r.quad_vao, r.velocity_vao, r.line_vao };
     glDeleteVertexArrays((GLsizei)PIX_ARRAY_COUNT(vaos), vaos);
     idx progs[] = { r.shader, r.skinned_shader, r.sky_shader, r.post_shader, r.fxaa_shader, r.line_shader,
-                    r.particle_shader, r.depth_shader, r.depth_skinned_shader,
+                    r.particle_shader, r.quad_shader, r.taa_shader, r.velocity_shader,
+                    r.depth_shader, r.depth_skinned_shader,
                     r.bloom_prefilter_shader, r.bloom_blur_shader, r.prepass_shader, r.prepass_skinned_shader,
                     r.fx_shader, r.bilateral_shader, r.outline_shader, r.outline_skinned_shader,
                     r.volumetric_shader, r.motion_blur_shader, r.dof_blur_shader, r.dof_composite_shader,
@@ -1788,13 +2143,18 @@ void pix_destory_renderer(pix_renderer& r) {
     opengl_destroy_texture(r.dummy_shadow);
     opengl_destroy_texture(r.dummy_cube);
     opengl_destroy_texture(r.env_cube);
+    opengl_destroy_texture(r.environment.cube);
+    opengl_destroy_shader(r.environment.convert_shader);
+    opengl_destroy_shader(r.environment.prefilter_shader);
     opengl_destroy_texture(r.refract_tex);
     opengl_destroy_texture(r.refract_depth);
     if (r.env_fbo) glDeleteFramebuffers(1, &r.env_fbo);
     if (r.env_depth) glDeleteRenderbuffers(1, &r.env_depth);
     if (r.planar_target.fbo) pix_destroy_framebuffer(r.planar_target);
-    void* heap[] = { r.meshes, r.skinned_meshes, r.materials, r.instances, r.animated_instances,
-                     (void*)r.animated_bones, r.animated_bone_count, r.skin_list_staging, r.skin_bone_staging, r.particles, r.lines, r.lights, r.staging, r.bounds, r.flags,
+    void* heap[] = { r.meshes, r.skinned_meshes, r.materials, r.free_mesh_ids, r.free_skinned_ids,
+                     r.free_material_ids, r.lod_of, r.lod_chains, r.pool.free_vertices.ranges, r.pool.free_indices.ranges,
+                     r.skin_pool.free_vertices.ranges, r.skin_pool.free_indices.ranges, r.instances, r.animated_instances,
+                     (void*)r.animated_bones, r.animated_bone_count, r.skin_list_staging, r.skin_bone_staging, r.particles, r.quads, r.quad_staging, r.quad_order, r.quad_depth, r.velocity_staging, r.motion_table, r.lines, r.lights, r.staging, r.bounds, r.flags,
                      r.sort_keys, r.sort_keys_tmp, r.sort_vals, r.sort_vals_tmp, r.list_storage };
     for (size_t i = 0; i < PIX_ARRAY_COUNT(heap); i++) pix_free(heap[i]);
     r = pix_renderer();
@@ -1904,21 +2264,109 @@ void push_light(pix_renderer& r, const pix_light& light) { pix_lights_add(*r.lig
 
 idx load_mesh_data(pix_renderer& r, const vertex* vertices, size_t vertex_count,
                    const uint32_t* indices, size_t index_count) {
-    if (r.mesh_count >= PIX_MAX_MESHES || !vertex_count || !index_count) return PIX_INVALID;
-    pix__pool_reserve(r, r.pool, vertex_count, index_count);
-    idx id = (idx)r.mesh_count++;
+    if (!vertex_count || !index_count) return PIX_INVALID;
+    if (r.mesh_count >= PIX_MAX_MESHES && !r.free_mesh_id_count) return PIX_INVALID;
+    // tangents the caller left zero are derived here, on a copy (the input is const)
+    vertex* derived = 0;
+    if (pix_tangents_missing(vertices, vertex_count, sizeof(vertex), offsetof(vertex, tangent))) {
+        derived = pix_new<vertex>(vertex_count);
+        if (derived) {
+            memcpy(derived, vertices, vertex_count * sizeof(vertex));
+            pix_compute_tangents(derived, vertex_count, sizeof(vertex), offsetof(vertex, tangent),
+                                 indices, index_count, true);
+            vertices = derived;
+        }
+    }
+    size_t vo, io;
+    pix__pool_alloc(r, r.pool, vertex_count, index_count, &vo, &io);
+    idx id = r.free_mesh_id_count ? r.free_mesh_ids[--r.free_mesh_id_count] : (idx)r.mesh_count++;
     mesh& m = r.meshes[id];
     m.vbo = r.pool.vbo;
-    m.vertex_offset = (idx)r.pool.vertex_cursor;
+    m.vertex_offset = (idx)vo;
     m.vertex_size = sizeof(vertex);
     m.vertex_count = (idx)vertex_count;
-    m.index_offset = (idx)r.pool.index_cursor;
+    m.index_offset = (idx)io;
     m.index_count = (idx)index_count;
     pix__mesh_bounds(m, vertices, vertex_count, sizeof(vertex));
-    pix__pool_upload(r.pool, vertices, vertex_count, indices, index_count);
-    r.pool.vertex_cursor += vertex_count;
-    r.pool.index_cursor += index_count;
+    pix__pool_upload(r.pool, vo, vertices, vertex_count, io, indices, index_count);
+    pix_free(derived);
     return id;
+}
+
+void pix_unload_mesh(pix_renderer& r, idx id) {
+    if (id >= r.mesh_count || !r.meshes[id].index_count) return;
+    if (r.lod_of[id]) {
+        pix_mesh_lods& c = r.lod_chains[r.lod_of[id] - 1];
+        for (int i = 0; i < c.count; i++) pix_unload_mesh(r, c.meshes[i]);
+        pix_set_mesh_lods(r, id, 0, 0, 0);
+    }
+    pix__pool_free(r.pool, r.meshes[id]);
+    r.free_mesh_ids[r.free_mesh_id_count++] = id;
+}
+
+bool pix_set_mesh_lods(pix_renderer& r, idx base, const idx* lods, const float* screen, int count) {
+    if (base >= r.mesh_count || count < 0 || count > PIX_MAX_LODS) return false;
+    if (count == 0) {
+        if (r.lod_of[base]) r.lod_chains[r.lod_of[base] - 1].count = 0;   // the slot is free again
+        r.lod_of[base] = 0;
+        return true;
+    }
+    for (int i = 0; i < count; i++) if (lods[i] >= r.mesh_count) return false;
+    size_t slot = r.lod_of[base] ? r.lod_of[base] - 1 : r.lod_chain_count;
+    if (!r.lod_of[base])
+        for (size_t i = 0; i < r.lod_chain_count; i++) if (!r.lod_chains[i].count) { slot = i; break; }
+    if (slot >= PIX_MAX_MESHES) return false;
+    if (slot == r.lod_chain_count) r.lod_chain_count++;
+    pix_mesh_lods& c = r.lod_chains[slot];
+    c.count = count;
+    for (int i = 0; i < count; i++) { c.meshes[i] = lods[i]; c.screen[i] = screen[i]; }
+    r.lod_of[base] = (uint16_t)(slot + 1);
+    return true;
+}
+
+int pix_generate_mesh_lods(pix_renderer& r, idx base, int levels, float ratio) {
+    if (base >= r.mesh_count || !r.meshes[base].index_count || levels < 1) return 0;
+    if (levels > PIX_MAX_LODS) levels = PIX_MAX_LODS;
+    const mesh& m = r.meshes[base];
+    // the mesh lives only on the GPU: read it back (a load-time stall, once)
+    pix_mesh_data md = {};
+    md.vertices = pix_new<vertex>(m.vertex_count);
+    md.indices = pix_new<uint32_t>(m.index_count);
+    if (!md.vertices || !md.indices) { pix_mesh_free(md); return 0; }
+    md.vertex_count = m.vertex_count;
+    md.index_count = m.index_count;
+    glBindBuffer(GL_COPY_READ_BUFFER, r.pool.vbo);
+    glGetBufferSubData(GL_COPY_READ_BUFFER, (GLintptr)(m.vertex_offset * sizeof(vertex)),
+                       (GLsizeiptr)(m.vertex_count * sizeof(vertex)), md.vertices);
+    glBindBuffer(GL_COPY_READ_BUFFER, r.pool.ebo);
+    glGetBufferSubData(GL_COPY_READ_BUFFER, (GLintptr)(m.index_offset * sizeof(uint32_t)),
+                       (GLsizeiptr)(m.index_count * sizeof(uint32_t)), md.indices);
+    glBindBuffer(GL_COPY_READ_BUFFER, 0);
+    pix_mesh_weld(md);   // per-corner files simplify to nothing unless their vertices are shared
+
+    idx lods[PIX_MAX_LODS];
+    float screen[PIX_MAX_LODS];
+    int made = 0;
+    size_t tris = md.index_count / 3;
+    for (int i = 0; i < levels; i++) {
+        size_t left = pix_mesh_simplify(md, ratio);
+        if (left < 4 || left > tris * 9 / 10) break;   // nothing left, or it would not simplify
+        idx lod = load_mesh_data(r, md.vertices, md.vertex_count, md.indices, md.index_count);
+        if (lod == PIX_INVALID) break;
+        lods[made] = lod;
+        screen[made] = 0.3f * powf(0.5f, (float)made);
+        made++;
+        tris = left;
+    }
+    pix_mesh_free(md);
+    if (made) pix_set_mesh_lods(r, base, lods, screen, made);
+    return made;
+}
+
+void pix_unload_skinned_mesh(pix_renderer& r, idx id) {
+    if (id >= r.skinned_mesh_count || !r.skinned_meshes[id].index_count) return;
+    pix__pool_free(r.skin_pool, r.skinned_meshes[id]);
+    r.free_skinned_ids[r.free_skinned_id_count++] = id;
 }
 
 idx load_mesh(pix_renderer& r, mesh_file_data& md) {
@@ -1926,20 +2374,24 @@ idx load_mesh(pix_renderer& r, mesh_file_data& md) {
 }
 
 idx load_skinned_mesh(pix_renderer& r, skinned_mesh_file_data& md) {
-    if (r.skinned_mesh_count >= PIX_MAX_MESHES || !md.vertex_count || !md.index_count) return PIX_INVALID;
-    pix__pool_reserve(r, r.skin_pool, md.vertex_count, md.index_count);
-    idx id = (idx)r.skinned_mesh_count++;
+    if (!md.vertex_count || !md.index_count) return PIX_INVALID;
+    if (r.skinned_mesh_count >= PIX_MAX_MESHES && !r.free_skinned_id_count) return PIX_INVALID;
+    // the file data is the caller's to edit, so missing tangents are filled in place
+    if (pix_tangents_missing(md.vertex_data, md.vertex_count, sizeof(vertex_rigged), offsetof(vertex_rigged, tangent)))
+        pix_compute_tangents(md.vertex_data, md.vertex_count, sizeof(vertex_rigged), offsetof(vertex_rigged, tangent),
+                             md.index_data, md.index_count, true);
+    size_t vo, io;
+    pix__pool_alloc(r, r.skin_pool, md.vertex_count, md.index_count, &vo, &io);
+    idx id = r.free_skinned_id_count ? r.free_skinned_ids[--r.free_skinned_id_count] : (idx)r.skinned_mesh_count++;
     mesh& m = r.skinned_meshes[id];
     m.vbo = r.skin_pool.vbo;
-    m.vertex_offset = (idx)r.skin_pool.vertex_cursor;
+    m.vertex_offset = (idx)vo;
     m.vertex_size = sizeof(vertex_rigged);
     m.vertex_count = (idx)md.vertex_count;
-    m.index_offset = (idx)r.skin_pool.index_cursor;
+    m.index_offset = (idx)io;
     m.index_count = (idx)md.index_count;
     pix__mesh_bounds(m, md.vertex_data, md.vertex_count, sizeof(vertex_rigged));
-    pix__pool_upload(r.skin_pool, md.vertex_data, md.vertex_count, md.index_data, md.index_count);
-    r.skin_pool.vertex_cursor += md.vertex_count;
-    r.skin_pool.index_cursor += md.index_count;
+    pix__pool_upload(r.skin_pool, vo, md.vertex_data, md.vertex_count, io, md.index_data, md.index_count);
     return id;
 }
 
@@ -1950,6 +2402,7 @@ idx load_mesh_from_skinned(pix_renderer& r, const skinned_mesh_file_data& md) {
         v[i].position = md.vertex_data[i].position;
         v[i].normal   = md.vertex_data[i].normal;
         v[i].uv       = md.vertex_data[i].uv;
+        v[i].tangent  = md.vertex_data[i].tangent;
     }
     idx id = load_mesh_data(r, v, md.vertex_count, md.index_data, md.index_count);
     pix_free(v);
@@ -2072,6 +2525,8 @@ material pix_material_default(void) {
     m.metallic = 0.0f;
     m.roughness = 0.6f;
     m.alpha = 1.0f;
+    m.normal_scale = 1.0f;
+    m.occlusion = 1.0f;
     m.alpha_cutoff = 0.5f;    // cut-out cards work out of the box; opaque textures have alpha 1
     m.blend = PIX_BLEND_OPAQUE;
     m.cast_shadows = true;
@@ -2090,13 +2545,20 @@ material pix_material_default(void) {
 idx pix_add_material(pix_renderer& r, const material& m) {
     // An overrun here would corrupt whatever follows the table and fail frames
     // later somewhere else entirely; refuse loudly instead.
-    if (r.material_count >= PIX_MAX_MATERIALS) {
+    if (r.material_count >= PIX_MAX_MATERIALS && !r.free_material_id_count) {
         pix_log("pix: material table full (PIX_MAX_MATERIALS = %d)", PIX_MAX_MATERIALS);
         return (idx)(r.material_count ? 0 : PIX_INVALID);
     }
-    idx id = (idx)r.material_count++;
+    idx id = r.free_material_id_count ? r.free_material_ids[--r.free_material_id_count] : (idx)r.material_count++;
     r.materials[id] = m;
     return id;
+}
+
+void pix_unload_material(pix_renderer& r, idx id) {
+    if (id >= r.material_count) return;
+    for (size_t i = 0; i < r.free_material_id_count; i++) if (r.free_material_ids[i] == id) return;
+    r.materials[id] = pix_material_default();
+    r.free_material_ids[r.free_material_id_count++] = id;
 }
 
 material* pix_get_material(pix_renderer& r, idx material_id) {
@@ -2363,6 +2825,7 @@ void begin_frame(pix_renderer& r, camera& cam) {
     r.renderable_count = 0;
     r.animated_count = 0;
     r.particle_count = 0;
+    r.quad_count = 0;
     r.line_count = 0;
     pix_lights_clear(*r.lights);
     if (r.shadows.enabled) pix__fit_cascades(r, cam);
@@ -2383,6 +2846,8 @@ void push_instance(pix_renderer& r, idx mesh, idx material, const mat4& transfor
     it.transform = transform;
     it.tint = tint;
     it.layers = layers;
+    it.lod_fade = 0.0f;
+    it.motion_id = 0;
 }
 
 void push_skinned(pix_renderer& r, idx mesh, idx material, const mat4& transform,
@@ -2439,6 +2904,11 @@ idx load_skinned_surface_shader(pix_renderer& r, const char* fsrc) {
     if (prog && r.shader_count < MAX_SHADERS) r.shaders[r.shader_count++] = prog;
     if (prog) pix__scene_sampler_units((GLuint)prog);
     return prog;
+}
+
+void push_quad3d(pix_renderer& r, const pix_quad3d& q) {
+    if (r.quad_count >= PIX_MAX_QUADS || q.color.w <= 0.0f) return;
+    r.quads[r.quad_count++] = q;
 }
 
 void push_particle(pix_renderer& r, vec3 at, float size, vec3 color, float alpha) {
@@ -2642,10 +3112,50 @@ static void pix__upload_skinning(pix_renderer& r) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(r.skin_list_capacity * sizeof(uint32_t)), 0, GL_STREAM_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
+// Swaps each instance of a mesh with LODs for the level its size on screen
+// calls for. Just past a switch point (within r.lod_band of it) the instance
+// is drawn at both levels, sharing the pixels by a dither pattern whose split
+// follows the size - so the change happens gradually as the camera moves.
+static void pix__select_lods(pix_renderer& r) {
+    const camera& cam = r.frame_camera;
+    vec3 eye = cam.position;
+    float half = cam.ortho_height > 0.0f ? cam.ortho_height * 0.5f
+               : tanf((cam.fovy > 0.0f ? cam.fovy : r.default_fovy) * 0.5f);
+    float band = r.lod_band > 0.0f ? r.lod_band : 0.0f;
+    size_t n = r.renderable_count;
+    for (size_t i = 0; i < n; i++) {
+        pix_render_instance& it = r.instances[i];
+        uint16_t chain = r.lod_of[it.mesh];
+        if (!chain) continue;
+        const pix_mesh_lods& c = r.lod_chains[chain - 1];
+        const mesh& base = r.meshes[it.mesh];
+        float rad = base.radius * mat4_max_scale(it.transform);
+        float d = v3dist(mat4_mul_point(it.transform, base.center), eye);
+        float span = cam.ortho_height > 0.0f ? half : d * half;   // half the screen's height, world units, there
+        float s = rad / (span > 1e-4f ? span : 1e-4f) * r.lod_bias;
+        int level = 0;
+        while (level < c.count && s < c.screen[level]) level++;
+        idx here = level == 0 ? it.mesh : c.meshes[level - 1];
+        if (level < c.count && band > 0.0f && s < c.screen[level] * (1.0f + band)
+            && r.renderable_count < PIX_MAX_INSTANCES) {
+            // k: how far the size is through the band, 0 at the switch point
+            float k = (s - c.screen[level]) / (c.screen[level] * band);
+            k = k < 0.001f ? 0.001f : (k > 0.999f ? 0.999f : k);
+            pix_render_instance& next = r.instances[r.renderable_count++];
+            next = it;
+            next.mesh = c.meshes[level];
+            next.lod_fade = -k;     // the coarser level: the pattern above k
+            it.lod_fade = k;        // this level: below k
+        }
+        it.mesh = here;
+    }
+}
+
 static void pix__prepare_frame(pix_renderer& r) {
     if (r.frame_prepared) return;
     pix__sync_settings(r);
     r.frame_draws = r.frame_instances = r.frame_culled = 0;
+    if (r.lod_chain_count) pix__select_lods(r);
     for (size_t i = 0; i < r.renderable_count; i++) {
         const pix_render_instance& it = r.instances[i];
         const mesh& m = r.meshes[it.mesh];
@@ -2687,6 +3197,7 @@ static void pix__stream_list(pix_renderer& r, pix__draw_list& list) {
         const pix_render_instance& it = r.instances[list.items[i]];
         r.staging[i].model = it.transform;
         r.staging[i].tint = it.tint;
+        r.staging[i].lod = it.lod_fade;
     }
     glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(r.instance_cursor * sizeof(pix__gpu_instance)),
                     (GLsizeiptr)(list.count * sizeof(pix__gpu_instance)), r.staging);
@@ -2815,6 +3326,12 @@ static void pix__upload_scene(pix_renderer& r, bool planar, bool probe, vec4 cli
     b.shadow_soft[1] = 2.0f / tile;
     b.shadow_soft[2] = r.cascade_depth;
     b.shadow_soft[3] = 4.0f;
+    if (r.environment.cube) {
+        b.ibl[0] = 1.0f;
+        b.ibl[1] = (float)r.environment.max_mip;
+        b.ibl[2] = r.environment.intensity;
+        for (int k = 0; k < 9; k++) pix__put4(b.sh + k * 4, r.environment.sh[k], 0.0f);
+    }
     glBindBuffer(GL_UNIFORM_BUFFER, r.scene_ubo);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)sizeof(b), &b);
     glBindBuffer(GL_UNIFORM_BUFFER, 0);
@@ -2881,7 +3398,9 @@ static void pix__bind_frame_textures(pix_renderer& r, bool shadows, bool env, bo
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, (shadows && r.shadow_map.depth) ? r.shadow_map.depth : r.dummy_shadow);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, (env && r.env_cube) ? r.env_cube : r.dummy_cube);
+    // the probe when this view may sample it, else the HDR environment (bIbl picks)
+    glBindTexture(GL_TEXTURE_CUBE_MAP, (env && r.env_cube) ? r.env_cube
+                                     : (r.environment.cube ? r.environment.cube : r.dummy_cube));
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, (planar && r.planar_target.color) ? r.planar_target.color : r.white_texture);
     glActiveTexture(GL_TEXTURE0 + 4);
@@ -2949,6 +3468,10 @@ static void pix__use_program(pix_renderer& r, pix__pass_state& st, GLuint progra
     if (st.u->screen_fx >= 0) glUniform1i(st.u->screen_fx, 10);
     if (st.u->local_shadow >= 0) glUniform1i(st.u->local_shadow, 11);
     if (st.u->shadow_raw >= 0) glUniform1i(st.u->shadow_raw, 12);
+    // 13..15 the material's normal, occlusion/roughness/metallic and emissive maps
+    if (st.u->normal_map >= 0) glUniform1i(st.u->normal_map, 13);
+    if (st.u->orm_map >= 0) glUniform1i(st.u->orm_map, 14);
+    if (st.u->emissive_map >= 0) glUniform1i(st.u->emissive_map, 15);
     r.draw_mode = st.u->patches ? GL_PATCHES : GL_TRIANGLES;
 }
 
@@ -2974,6 +3497,20 @@ static void pix__bind_material(pix_renderer& r, pix__pass_state& st, idx materia
             glBindTexture(GL_TEXTURE_2D, m.textures[i]);
             glActiveTexture(GL_TEXTURE0);
         }
+    if (u->maps >= 0) {
+        // the shader samples only the maps the bits name, so stale bindings are harmless
+        idx maps[3] = { m.normal_map, m.orm_map, m.emissive_map };
+        int bits = 0;
+        for (int i = 0; i < 3; i++) {
+            if (!maps[i]) continue;
+            bits |= 1 << i;
+            glActiveTexture(GL_TEXTURE0 + 13 + i);
+            glBindTexture(GL_TEXTURE_2D, maps[i]);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glUniform1i(u->maps, bits);
+        glUniform2f(u->map_scale, m.normal_scale, m.occlusion);
+    }
     for (int i = 0; i < m.uniform_count; i++) {
         const pix_material_uniform& mu = m.uniforms[i];
         switch (mu.components) {
@@ -3387,6 +3924,8 @@ static void pix__sky_pass(pix_renderer& r, const mat4& view_proj) {
     glDisable(GL_CULL_FACE);
     glUseProgram(r.sky_shader);
     glUniformMatrix4fv(r.u_sky, 1, GL_FALSE, inv.data);
+    // the environment borrows unit 0 (uSkyCube's default); the next material rebinds it
+    if (r.environment.cube) glBindTexture(GL_TEXTURE_CUBE_MAP, r.environment.cube);
     pix_draw_fullscreen();
     glDepthMask(GL_TRUE);
 }
@@ -3410,6 +3949,74 @@ static void pix__particle_pass(pix_renderer& r) {
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(r.particle_count * sizeof(pix_particle_vertex)), r.particles);
     glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)r.particle_count);
     r.frame_draws++;
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+}
+
+// Billboards and 3D text: the cutout ones in the opaque phase (depth written,
+// any order), the rest blended back to front. Runs sharing a texture draw as
+// one instanced call; a text label is one texture, so one draw.
+static float* pix__quad_sort_depth;
+static int pix__quad_cmp(const void* a, const void* b) {
+    uint32_t i = *(const uint32_t*)a, j = *(const uint32_t*)b;
+    float di = pix__quad_sort_depth[i], dj = pix__quad_sort_depth[j];
+    if (di != dj) return di < dj ? -1 : 1;       // view z: more negative is further: drawn first
+    return i < j ? -1 : (i > j ? 1 : 0);         // stable, so a label's glyphs keep their order
+}
+
+static void pix__quad_pass(pix_renderer& r, bool cutout) {
+    if (!r.quad_count) return;
+    size_t n = 0;
+    for (size_t i = 0; i < r.quad_count; i++)
+        if (r.quads[i].cutout == cutout) r.quad_order[n++] = (uint32_t)i;
+    if (!n) return;
+    if (!cutout) {
+        // view-space z of each anchor
+        const float* m = r.view_matrix.data;
+        for (size_t i = 0; i < r.quad_count; i++) {
+            vec3 p = r.quads[i].anchor;
+            r.quad_depth[i] = m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14];
+        }
+        pix__quad_sort_depth = r.quad_depth;
+        qsort(r.quad_order, n, sizeof(uint32_t), pix__quad_cmp);
+    }
+    for (size_t k = 0; k < n; k++) {
+        const pix_quad3d& q = r.quads[r.quad_order[k]];
+        float* o = r.quad_staging + k * 24;
+        o[0] = q.anchor.x; o[1] = q.anchor.y; o[2] = q.anchor.z; o[3] = (float)q.facing;
+        o[4] = q.rect.x;   o[5] = q.rect.y;   o[6] = q.rect.z;   o[7] = q.rect.w;
+        o[8] = q.uv.x;     o[9] = q.uv.y;     o[10] = q.uv.z;    o[11] = q.uv.w;
+        o[12] = q.color.x; o[13] = q.color.y; o[14] = q.color.z; o[15] = q.color.w;
+        o[16] = q.right.x; o[17] = q.right.y; o[18] = q.right.z; o[19] = q.sdf ? 1.0f : 0.0f;
+        o[20] = q.up.x;    o[21] = q.up.y;    o[22] = q.up.z;    o[23] = 0.0f;
+    }
+    vec3 right = v3(r.view_matrix.data[0], r.view_matrix.data[4], r.view_matrix.data[8]);
+    vec3 up    = v3(r.view_matrix.data[1], r.view_matrix.data[5], r.view_matrix.data[9]);
+    glUseProgram(r.quad_shader);
+    glUniform3f(r.u_quad[0], right.x, right.y, right.z);
+    glUniform3f(r.u_quad[1], up.x, up.y, up.z);
+    glUniform1i(r.u_quad[2], cutout ? 1 : 0);
+    if (cutout) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+    else        { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(r.quad_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r.quad_vbo);
+    // the views of a frame each upload their own order: orphan, then fill
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(PIX_MAX_QUADS * 24 * sizeof(float)), 0, GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * 24 * sizeof(float)), r.quad_staging);
+    glActiveTexture(GL_TEXTURE0);
+    for (size_t k = 0; k < n;) {
+        idx tex = r.quads[r.quad_order[k]].texture;
+        size_t end = k + 1;
+        while (end < n && r.quads[r.quad_order[end]].texture == tex) end++;
+        glBindTexture(GL_TEXTURE_2D, tex ? tex : r.white_texture);
+        glDrawArraysInstancedBaseInstance(GL_TRIANGLE_STRIP, 0, 4, (GLsizei)(end - k), (GLuint)k);
+        r.frame_draws++;
+        k = end;
+    }
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
     glBindVertexArray(0);
@@ -3440,7 +4047,7 @@ pix_view pix_view_default(pix_renderer& r, const camera& cam) {
     v.clear = true;
     v.clear_color = r.clear_color;
     v.sky = r.sky_enabled;
-    v.opaque = v.skinned = v.transparent = v.particles = v.lines = true;
+    v.opaque = v.skinned = v.transparent = v.particles = v.lines = v.quads = true;
     v.shadows = true;
     v.reflections = true;
     return v;
@@ -3450,6 +4057,113 @@ pix_view pix_view_default(pix_renderer& r, const camera& cam) {
 // Renders `v` into whatever framebuffer is bound by the caller (`fbo`, sized
 // fb_w x fb_h). `color_tex`/`depth_tex` are that framebuffer's attachments,
 // copied from for refraction; 0 when it has none.
+// The multisampled main view into the scene target: colour averaged, depth
+// one sample per pixel (the screen effects read it as plain depth).
+static void pix__resolve_msaa(pix_renderer& r) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, r.msaa_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r.scene_target.fbo);
+    glBlitFramebuffer(0, 0, r.width, r.height, 0, 0, r.width, r.height,
+                      GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, r.scene_target.fbo);
+}
+
+// Where the object with this motion_id was last frame (its transform now, if
+// it was not seen then). One table, entries stamped with the frame they were
+// last updated in, so nothing has to be cleared between frames.
+#define PIX__MOTION_SLOTS 16384
+static mat4 pix__motion_prev(pix_renderer& r, uint32_t id, const mat4& now) {
+    uint32_t frame = (uint32_t)r.frame_number + 1;   // + 1: 0 marks a never-used slot
+    uint32_t h = id * 2654435761u, free_slot = 0xFFFFFFFFu;
+    for (uint32_t probe = 0; probe < PIX__MOTION_SLOTS; probe++) {
+        pix_renderer::pix__motion_entry& e = r.motion_table[(h + probe) & (PIX__MOTION_SLOTS - 1)];
+        if (e.frame && e.id == id) {
+            if (e.frame == frame) return e.prev;     // seen already this frame (a LOD's twin)
+            e.prev = e.frame + 1 == frame ? e.cur : now;
+            e.cur = now;
+            e.frame = frame;
+            return e.prev;
+        }
+        // stale entries (not seen last frame) can be taken over
+        if (free_slot == 0xFFFFFFFFu && (!e.frame || e.frame + 1 < frame)) free_slot = (h + probe) & (PIX__MOTION_SLOTS - 1);
+        if (!e.frame) break;   // the end of this id's chain
+    }
+    if (free_slot != 0xFFFFFFFFu) {
+        pix_renderer::pix__motion_entry& e = r.motion_table[free_slot];
+        e.id = id; e.frame = frame; e.cur = now; e.prev = now;
+    }
+    return now;
+}
+
+// The velocity buffer: cleared to "ask the depth" (the camera's motion), then
+// every opaque instance with a motion_id draws its own motion over it.
+static void pix__velocity_pass(pix_renderer& r) {
+    glBindFramebuffer(GL_FRAMEBUFFER, r.velocity_fbo);
+    glViewport(0, 0, r.width, r.height);
+    glClearColor(1000.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    size_t n = 0;
+    for (size_t i = 0; i < r.renderable_count; i++)
+        if (r.instances[i].motion_id && !(r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) n++;
+    if (!n) return;
+    if (!r.motion_table) {
+        r.motion_table = pix_alloc<pix_renderer::pix__motion_entry>(PIX__MOTION_SLOTS);
+        if (!r.motion_table) return;
+    }
+    if (n > r.velocity_capacity) {
+        size_t cap = r.velocity_capacity ? r.velocity_capacity : 256;
+        while (cap < n) cap *= 2;
+        pix_free(r.velocity_staging);
+        r.velocity_staging = pix_alloc<float>(cap * 32);
+        if (!r.velocity_staging) { r.velocity_capacity = 0; return; }
+        r.velocity_capacity = cap;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < r.renderable_count; i++) {
+        const pix_render_instance& it = r.instances[i];
+        if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
+        mat4 prev = pix__motion_prev(r, it.motion_id, it.transform);
+        memcpy(r.velocity_staging + k * 32, it.transform.data, 16 * sizeof(float));
+        memcpy(r.velocity_staging + k * 32 + 16, prev.data, 16 * sizeof(float));
+        k++;
+    }
+    // the pool's buffers change when it grows, so the layout is set each time
+    glBindVertexArray(r.velocity_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r.pool.vbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), (void*)offsetof(vertex, position));
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, r.velocity_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(r.velocity_capacity * 32 * sizeof(float)), 0, GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(k * 32 * sizeof(float)), r.velocity_staging);
+    for (int c = 0; c < 8; c++) {
+        glVertexAttribPointer(1 + c, 4, GL_FLOAT, GL_FALSE, 32 * sizeof(float), (void*)(size_t)(c * 4 * sizeof(float)));
+        glEnableVertexAttribArray(1 + c);
+        glVertexAttribDivisor(1 + c, 1);
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, r.pool.ebo);
+    GLuint p = (GLuint)r.velocity_shader;
+    glUseProgram(p);
+    glUniformMatrix4fv(glGetUniformLocation(p, "uJitteredViewProj"), 1, GL_FALSE, r.taa_jittered_view_proj.data);
+    glUniformMatrix4fv(glGetUniformLocation(p, "uCurViewProj"), 1, GL_FALSE, r.taa_view_proj.data);
+    glUniformMatrix4fv(glGetUniformLocation(p, "uPrevViewProj"), 1, GL_FALSE,
+                       (r.taa_valid ? r.taa_prev_view_proj : r.taa_view_proj).data);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    k = 0;
+    for (size_t i = 0; i < r.renderable_count; i++) {
+        const pix_render_instance& it = r.instances[i];
+        if (!it.motion_id || (r.flags[i] & (PIX__BLENDED | PIX__HIDDEN))) continue;
+        const mesh& me = r.meshes[it.mesh];
+        glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES, (GLsizei)me.index_count, GL_UNSIGNED_INT,
+            (void*)(size_t)(me.index_offset * sizeof(uint32_t)), 1, (GLint)me.vertex_offset, (GLuint)k);
+        k++;
+    }
+    glDepthMask(GL_TRUE);
+    glBindVertexArray(0);
+}
+
 static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo, int fb_w, int fb_h,
                                   GLuint color_tex, GLuint depth_tex, int kind) {
     pix__prepare_frame(r);
@@ -3466,6 +4180,27 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     camera cam = v.cam;
     if (kind == PIX__KIND_PROBE) { cam.fovy = PIX_PI * 0.5f; cam.ortho_height = 0.0f; }
     pix__set_current_view(r, cam, kind == PIX__KIND_PROBE ? 1.0f : (float)vw / (float)vh);
+    // the screen-sized main view: TAA jitters it, MSAA draws it multisampled
+    bool main_view = kind == PIX__KIND_USER && fbo == r.scene_target.fbo && fb_w == r.width && fb_h == r.height
+                  && vw == fb_w && vh == fb_h;
+    bool taa = main_view && r.aa.taa && r.taa_history[0].fbo && !r.taa_jittered;
+    bool msaa = main_view && r.msaa_fbo;
+    if (taa) {
+        // Halton (2, 3): eight offsets that cover the pixel evenly in any window of frames
+        int k = (int)(r.frame_number % 8) + 1;
+        float hx = 0.0f, hy = 0.0f;
+        for (float f = 0.5f, i = (float)k; i > 0.0f; f *= 0.5f, i = floorf(i / 2.0f)) hx += f * fmodf(i, 2.0f);
+        for (float f = 1.0f / 3.0f, i = (float)k; i > 0.0f; f /= 3.0f, i = floorf(i / 3.0f)) hy += f * fmodf(i, 3.0f);
+        r.taa_jitter = v2(hx - 0.5f, hy - 0.5f);
+        r.taa_view_proj = r.view_proj;
+        // shift the projection in clip space, so it works for ortho cameras too
+        mat4 shift = mat4_translate(2.0f * r.taa_jitter.x / (float)fb_w, 2.0f * r.taa_jitter.y / (float)fb_h, 0.0f);
+        r.projection_matrix = mat4_mul(shift, r.projection_matrix);
+        r.view_proj = mat4_mul(r.projection_matrix, r.view_matrix);
+        r.taa_jittered_view_proj = r.view_proj;
+        r.taa_jittered = true;
+    }
+    GLuint draw_fbo = msaa ? r.msaa_fbo : fbo;
     float max_dist = v.max_distance > 0.0f ? v.max_distance : r.camera_far;
     pix__build_view_lists(r, r.view_frustum, r.camera_position, max_dist, r.camera_far, v.layers,
                           v.opaque, v.transparent);
@@ -3483,7 +4218,7 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     if (kind == PIX__KIND_USER) { r.prepass_done = pre; r.fx_valid = fx; }
     pix__upload_scene(r, planar, probe, v.clip_plane, fb_w, fb_h, fx);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo);
     glViewport(vx, vy, vw, vh);
     int sx = vx, sy = vy, sw = vw, sh = vh;
     if (v.scissor.w > 0.0f && v.scissor.h > 0.0f) {
@@ -3511,7 +4246,7 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
     if (pre) {
         pix__prepass(r, v, st, kind);
         if (fx) pix__screen_fx_pass(r);
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo);
         glViewport(vx, vy, vw, vh);
         glDisable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
@@ -3519,22 +4254,30 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
         st.cull = -1;
     }
     pix__bind_frame_textures(r, shadows, probe, planar, false);
-    bool prepassed = pre || (v.opaque && !v.override_shader && kind == PIX__KIND_USER && pix__cutout_prepass(r, r.list_opaque, st));
-    if (v.opaque) pix__draw_sorted(r, r.list_opaque, st, false, v.override_shader, prepassed, pre);
+    // multisampled, the lit pass has its own depth: the prepass laid it in the
+    // single-sample scene depth, which the screen effects read, not in this one
+    bool depth_laid = pre && !msaa;
+    bool prepassed = depth_laid || (v.opaque && !v.override_shader && kind == PIX__KIND_USER && pix__cutout_prepass(r, r.list_opaque, st));
+    if (v.opaque) pix__draw_sorted(r, r.list_opaque, st, false, v.override_shader, prepassed, depth_laid);
     if (v.skinned && r.animated_count) {
-        if (pre) glDepthMask(GL_FALSE);
+        if (depth_laid) glDepthMask(GL_FALSE);
         pix__draw_skinned(r, st, 0, kind == PIX__KIND_MIRROR ? 0 : &r.view_frustum, v.layers);
         glDepthMask(GL_TRUE);
     }
     if (v.opaque && !v.override_shader && kind != PIX__KIND_PROBE) pix__hull_outlines(r, v, st, kind);
     if (r.wireframe && kind == PIX__KIND_USER && v.opaque) pix__wireframe_pass(r, st);
     pix__run_hooks(r, st, PIX_HOOK_OPAQUE, kind, -1, r.view_proj, v.layers, fb_w, fb_h);
+    if (v.quads) { pix__quad_pass(r, true); st.program = 0; st.cull = -1; }
     if (v.sky) { pix__sky_pass(r, r.view_proj); st.program = 0; st.cull = -1; }
     if (v.lines) pix__line_pass(r);
 
     if (r.list_transparent.count) {
         if (r.refract_needed && color_tex && depth_tex) {
             // what is behind the glass: one GPU-side copy of this view's opaque result
+            if (msaa) {   // resolved first: the copy reads the single-sample target
+                pix__resolve_msaa(r);
+                glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo);
+            }
             pix__ensure_refract_tex(r, fb_w, fb_h);
             glCopyImageSubData(color_tex, GL_TEXTURE_2D, 0, 0, 0, 0, r.refract_tex, GL_TEXTURE_2D, 0, 0, 0, 0, fb_w, fb_h, 1);
             glCopyImageSubData(depth_tex, GL_TEXTURE_2D, 0, 0, 0, 0, r.refract_depth, GL_TEXTURE_2D, 0, 0, 0, 0, fb_w, fb_h, 1);
@@ -3556,10 +4299,13 @@ static void pix__render_view_into(pix_renderer& r, const pix_view& v, GLuint fbo
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
     }
+    if (v.quads) pix__quad_pass(r, false);
     if (v.particles) pix__particle_pass(r);
 
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
+    if (msaa) pix__resolve_msaa(r);
+    if (taa) pix__velocity_pass(r);
     glBindVertexArray(0);
 }
 
@@ -3895,6 +4641,32 @@ static const framebuffer* pix__hdr_stages(pix_renderer& r, const framebuffer& sr
     if (!src.depth) return cur;
     framebuffer* next = &r.hdr_a;
 
+    if (r.taa_jittered && src.fbo == r.scene_target.fbo && r.taa_history[0].fbo) {
+        // TAA first: everything after it (blur, DoF, bloom) works on the clean image
+        int into = r.taa_index ^ 1;
+        pix_bind_framebuffer(r.taa_history[into]);
+        GLuint p = (GLuint)r.taa_shader;
+        glUseProgram(p);
+        glUniform1i(glGetUniformLocation(p, "uScene"), 0);
+        glUniform1i(glGetUniformLocation(p, "uHistory"), 1);
+        glUniform1i(glGetUniformLocation(p, "uVelocity"), 2);
+        glUniform1i(glGetUniformLocation(p, "uDepth"), 3);
+        mat4 inv = mat4_inverse(r.taa_view_proj);
+        glUniformMatrix4fv(glGetUniformLocation(p, "uInvViewProj"), 1, GL_FALSE, inv.data);
+        glUniformMatrix4fv(glGetUniformLocation(p, "uPrevViewProj"), 1, GL_FALSE, r.taa_prev_view_proj.data);
+        glUniform2f(glGetUniformLocation(p, "uTexel"), 1.0f / (float)r.width, 1.0f / (float)r.height);
+        glUniform1f(glGetUniformLocation(p, "uFeedback"), clampf(r.aa.taa_feedback, 0.0f, 0.98f));
+        glUniform1i(glGetUniformLocation(p, "uHasHistory"), r.taa_valid ? 1 : 0);
+        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, src.depth);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, r.velocity_tex);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, r.taa_history[r.taa_index].color);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, src.color);
+        pix_draw_fullscreen();
+        r.taa_index = into;
+        r.taa_valid = true;
+        cur = &r.taa_history[into];
+    }
+
     if (r.motion_blur.enabled && r.hdr_a.fbo) {
         pix_bind_framebuffer(*next);
         GLuint p = (GLuint)r.motion_blur_shader;
@@ -4181,6 +4953,8 @@ void pix_fullscreen_pass(pix_renderer& r, idx program, const idx* textures, int 
 void pix_finish_frame(pix_renderer& r, bool clear_instances) {
     if (r.gpu_timing) r.gpu_slot ^= 1;
     r.prev_view_proj = r.frame_view_proj;     // motion blur's "where it was"
+    if (r.taa_jittered) r.taa_prev_view_proj = r.taa_view_proj;
+    r.taa_jittered = false;
     r.frame_number++;
     // back to the frame camera, so picking and world_to_screen answer for it
     pix__set_current_view(r, r.frame_camera, (float)r.width / (float)r.height);
@@ -4194,9 +4968,245 @@ void pix_finish_frame(pix_renderer& r, bool clear_instances) {
         r.renderable_count = 0;
         r.animated_count = 0;
         r.particle_count = 0;
+        r.quad_count = 0;
         r.line_count = 0;
     }
     r.frame_prepared = false;
+}
+
+// ---------------- HDR environment ----------------
+
+#ifndef GL_RGB32F
+#define GL_RGB32F 0x8815
+#endif
+
+// Projects the image onto order-2 spherical harmonics, then applies the
+// cosine-lobe convolution (A0 = pi, A1 = 2pi/3, A2 = pi/4) and divides by pi,
+// so evaluating them gives the light to multiply albedo by.
+void pix_environment_sh(const float* rgb, int w, int h, vec3 out[9]) {
+    double acc[9][3] = {};
+    for (int y = 0; y < h; y++) {
+        float theta = ((float)y + 0.5f) / (float)h * PIX_PI;   // 0 = straight up
+        float st = sinf(theta), ct = cosf(theta);
+        float d_omega = (2.0f * PIX_PI / (float)w) * (PIX_PI / (float)h) * st;
+        for (int x = 0; x < w; x++) {
+            float phi = (((float)x + 0.5f) / (float)w - 0.5f) * 2.0f * PIX_PI;
+            float dx = st * cosf(phi), dy = ct, dz = st * sinf(phi);   // matches the cube conversion
+            float basis[9] = { 0.282095f, 0.488603f * dy, 0.488603f * dz, 0.488603f * dx,
+                               1.092548f * dx * dy, 1.092548f * dy * dz, 0.315392f * (3.0f * dz * dz - 1.0f),
+                               1.092548f * dx * dz, 0.546274f * (dx * dx - dy * dy) };
+            const float* p = rgb + ((size_t)y * w + x) * 3;
+            for (int k = 0; k < 9; k++)
+                for (int c = 0; c < 3; c++) acc[k][c] += (double)(p[c] * basis[k] * d_omega);
+        }
+    }
+    const float band[9] = { 1.0f, 2.0f / 3.0f, 2.0f / 3.0f, 2.0f / 3.0f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f };   // A_l / pi
+    for (int k = 0; k < 9; k++)
+        out[k] = v3((float)acc[k][0] * band[k], (float)acc[k][1] * band[k], (float)acc[k][2] * band[k]);
+}
+
+// sh_irradiance on the CPU
+static vec3 pix__sh_eval(const vec3 sh[9], vec3 n) {
+    float b[9] = { 0.282095f, 0.488603f * n.y, 0.488603f * n.z, 0.488603f * n.x, 1.092548f * n.x * n.y,
+                   1.092548f * n.y * n.z, 0.315392f * (3.0f * n.z * n.z - 1.0f), 1.092548f * n.x * n.z,
+                   0.546274f * (n.x * n.x - n.y * n.y) };
+    vec3 s = v3(0, 0, 0);
+    for (int k = 0; k < 9; k++) s = s + sh[k] * b[k];
+    return v3(maxf(s.x, 0.0f), maxf(s.y, 0.0f), maxf(s.z, 0.0f));
+}
+
+// face-local [-1, 1] coordinates to the direction GL samples there (the cube map table)
+static const char* const GLSL_CUBE_FACE = R"(
+uniform int uFace;
+vec3 face_dir(vec2 uv) {
+    vec2 c = uv * 2.0 - 1.0;
+    if (uFace == 0) return normalize(vec3( 1.0, -c.y, -c.x));
+    if (uFace == 1) return normalize(vec3(-1.0, -c.y,  c.x));
+    if (uFace == 2) return normalize(vec3( c.x,  1.0,  c.y));
+    if (uFace == 3) return normalize(vec3( c.x, -1.0, -c.y));
+    if (uFace == 4) return normalize(vec3( c.x, -c.y,  1.0));
+    return normalize(vec3(-c.x, -c.y, -1.0));
+}
+)";
+
+static const char* const FSHDER_EQUIRECT_TO_CUBE = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform sampler2D uEquirect;
+void main() {
+    vec3 d = face_dir(vUV);
+    vec2 uv = vec2(atan(d.z, d.x) / 6.28318530718 + 0.5, acos(clamp(d.y, -1.0, 1.0)) / 3.14159265359);
+    frag = vec4(textureLod(uEquirect, uv, 0.0).rgb, 1.0);
+}
+)";
+
+// Split-sum prefilter (Karis 2013): GGX importance samples around the
+// direction, with N = V = R. Each sample reads the source mip whose texel
+// matches the sample's solid angle (Krivanek & Colbert 2008), so a few dozen
+// samples give a clean result instead of fireflies from the sun.
+static const char* const FSHDER_PREFILTER_GGX = R"(#version 440 core
+in vec2 vUV;
+out vec4 frag;
+uniform samplerCube uSource;
+uniform float uRough;
+uniform float uSourceSize;
+const float PI = 3.14159265359;
+vec2 hammersley(uint i, uint n) {
+    uint b = i;
+    b = (b << 16u) | (b >> 16u);
+    b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
+    b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
+    b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
+    b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
+    return vec2(float(i) / float(n), float(b) * 2.3283064365386963e-10);
+}
+void main() {
+    vec3 n = face_dir(vUV);
+    if (uRough <= 0.0) { frag = vec4(textureLod(uSource, n, 0.0).rgb, 1.0); return; }
+    vec3 up = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tx = normalize(cross(up, n)), ty = cross(n, tx);
+    float a = uRough * uRough, a2 = a * a;
+    float texel = 4.0 * PI / (6.0 * uSourceSize * uSourceSize);
+    const uint COUNT = 128u;
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (uint i = 0u; i < COUNT; i++) {
+        vec2 xi = hammersley(i, COUNT);
+        float phi = 2.0 * PI * xi.x;
+        float cos_t = sqrt((1.0 - xi.y) / (1.0 + (a2 - 1.0) * xi.y));
+        float sin_t = sqrt(1.0 - cos_t * cos_t);
+        vec3 h = tx * (cos(phi) * sin_t) + ty * (sin(phi) * sin_t) + n * cos_t;
+        vec3 l = 2.0 * dot(n, h) * h - n;
+        float ndl = dot(n, l);
+        if (ndl <= 0.0) continue;
+        float d = (cos_t * cos_t * (a2 - 1.0) + 1.0);
+        float pdf = a2 / (PI * d * d) * 0.25;            // D * NoH / (4 VoH), with N = V
+        float omega = 1.0 / (float(COUNT) * pdf + 1e-6);
+        float mip = max(0.5 * log2(omega / texel) + 1.0, 0.0);
+        sum += textureLod(uSource, l, mip).rgb * ndl;
+        weight += ndl;
+    }
+    frag = vec4(sum / max(weight, 1e-4), 1.0);
+}
+)";
+
+static GLuint pix__make_cube(int size, int levels) {
+    GLuint t = 0;
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, t);
+    for (int m = 0; m < levels; m++) {
+        int s = size >> m;
+        for (int f = 0; f < 6; f++)
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, m, GL_RGBA16F, s, s, 0, GL_RGBA, GL_FLOAT, 0);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, levels - 1);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    return t;
+}
+
+bool pix_set_environment(pix_renderer& r, const float* rgb, int w, int h, float intensity) {
+    if (!rgb || w < 4 || h < 2) return false;
+    auto& e = r.environment;
+    if (!e.convert_shader) {
+        const char* chunks[] = { GLSL_CUBE_FACE };
+        char* a = pix_shader_splice(FSHDER_EQUIRECT_TO_CUBE, chunks, 1);
+        char* b = pix_shader_splice(FSHDER_PREFILTER_GGX, chunks, 1);
+        e.convert_shader = a ? opengl_create_shader(VSHDER_POST, a) : 0;
+        e.prefilter_shader = b ? opengl_create_shader(VSHDER_POST, b) : 0;
+        pix_free(a);
+        pix_free(b);
+        if (!e.convert_shader || !e.prefilter_shader) return false;
+    }
+    pix_environment_sh(rgb, w, h, e.sh);
+    e.intensity = intensity;
+
+    // a cube with about the image's detail: a quarter of its width per face, capped
+    int size = 32;
+    while (size * 2 <= w / 4 && size < 512) size *= 2;
+    int levels = 1;
+    while ((size >> levels) >= 8) levels++;   // down to 8 x 8: roughness 1 needs no less
+
+    GLuint equirect = 0;
+    glGenTextures(1, &equirect);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, equirect);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, w, h, 0, GL_RGB, GL_FLOAT, rgb);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    int full = 1;
+    while ((size >> full) >= 1) full++;
+    GLuint source = pix__make_cube(size, full);       // the sharp sky, every mip (for the prefilter)
+    GLuint cube = pix__make_cube(size, levels);       // the result
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+
+    glUseProgram(e.convert_shader);
+    GLint face_u = glGetUniformLocation(e.convert_shader, "uFace");
+    glViewport(0, 0, size, size);
+    for (int f = 0; f < 6; f++) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, source, 0);
+        glUniform1i(face_u, f);
+        pix_draw_fullscreen();
+    }
+    glBindTexture(GL_TEXTURE_CUBE_MAP, source);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+
+    glUseProgram(e.prefilter_shader);
+    face_u = glGetUniformLocation(e.prefilter_shader, "uFace");
+    GLint rough_u = glGetUniformLocation(e.prefilter_shader, "uRough");
+    glUniform1f(glGetUniformLocation(e.prefilter_shader, "uSourceSize"), (float)size);
+    for (int m = 0; m < levels; m++) {
+        glViewport(0, 0, size >> m, size >> m);
+        glUniform1f(rough_u, levels > 1 ? (float)m / (float)(levels - 1) : 0.0f);
+        for (int f = 0; f < 6; f++) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, cube, m);
+            glUniform1i(face_u, f);
+            pix_draw_fullscreen();
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    glDeleteTextures(1, &source);
+    glDeleteTextures(1, &equirect);
+    glEnable(GL_DEPTH_TEST);
+
+    opengl_destroy_texture(e.cube);
+    e.cube = cube;
+    e.size = size;
+    e.max_mip = levels - 1;
+    // toon shading still reads the hemisphere colours: give it the environment's, from above and below
+    r.sky.diffuse_up = pix__sh_eval(e.sh, v3(0, 1, 0)) * intensity;
+    r.sky.diffuse_down = pix__sh_eval(e.sh, v3(0, -1, 0)) * intensity;
+    return true;
+}
+
+bool pix_load_environment(pix_renderer& r, const char* path, float intensity) {
+    int w = 0, h = 0;
+    float* rgb = hdr_load_file(path, &w, &h);
+    if (!rgb) { pix_log("pix: could not load environment '%s' (Radiance .hdr expected)", path); return false; }
+    bool ok = pix_set_environment(r, rgb, w, h, intensity);
+    pix_free(rgb);
+    return ok;
+}
+
+void pix_taa_reset(pix_renderer& r) { r.taa_valid = false; }
+
+void pix_clear_environment(pix_renderer& r) {
+    opengl_destroy_texture(r.environment.cube);
+    r.environment.cube = 0;
 }
 
 idx pix_load_color_lut(const char* path) {

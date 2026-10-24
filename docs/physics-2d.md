@@ -58,8 +58,21 @@ mouse. Build it with `build physics_2d run`.
 | `phys2d_box(width, height)` | a box that rotates when knocked over |
 | `phys2d_aabb(width, height)` | a box that never rotates: tiles, platforms, simple characters |
 | `phys2d_capsule(radius, height)` | an upright pill shape, `height` from top to bottom. The usual shape for a character |
+| `phys2d_polygon(points, count, radius)` | any convex outline: triangles, hexagons, ramps, rocks |
 
 Sizes are full widths and heights. A body's `position` is its centre.
+
+`phys2d_polygon` takes any points in any order and keeps their convex hull,
+at most 8 corners (for more, the ones that matter least are dropped).
+`radius` rounds the corners. The polygon is centred on its centre of mass;
+`shape.offset` is where that was among your points, for drawing a sprite
+that lines up:
+
+```cpp
+vec2 tri[3] = { v2(0, -30), v2(30, 20), v2(-30, 20) };
+phys2d_shape wedge = phys2d_polygon(tri, 3);
+idx id = phys2d_add(world, PHYS2D_DYNAMIC, wedge, v2(300, 100));
+```
 
 ## Body types
 
@@ -469,8 +482,9 @@ boxes, capsules) settling in one pile, plus 2000 static tiles, take about
 Define them before including pix to change them. Contacts and events grow
 as needed.
 
-Not done yet: threading, polygon shapes other than boxes, one-way
-platforms, and joint motors on distance joints.
+Not done yet: threading, several shapes on one body (compounds), the wheel,
+motor, gear and pulley joints the 3D world has, a character controller like
+the 3D one, one-way platforms, and joint motors on distance joints.
 
 ## Reference
 

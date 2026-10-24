@@ -255,6 +255,11 @@ idx hero_mat = pix_add_material(pix_get_renderer(), m);
 | `toon_bands` | 3 | how many light steps cartoon shading has, 2..5 |
 | `rim` | 0 | brightness of an outline glow at the edges of the object |
 | `toon_specular` | 0 | size of a hard cartoon highlight; about 0.3 is typical |
+| `normal_map` | 0 | a texture of surface bumps (tangent-space normals, green up): detail without extra triangles |
+| `normal_scale` | 1 | how strong the bumps are |
+| `orm_map` | 0 | red = occlusion, green = roughness, blue = metallic (the glTF packing); multiplies those fields |
+| `occlusion` | 1 | how much of the map's occlusion darkens the surface |
+| `emissive_map` | 0 | multiplies `emissive`: glowing windows, screens, eyes |
 | `planar_reflection`, `refraction` | 0 | mirror and glass effects; see `examples/reflections.cpp` |
 | `shader`, `textures[4]`, `params0/1` | | custom shaders; see `examples/pipeline.cpp` |
 
@@ -298,6 +303,16 @@ pix_draw_model(house, mat4_translate(10, 0, 0) * mat4_scale(s, s, s));
 
 You can replace the model's material with your own:
 `pix_draw_mesh(house.mesh, my_material, transform)`.
+
+A glTF model brings its whole metal/rough material: colour, normal map,
+roughness/metallic/occlusion and emissive maps (PNG textures; other image
+formats are skipped), and its metallic, roughness and emissive values.
+
+When a model is no longer needed - leaving a level, say -
+`pix_unload_model(house)` frees its mesh, material, textures and animations.
+The space it used in the GPU buffers is reused by the next load. The lower
+level calls are `pix_unload_mesh(r, mesh)`, `pix_unload_material(r, material)`
+and, for sounds, `pix_unload_sound(id)`.
 
 ### Animated characters
 
@@ -405,6 +420,45 @@ for (int i = 0; i < 40; i++) {
 }
 ```
 
+## Billboards and 3D text
+
+Pictures and text standing in the world: trees far away, health bars, names
+over heads, damage numbers, signs. They are not lit (fog still applies).
+
+```cpp
+pix_draw_billboard(tree_tex, v3(10, 2, 0), 4.0f);                         // 4 m tall, turns to face you
+pix_draw_billboard(tree_tex, pos, 4.0f, PIX_WHITE, PIX_FACE_UPRIGHT, true); // turns about y only, hard edges
+pix_draw_text3d("Bob", head + v3(0, 0.4f, 0), 0.25f, PIX_WHITE);          // 25 cm tall letters, centred
+pix_draw_text3d_fixed("EXIT", wall_transform, 0.5f, PIX_GREEN);            // written on a wall
+```
+
+| facing | |
+|---|---|
+| `PIX_FACE_CAMERA` | square to the camera: labels, particles, effects |
+| `PIX_FACE_UPRIGHT` | turns about the vertical only: trees and characters as sprites |
+| `PIX_FACE_FIXED` | stays on its own axes (`pix_draw_text3d_fixed`) |
+
+The last argument, `cutout`, draws hard-edged pictures (leaves with clear
+gaps) in the opaque pass, where they need no sorting and hide what is behind
+them. Without it they are blended and sorted back to front. For a frame of
+an atlas, `pix_draw_billboard_pro(tex, src_rect, pos, size, origin, ...)`;
+`origin (0.5, 0)` hangs it from its bottom centre.
+
+## Levels of detail
+
+A mesh can carry simpler stand-ins that pix swaps in by itself as it gets
+smaller on screen. You keep drawing the full mesh:
+
+```cpp
+pix_generate_mesh_lods(pix_get_renderer(), rock.mesh);   // once: 3 simpler versions, by simplification
+// or your own: pix_set_mesh_lods(r, base, lods, screen_sizes, count)
+```
+
+The change happens over a short distance as a fine dither between the two
+versions, so it does not pop. `r.lod_band` sets that distance (0.2; 0 = a hard
+switch) and `r.lod_bias` trades detail for speed (above 1 keeps detail
+longer). Shadows and reflections use the same choice as the main view.
+
 ## Tinting instances
 
 Every draw call takes an optional **tint** colour that multiplies the
@@ -432,8 +486,44 @@ on weak laptops.
 |---|---|---|---|---|
 | shadow resolution | 1024 | 1536 | 2048 | 4096 |
 | shadow softness | 0 (hard) | 1 | 1 | 2 (softest) |
-| bloom, FXAA | off | on | on | on |
+| bloom | off | on | on | on |
+| temporal anti-aliasing | off | on | on | on |
 | reflection probe | off | off | 128 px | 256 px |
+
+### Anti-aliasing
+
+Temporal AA (`r.aa.taa`, on by default) moves the camera by a fraction of a
+pixel every frame and blends the frames: smooth edges, steady thin wires and
+highlights, for the price of one pass. Things that move by themselves stay
+sharp when you give them a `motion_id` - any number of yours, the same every
+frame:
+
+```cpp
+pix_draw_model(car, car_transform, PIX_WHITE, /*motion_id*/ 1);
+```
+
+Without one they still look right at ordinary speeds; very fast objects can
+leave a faint trail. After a camera cut, `pix_taa_reset(r)` stops the old view
+blending into the new. `r.aa.taa_feedback` (0.9) is how much of the past each
+frame keeps.
+
+`r.aa.msaa = 4` renders the main view with 4 samples per pixel instead (or
+as well): sharp, no blending over time, more memory and fill rate.
+`r.post.fxaa` is the cheapest option of all.
+
+### A real sky: HDR environments
+
+An HDR panorama (a Radiance `.hdr` file, the format sites like Poly Haven
+offer) can light the whole scene:
+
+```cpp
+pix_load_environment(pix_get_renderer(), "assets/sky/meadow.hdr");   // once
+```
+
+It becomes the sky behind everything, the reflections in shiny surfaces
+(blurrier on rougher ones) and the soft light from all around. The sun still
+adds its light and shadows on top: set it to match the panorama's sun with
+`pix_set_sun`. `pix_clear_environment(r)` goes back to the built-in sky.
 
 ### Shadows
 
@@ -591,6 +681,15 @@ Default limits, which you can raise by defining them before including pix:
 | `PIX_MAX_MESHES`, `PIX_MAX_MATERIALS` | 8192 each |
 | `PIX_MAX_PARTICLES` | 16384 per frame |
 | `PIX_MAX_LINES` | 32768 debug lines per frame |
+| `PIX_MAX_QUADS` | 16384 billboards and 3D-text letters per frame |
+
+## Screenshots
+
+```cpp
+if (pix_key_pressed(KEY_F12)) pix_screenshot("shot.png");
+```
+
+saves the frame exactly as shown, 2D on top included, when it is presented.
 
 ## Going further
 
@@ -613,8 +712,12 @@ These are covered by the examples for now:
 |---|---|
 | `pix_begin_3d(camera& cam)` | start the 3D frame |
 | `pix_end_3d()` | render it to the window |
-| `pix_draw_mesh(mesh, material, transform, tint = WHITE)` | |
-| `pix_draw_model(model, transform, tint = WHITE)` | |
+| `pix_draw_mesh(mesh, material, transform, tint = WHITE, motion_id = 0)` | |
+| `pix_draw_model(model, transform, tint = WHITE, motion_id = 0)` | |
+| `pix_unload_model(model)`, `pix_unload_sound(id)` | free what a level no longer needs |
+| `pix_draw_billboard(tex, pos, height, tint, facing, cutout)`, `pix_draw_billboard_pro(...)` | pictures in the world |
+| `pix_draw_text3d(text, pos, height, color, facing)`, `pix_draw_text3d_fixed(text, transform, height, color)` | text in the world |
+| `pix_screenshot(path)` | saves this frame as a PNG |
 | `pix_draw_model_animated(model, pose, transform, tint = WHITE)` | `pose` (usually `anim.pose`) must stay alive until `pix_end_3d` |
 | `pix_draw_line3d(a, b, color)` | |
 | `pix_draw_bounds(min, max, color)` | |
@@ -636,6 +739,10 @@ These are covered by the examples for now:
 | function | |
 |---|---|
 | `pix_get_material(r, id)` | pointer to edit a material |
+| `pix_unload_mesh(r, id)`, `pix_unload_material(r, id)` | |
+| `pix_generate_mesh_lods(r, mesh, levels, ratio)`, `pix_set_mesh_lods(r, base, lods, screen, count)` | levels of detail |
+| `pix_load_environment(r, path, intensity)`, `pix_set_environment(r, rgb, w, h, intensity)`, `pix_clear_environment(r)` | HDR sky and lighting |
+| `pix_taa_reset(r)` | after a camera cut |
 | `pix_material_default()`, `pix_add_material(r, m)` | build a material field by field |
 | `pix_material_glass/mirror/water/water_toon(...)` | ready-made materials |
 | `load_mesh_data(r, vertices, vertex_count, indices, index_count)` | upload your own mesh |

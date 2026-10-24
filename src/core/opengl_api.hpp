@@ -178,6 +178,7 @@ typedef void  (APIENTRY* PFN_glGenRenderbuffers)(GLsizei, GLuint*);
 typedef void  (APIENTRY* PFN_glBindRenderbuffer)(GLenum, GLuint);
 typedef void  (APIENTRY* PFN_glDeleteRenderbuffers)(GLsizei, const GLuint*);
 typedef void  (APIENTRY* PFN_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+typedef void  (APIENTRY* PFN_glRenderbufferStorageMultisample)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
 typedef void  (APIENTRY* PFN_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
 typedef void  (APIENTRY* PFN_glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
 typedef void  (APIENTRY* PFN_glDeleteBuffers)(GLsizei, const GLuint*);
@@ -235,6 +236,7 @@ typedef void  (APIENTRY* PFN_glCopyImageSubData)(GLuint, GLenum, GLint, GLint, G
     E(glGenFramebuffers) E(glBindFramebuffer) E(glDeleteFramebuffers) E(glFramebufferTexture2D) \
     E(glCheckFramebufferStatus) E(glGenRenderbuffers) E(glBindRenderbuffer) \
     E(glDeleteRenderbuffers) E(glRenderbufferStorage) E(glFramebufferRenderbuffer) \
+    E(glRenderbufferStorageMultisample) \
     E(glBlitFramebuffer) E(glDeleteBuffers) E(glDeleteVertexArrays) \
     E(glDrawElementsInstancedBaseVertexBaseInstance) \
     E(glGenQueries) E(glDeleteQueries) E(glBeginQuery) E(glEndQuery) \

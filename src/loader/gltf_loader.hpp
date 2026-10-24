@@ -35,6 +35,12 @@ struct gltf_result {
     size_t                    clip_count;
     image_file_data           image; // .data == 0 when absent or not decodable
     bool                      image_is_palette; // sample it with NEAREST, not LINEAR
+    // base colour factor and metal/rough factors and maps (pbr's image indices are unused here: the
+    // images themselves are below, .data == 0 when absent)
+    pbr_file_data             pbr;
+    image_file_data           normal_image;
+    image_file_data           orm_image;        // r occlusion, g roughness, b metallic
+    image_file_data           emissive_image;
     // The world translation an `only_node` load re-based the geometry off.
     // Zero otherwise. See model_file_data::node_offset for what wants it.
     vec3                      node_offset;
@@ -424,10 +430,19 @@ static vec3 gltf__base_color(const gltf_file& g, int mat_index) {
               js_float(d, js_at(d, f, 2), 1.0f));
 }
 
-static int gltf__base_color_texture(const gltf_file& g, int mat_index) {
-    const js_doc& d = g.json;
-    int pbr = js_get(d, gltf__material(g, mat_index), "pbrMetallicRoughness");
-    return js_int(d, js_get(d, js_get(d, pbr, "baseColorTexture"), "index"), -1);
+static int gltf__texture_of(const gltf_file& g, int holder, const char* name) {
+    return js_int(g.json, js_get(g.json, js_get(g.json, holder, name), "index"), -1);
+}
+
+static bool gltf__has_texture(const gltf_file& g, int mat_index) {
+    int m = gltf__material(g, mat_index);
+    if (m < 0) return false;
+    int pbr = js_get(g.json, m, "pbrMetallicRoughness");
+    return gltf__texture_of(g, pbr, "baseColorTexture") >= 0
+        || gltf__texture_of(g, pbr, "metallicRoughnessTexture") >= 0
+        || gltf__texture_of(g, m, "normalTexture") >= 0
+        || gltf__texture_of(g, m, "occlusionTexture") >= 0
+        || gltf__texture_of(g, m, "emissiveTexture") >= 0;
 }
 
 struct gltf__palette {
@@ -471,6 +486,56 @@ static void gltf__palette_pixels(const gltf__palette& p, unsigned char* rgba) {
             rgba[i * 4 + k] = (unsigned char)(q < 0 ? 0 : (q > 255 ? 255 : q));
         }
         rgba[i * 4 + 3] = 255;
+    }
+}
+
+// Decodes texture `tex_index` (embedded or an external file next to `path`)
+// into `out`; leaves it empty for a missing texture or one that is not a png.
+static void gltf__decode_texture(mem_arena& arena, const gltf_file& g, const char* path, int tex_index,
+                                 image_file_data* out) {
+    const js_doc& d = g.json;
+    if (tex_index < 0) return;
+    int tex = js_at(d, js_get(d, g.root, "textures"), tex_index);
+    int img_index = js_int(d, js_get(d, tex, "source"), -1);
+    int img = js_at(d, js_get(d, g.root, "images"), img_index);
+    if (img < 0) return;
+    const unsigned char* bytes = 0;
+    size_t nbytes = 0;
+    int bv_index = js_int(d, js_get(d, img, "bufferView"), -1);
+    if (bv_index >= 0) {
+        int bv = js_at(d, js_get(d, g.root, "bufferViews"), bv_index);
+        size_t off = (size_t)js_int(d, js_get(d, bv, "byteOffset"), 0);
+        size_t len = (size_t)js_int(d, js_get(d, bv, "byteLength"), 0);
+        if (off + len <= g.bin_size) { bytes = g.bin + off; nbytes = len; }
+    } else {
+        int uri = js_get(d, img, "uri");
+        char name[260];
+        js_str(d, uri, name, sizeof(name));
+        if (name[0] && strncmp(name, "data:", 5) != 0) {
+            char dir[260];
+            strncpy(dir, path, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char* slash = strrchr(dir, '/');
+            char* back = strrchr(dir, '\\');
+            if (back > slash) slash = back;
+            if (slash) slash[1] = 0; else dir[0] = 0;
+            char full[520];
+            snprintf(full, sizeof(full), "%s%s", dir, name);
+            size_t n = 0;
+            bytes = gltf__read_whole(arena, full, &n);
+            nbytes = n;
+        }
+    }
+    // sniff rather than trust mimeType; jpeg and friends are simply skipped
+    static const unsigned char png_sig[8] = { 137,80,78,71,13,10,26,10 };
+    if (bytes && nbytes > 8 && memcmp(bytes, png_sig, 8) == 0) {
+        png_result png = {};
+        if (png_load_memory(arena, bytes, nbytes, &png)) {
+            out->width   = png.width;
+            out->height  = png.height;
+            out->channel = png.channels;
+            out->data    = (char*)png.pixels;
+        }
     }
 }
 
@@ -526,6 +591,14 @@ bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
                            const int* skip_nodes, int skip_count) {
     *out = gltf_result();
     out->skeleton.root_transform = mat4_identity();
+    // what a material that says nothing means (glTF's own defaults, except
+    // metal/rough: a model with no material at all is a dull dielectric)
+    out->pbr.base_color = v3(1.0f, 1.0f, 1.0f);
+    out->pbr.normal_image = out->pbr.orm_image = out->pbr.emissive_image = -1;
+    out->pbr.metallic = 0.0f;
+    out->pbr.roughness = 0.6f;
+    out->pbr.normal_scale = 1.0f;
+    out->pbr.occlusion_strength = 1.0f;
 
     gltf_file g;
     if (!gltf__open(arena, path, &g)) return false;
@@ -677,7 +750,8 @@ bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
             int idx_acc = js_int(d, js_get(d, prim, "indices"), -1);
             total_verts += vc;
             total_inds  += (idx_acc >= 0) ? gltf__accessor_count(g, idx_acc) : vc;
-            if (gltf__base_color_texture(g, js_int(d, js_get(d, prim, "material"), -1)) >= 0)
+            // any map at all needs the real uvs, which the palette would overwrite
+            if (gltf__has_texture(g, js_int(d, js_get(d, prim, "material"), -1)))
                 any_texture = true;
         }
     }
@@ -772,6 +846,15 @@ bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
                     }
                     verts[vbase + i].normal = n;
                 }
+
+            int tan_acc = js_int(d, js_get(d, attrs, "TANGENT"), -1);
+            if (tan_acc >= 0 && gltf_read_floats(g, tan_acc, tmp3, 4) == vc)
+                for (size_t i = 0; i < vc; i++) {
+                    vec3 t = v3(tmp3[i * 4], tmp3[i * 4 + 1], tmp3[i * 4 + 2]);
+                    if (bake_place) t = v3norm(mat4_mul_dir(place, t));   // tangents follow the surface
+                    verts[vbase + i].tangent = v4(t.x, t.y, t.z, tmp3[i * 4 + 3] < 0.0f ? -1.0f : 1.0f);
+                }
+            // (left zero otherwise: the renderer derives them at load)
 
             int mat_index = js_int(d, js_get(d, prim, "material"), -1);
             if (use_palette) {
@@ -974,63 +1057,81 @@ bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
         }
     }
 
-    // ---- base colour texture, if it is a png we can decode ----
+    // ---- textures, if they are pngs we can decode ----
     if (use_palette) return true;    // the generated palette above is the texture
 
-    int tex_index = -1;
-    if (only_material >= 0) {
-        tex_index = gltf__base_color_texture(g, only_material);
-    } else {
+    int mat_index = only_material;
+    if (mat_index < 0) {
         // No material was asked for, so the first primitive's is as good a
         // guess as there is - and is exactly right for the single-material
         // files that are most of this project's art.
         int mesh0 = js_at(d, js_get(d, g.root, "meshes"),
                           js_int(d, js_get(d, gltf__node(g, mesh_nodes[0]), "mesh"), -1));
         int prim0 = js_at(d, js_get(d, mesh0, "primitives"), 0);
-        tex_index = gltf__base_color_texture(g, js_int(d, js_get(d, prim0, "material"), -1));
+        mat_index = js_int(d, js_get(d, prim0, "material"), -1);
     }
-    int tex = js_at(d, js_get(d, g.root, "textures"), tex_index);
-    int img_index = js_int(d, js_get(d, tex, "source"), -1);
-    int img = js_at(d, js_get(d, g.root, "images"), img_index);
-    if (img >= 0) {
-        const unsigned char* bytes = 0;
-        size_t nbytes = 0;
-        int bv_index = js_int(d, js_get(d, img, "bufferView"), -1);
-        if (bv_index >= 0) {
-            int bv = js_at(d, js_get(d, g.root, "bufferViews"), bv_index);
-            size_t off = (size_t)js_int(d, js_get(d, bv, "byteOffset"), 0);
-            size_t len = (size_t)js_int(d, js_get(d, bv, "byteLength"), 0);
-            if (off + len <= g.bin_size) { bytes = g.bin + off; nbytes = len; }
-        } else {
-            int uri = js_get(d, img, "uri");
-            char name[260];
-            js_str(d, uri, name, sizeof(name));
-            if (name[0] && strncmp(name, "data:", 5) != 0) {
-                char dir[260];
-                strncpy(dir, path, sizeof(dir) - 1);
-                dir[sizeof(dir) - 1] = 0;
-                char* slash = strrchr(dir, '/');
-                char* back = strrchr(dir, '\\');
-                if (back > slash) slash = back;
-                if (slash) slash[1] = 0; else dir[0] = 0;
-                char full[520];
-                snprintf(full, sizeof(full), "%s%s", dir, name);
-                size_t n = 0;
-                bytes = gltf__read_whole(arena, full, &n);
-                nbytes = n;
+    int mat = gltf__material(g, mat_index);
+    int pbr = js_get(d, mat, "pbrMetallicRoughness");
+    pbr_file_data& p = out->pbr;
+    p.base_color = gltf__base_color(g, mat_index);
+    gltf__decode_texture(arena, g, path, gltf__texture_of(g, pbr, "baseColorTexture"), &out->image);
+    if (!out->image.data) {
+        // Maps but no colour texture (a rock with only a normal map): the colour
+        // goes into a small image, as the palette would have done, so callers
+        // that only look at `image` still get it.
+        unsigned char* px = allocate<unsigned char>(arena, 4 * 4 * 4);
+        if (px) {
+            const float* c = &p.base_color.x;
+            for (int i = 0; i < 16; i++) {
+                for (int k = 0; k < 3; k++)
+                    px[i * 4 + k] = (unsigned char)(clampf(powf(c[k], 1.0f / 2.2f), 0.0f, 1.0f) * 255.0f + 0.5f);
+                px[i * 4 + 3] = 255;
             }
+            out->image.width = out->image.height = 4;
+            out->image.channel = 4;
+            out->image.data = (char*)px;
+            p.base_color = v3(1.0f, 1.0f, 1.0f);
         }
-        // sniff rather than trust mimeType; jpeg and friends are simply skipped
-        static const unsigned char png_sig[8] = { 137,80,78,71,13,10,26,10 };
-        if (bytes && nbytes > 8 && memcmp(bytes, png_sig, 8) == 0) {
-            png_result png = {};
-            if (png_load_memory(arena, bytes, nbytes, &png)) {
-                out->image.width   = png.width;
-                out->image.height  = png.height;
-                out->image.channel = png.channels;
-                out->image.data    = (char*)png.pixels;
-            }
+    }
+
+    // the rest of the metal/rough material
+    p.normal_image = p.orm_image = p.emissive_image = -1;
+    p.metallic  = js_float(d, js_get(d, pbr, "metallicFactor"), 1.0f);
+    p.roughness = js_float(d, js_get(d, pbr, "roughnessFactor"), 1.0f);
+    int nt = js_get(d, mat, "normalTexture"), ot = js_get(d, mat, "occlusionTexture");
+    p.normal_scale = js_float(d, js_get(d, nt, "scale"), 1.0f);
+    p.occlusion_strength = js_float(d, js_get(d, ot, "strength"), 1.0f);
+    int ef = js_get(d, mat, "emissiveFactor");
+    p.emissive = v3(js_float(d, js_at(d, ef, 0), 0.0f), js_float(d, js_at(d, ef, 1), 0.0f),
+                    js_float(d, js_at(d, ef, 2), 0.0f));
+    gltf__decode_texture(arena, g, path, gltf__texture_of(g, mat, "normalTexture"), &out->normal_image);
+    gltf__decode_texture(arena, g, path, gltf__texture_of(g, mat, "emissiveTexture"), &out->emissive_image);
+
+    // occlusion and metal/rough share one texture in the renderer (r occlusion,
+    // g roughness, b metallic). Most exporters already pack them like that; a
+    // separate occlusion image is merged into the red channel here.
+    int mr_tex = gltf__texture_of(g, pbr, "metallicRoughnessTexture");
+    int occ_tex = gltf__texture_of(g, mat, "occlusionTexture");
+    image_file_data mr = {}, occ = {};
+    gltf__decode_texture(arena, g, path, mr_tex, &mr);
+    if (occ_tex >= 0 && occ_tex != mr_tex) gltf__decode_texture(arena, g, path, occ_tex, &occ);
+    if (mr.data || occ.data) {
+        image_file_data& orm = mr.data ? mr : occ;
+        unsigned char* px = (unsigned char*)orm.data;
+        size_t n = (size_t)orm.width * orm.height;
+        if (!mr.data) {
+            for (size_t i = 0; i < n; i++) { px[i * 4 + 1] = 255; px[i * 4 + 2] = 255; }   // factors alone
+        } else if (occ.data) {
+            const unsigned char* o = (const unsigned char*)occ.data;
+            for (int y = 0; y < orm.height; y++)   // nearest, in case the two differ in size
+                for (int x = 0; x < orm.width; x++) {
+                    int ox = x * occ.width / orm.width, oy = y * occ.height / orm.height;
+                    px[((size_t)y * orm.width + x) * 4] = o[((size_t)oy * occ.width + ox) * 4];
+                }
+        } else if (occ_tex != mr_tex) {
+            for (size_t i = 0; i < n; i++) px[i * 4] = 255;   // glTF leaves red undefined here
         }
+        out->orm_image = orm;
     }
     return true;
 }

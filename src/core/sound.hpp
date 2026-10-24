@@ -46,7 +46,6 @@ struct sound_voice {
 
 struct pix_audio {
     pix_audio_device device;
-    mem_arena arena;
 
     sound  sounds[MAX_SOUNDS];
     size_t sound_count;
@@ -58,7 +57,7 @@ struct pix_audio {
     float  scratch[PIX_AUDIO_FRAMES * PIX_AUDIO_CHANNELS];
 };
 
-PIXDEF bool pix_create_audio(pix_audio& audio, size_t capacity = 512 * MB);
+PIXDEF bool pix_create_audio(pix_audio& audio);
 PIXDEF void pix_destroy_audio(pix_audio& audio);
 
 // takes ownership of a copy, mirroring how load_mesh copies onto the GPU: the
@@ -66,6 +65,8 @@ PIXDEF void pix_destroy_audio(pix_audio& audio);
 PIXDEF idx load_sound(pix_audio& audio, const sound_file_data& data);
 // takes a copy of `samples`, so callers can build sounds on the stack
 PIXDEF idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate);
+// stops every voice playing it and frees the samples; the id may be reused
+PIXDEF void unload_sound(pix_audio& audio, idx sound_id);
 
 PIXDEF idx  play_sound(pix_audio& audio, idx sound_id, float volume = 1.0f,
                        float pitch = 1.0f, bool loop = false, float pan = 0.0f);
@@ -103,12 +104,9 @@ static void snd__device_fill(int16_t* frames, size_t count, void* user) {
     pix_audio_mix(*(pix_audio*)user, frames, count);
 }
 
-bool pix_create_audio(pix_audio& audio, size_t capacity) {
+bool pix_create_audio(pix_audio& audio) {
     audio = pix_audio();
     audio.master_volume = 1.0f;
-    // address space only; pages are committed as sounds are loaded into it
-    audio.arena = pix_arena_create(capacity);
-    if (!audio.arena.data) return false;
     InitializeCriticalSection(&audio.lock);
 
     // a missing or busy device is not fatal: sounds still load and play into
@@ -120,23 +118,38 @@ bool pix_create_audio(pix_audio& audio, size_t capacity) {
 void pix_destroy_audio(pix_audio& audio) {
     pix_close_audio(audio.device);       // stop the thread before freeing anything it reads
     DeleteCriticalSection(&audio.lock);
-    pix_arena_destroy(audio.arena);
+    for (size_t i = 0; i < audio.sound_count; i++) pix_free(audio.sounds[i].samples);
     audio.device_ok = false;
 }
 
 idx create_sound(pix_audio& audio, const int16_t* samples, size_t frames, int channels, int rate) {
-    if (audio.sound_count >= MAX_SOUNDS || !frames || channels < 1 || channels > 2) return SOUND_INVALID;
-    int16_t* copy = allocate<int16_t>(audio.arena, frames * (size_t)channels);
+    if (!frames || channels < 1 || channels > 2) return SOUND_INVALID;
+    // an unloaded slot first, then a new one
+    idx id = SOUND_INVALID;
+    for (size_t i = 0; i < audio.sound_count; i++) if (!audio.sounds[i].samples) { id = (idx)i; break; }
+    if (id == SOUND_INVALID && audio.sound_count >= MAX_SOUNDS) return SOUND_INVALID;
+    int16_t* copy = pix_new<int16_t>(frames * (size_t)channels);
     if (!copy) return SOUND_INVALID;
     memcpy(copy, samples, frames * (size_t)channels * sizeof(int16_t));
 
-    idx id = (idx)audio.sound_count++;
+    if (id == SOUND_INVALID) id = (idx)audio.sound_count++;
     sound& s = audio.sounds[id];
     s.samples     = copy;
     s.frame_count = frames;
     s.channels    = channels;
     s.rate        = rate > 0 ? rate : PIX_AUDIO_RATE;
     return id;
+}
+
+void unload_sound(pix_audio& audio, idx sound_id) {
+    if (sound_id >= audio.sound_count) return;
+    EnterCriticalSection(&audio.lock);   // the mixer may be reading the samples right now
+    for (int i = 0; i < MAX_VOICES; i++)
+        if (audio.voices[i].sound == sound_id) audio.voices[i].active = false;
+    sound& s = audio.sounds[sound_id];
+    pix_free(s.samples);
+    s = sound();
+    LeaveCriticalSection(&audio.lock);
 }
 
 // ---- playback ----

@@ -36,6 +36,7 @@ static void scoped_job(void* user, size_t begin, size_t end, int worker) {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);   // a hang still shows how far it got
     contact3 c;
 
     // ---- sphere / sphere ----
@@ -1525,6 +1526,505 @@ int main() {
         check(tt->sleeping, "p3d a 12-box stack settles and sleeps");
         check(fabsf(tt->position.x - 20) < 0.02f && fabsf(tt->position.z) < 0.02f, "p3d the 12-box stack stays straight");
         phys3d_destroy_world(w);
+    }
+
+    // ---- 3D convex hulls and compounds ----
+    {
+        // a 2 m cube's corners plus points inside it: 8 corners, 6 faces, 12 edges
+        vec3 pts[40];
+        int n = 0;
+        for (int i = 0; i < 8; i++) pts[n++] = v3((i & 1) ? 1.0f : -1.0f, (i & 2) ? 1.0f : -1.0f, (i & 4) ? 1.0f : -1.0f) + v3(5, 0, 0);
+        rng rr = rng_seed(7);
+        while (n < 40) pts[n++] = v3(rng_range(rr, -0.9f, 0.9f), rng_range(rr, -0.9f, 0.9f), rng_range(rr, -0.9f, 0.9f)) + v3(5, 0, 0);
+        phys3d_hull cube;
+        check(phys3d_create_hull(cube, pts, n), "hull of a cube's points");
+        check(cube.vertex_count == 8 && cube.face_count == 6 && cube.edge_count == 12, "hull cube: 8 corners, 6 faces, 12 edges");
+        near_eq(cube.volume, 8.0f, 1e-3f, "hull cube volume");
+        near_eq(cube.offset.x, 5.0f, 1e-4f, "hull centred: offset is where the centre was");
+        near_eq(cube.inertia.data[0], 8.0f * 8.0f / 12.0f, 1e-2f, "hull cube inertia (m (a^2 + b^2) / 12)");
+        near_eq(cube.inertia.data[1], 0.0f, 1e-3f, "hull cube has no products of inertia");
+
+        // points on a sphere: Euler's V - E + F = 2 holds for whatever comes out
+        vec3 ball[200];
+        for (int i = 0; i < 200; i++) {
+            vec3 d = v3(rng_range(rr, -1, 1), rng_range(rr, -1, 1), rng_range(rr, -1, 1));
+            ball[i] = v3norm(d) * 0.5f;
+        }
+        phys3d_hull round;
+        check(phys3d_create_hull(round, ball, 200), "hull of points on a sphere");
+        check(round.vertex_count - round.edge_count + round.face_count == 2, "hull topology: V - E + F = 2");
+        bool convex = true;
+        for (int f = 0; f < round.face_count; f++)
+            for (int i = 0; i < round.vertex_count; i++)
+                if (v3dot(v3(round.planes[f].x, round.planes[f].y, round.planes[f].z), round.vertices[i]) > round.planes[f].w + 1e-4f) convex = false;
+        check(convex, "hull: every corner behind every face");
+        vec3 flat[4] = { v3(0, 0, 0), v3(1, 0, 0), v3(0, 0, 1), v3(1, 0, 1) };
+        phys3d_hull none;
+        check(!phys3d_create_hull(none, flat, 4), "hull of flat points is refused");
+
+        phys3d_world w;
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        idx h1 = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_hull_shape(cube), v3(0, 3, 0));
+        phys3d_body* hb = phys3d_get_body(w, h1);
+        hb->rotation = quat_from_euler(0.3f, 0.2f, 0.4f);
+        // a stack of hull cubes and one hull cube on a box
+        idx stack[6];
+        for (int i = 0; i < 6; i++) stack[i] = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_hull_shape(cube), v3(10, 1.0f + i * 2.0f, 0));
+        idx base = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(3, 1, 3)), v3(-10, 0.5f, 0));
+        idx on_box = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_hull_shape(cube), v3(-10, 2.5f, 0));
+        // a dumbbell: two balls on a bar
+        phys3d_compound_child parts[3] = {
+            phys3d_child(phys3d_sphere(0.5f), v3(-1, 0, 0)), phys3d_child(phys3d_sphere(0.5f), v3(1, 0, 0)),
+            phys3d_child(phys3d_capsule(0.1f, 2.0f), v3(0, 0, 0), quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.5f)) };
+        phys3d_compound bell;
+        check(phys3d_create_compound(bell, parts, 3), "compound dumbbell");
+        near_eq(bell.offset.x, 0.0f, 1e-4f, "symmetric compound: centre of mass in the middle");
+        check(bell.inertia.data[4] > bell.inertia.data[0] * 5.0f, "dumbbell: hard to spin end over end, easy about its bar");
+        idx db = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_compound_shape(bell), v3(0, 2, 6));
+        for (int i = 0; i < 400; i++) phys3d_step(w, 1.0f / 60.0f);
+        hb = phys3d_get_body(w, h1);
+        printf("info  hull cube rests at y %.3f (1.0), asleep %d\n", hb->position.y, hb->sleeping);
+        near_eq(hb->position.y, 1.0f, 0.02f, "hull cube rests on a face on the plane");
+        check(hb->sleeping, "hull cube falls asleep");
+        phys3d_body* top = phys3d_get_body(w, stack[5]);
+        printf("info  hull stack top at %.3f %.3f %.3f\n", top->position.x, top->position.y, top->position.z);
+        check(fabsf(top->position.x - 10.0f) < 0.05f && fabsf(top->position.y - 11.0f) < 0.1f, "6 hull cubes stack straight");
+        near_eq(phys3d_get_body(w, on_box)->position.y, 2.0f, 0.03f, "hull cube rests on a box");
+        phys3d_body* bb = phys3d_get_body(w, db);
+        printf("info  dumbbell at y %.3f (0.5)\n", bb->position.y);
+        near_eq(bb->position.y, 0.5f, 0.03f, "dumbbell lies on both balls");
+        (void)base;
+
+        // rays: the hull's face, a compound's part
+        phys3d_ray_hit rh;
+        check(phys3d_raycast(w, v3(0, 10, 0), v3(0, -1, 0), 20.0f, &rh) && rh.body == h1, "ray hits the hull");
+        near_eq(rh.point.y, 2.0f, 0.03f, "ray stops on the hull's top face");
+        check(phys3d_raycast(w, v3(bb->position.x + 1.0f, 10, bb->position.z), v3(0, -1, 0), 20.0f, &rh) && rh.body == db,
+              "ray hits a compound's ball");
+
+        // a hull on a triangle mesh
+        vec3 gv[4] = { v3(-5, 0, -5), v3(5, 0, -5), v3(5, 0, 5), v3(-5, 0, 5) };
+        uint32_t gi[6] = { 0, 2, 1, 0, 3, 2 };
+        phys3d_mesh ground;
+        phys3d_create_mesh(ground, gv, 4, gi, 6);
+        phys3d_world w2;
+        phys3d_create_world(w2);
+        phys3d_add(w2, PHYS3D_STATIC, phys3d_mesh_shape(ground), v3(0, 0, 0));
+        idx hm = phys3d_add(w2, PHYS3D_DYNAMIC, phys3d_hull_shape(round), v3(0, 2, 0));
+        idx cm = phys3d_add(w2, PHYS3D_DYNAMIC, phys3d_compound_shape(bell), v3(2, 2, 2));
+        for (int i = 0; i < 300; i++) phys3d_step(w2, 1.0f / 60.0f);
+        printf("info  round hull on mesh at y %.3f, dumbbell %.3f\n", phys3d_get_body(w2, hm)->position.y, phys3d_get_body(w2, cm)->position.y);
+        check(phys3d_get_body(w2, hm)->position.y > 0.4f && phys3d_get_body(w2, hm)->position.y < 0.55f, "round hull rests on a mesh");
+        near_eq(phys3d_get_body(w2, cm)->position.y, 0.5f, 0.03f, "compound rests on a mesh");
+        phys3d_destroy_world(w2);
+        phys3d_destroy_mesh(ground);
+        phys3d_destroy_world(w);
+        phys3d_destroy_compound(bell);
+        phys3d_destroy_hull(cube);
+        phys3d_destroy_hull(round);
+    }
+
+    // ---- 3D continuous collision: a whirling bar and a bullet against thin walls ----
+    {
+        int poked[2];
+        for (int pass = 0; pass < 2; pass++) {
+            phys3d_world w;
+            phys3d_create_world(w);
+            w.gravity = v3(0, 0, 0);
+            w.continuous = pass == 1;
+            phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(0.05f, 6, 6)), v3(0, 0, 0));   // 5 cm wall at x = 0
+            // a 2.4 m bar spinning in place near the wall: its tip would sweep through it every turn
+            phys3d_body bar = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(2.4f, 0.04f, 0.04f)), v3(-1.0f, 0, 0));
+            bar.rotation = quat_from_axis_angle(v3(0, 0, 1), PIX_PI * 0.5f);   // starts upright, clear of the wall
+            bar.angular_velocity = v3(0, 0, 150.0f);   // its ends move at 180 m/s
+            bar.angular_damping = 0.0f;
+            idx id = phys3d_add_body(w, bar);
+            poked[pass] = 0;
+            for (int i = 0; i < 60; i++) {
+                phys3d_step(w, 1.0f / 60.0f);
+                phys3d_body* b = phys3d_get_body(w, id);
+                vec3 tip = quat_rotate(b->rotation, v3(1.2f, 0, 0));
+                // a tip out past the far face while the centre is on the near side: through the wall
+                if (b->position.x < 0.0f && b->position.x + fabsf(tip.x) > 0.06f) poked[pass]++;
+            }
+            phys3d_destroy_world(w);
+        }
+        printf("info  whirling bar: frames through the wall without continuous %d, with %d\n", poked[0], poked[1]);
+        check(poked[1] == 0, "continuous: a whirling bar does not sweep through a thin wall");
+
+        phys3d_world w;
+        phys3d_create_world(w);
+        w.gravity = v3(0, 0, 0);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(0.02f, 6, 6)), v3(0, 0, 0));
+        phys3d_body bullet = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.01f), v3(-3, 0, 0));
+        bullet.velocity = v3(900.0f, 0, 0);
+        idx bid = phys3d_add_body(w, bullet);
+        for (int i = 0; i < 10; i++) phys3d_step(w, 1.0f / 60.0f);
+        check(phys3d_get_body(w, bid)->position.x < 0.0f, "continuous: a 900 m/s bullet stops at a 2 cm wall");
+        phys3d_destroy_world(w);
+    }
+
+    // ---- 3D joints: wheel, gear, pulley, motor, generic ----
+    {
+        const float dt = 1.0f / 60.0f;
+        // a car: a box on four wheel joints
+        phys3d_world w;
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        phys3d_body chassis_b = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(2.0f, 0.4f, 4.0f)), v3(0, 0.9f, 0));
+        chassis_b.density = 200.0f;
+        idx chassis = phys3d_add_body(w, chassis_b);
+        idx wheels[4], wj[4];
+        for (int i = 0; i < 4; i++) {
+            vec3 at = v3((i & 1) ? 1.2f : -1.2f, 0.4f, (i & 2) ? 1.5f : -1.5f);
+            phys3d_body wb = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_sphere(0.4f), at);
+            wb.density = 200.0f;
+            wb.friction = 1.0f;
+            wheels[i] = phys3d_add_body(w, wb);
+            wj[i] = phys3d_add_wheel(w, chassis, wheels[i], at, v3(0, 1, 0), v3(1, 0, 0));
+            phys3d_joint* j = phys3d_get_joint(w, wj[i]);
+            j->enable_limit = true; j->lower = -0.2f; j->upper = 0.2f;
+        }
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        float rest_y = phys3d_get_body(w, chassis)->position.y;
+        printf("info  car rests at chassis y %.3f\n", rest_y);
+        check(rest_y > 0.6f && rest_y < 0.95f, "car rests on its suspension");
+        // drive: wheels spin about +x at -10 rad/s, which rolls them toward -z... measure whichever way
+        for (int i = 0; i < 4; i++) {
+            phys3d_joint* j = phys3d_get_joint(w, wj[i]);
+            j->enable_motor = true; j->motor_speed = -10.0f; j->max_motor_force = 400.0f;
+        }
+        vec3 start = phys3d_get_body(w, chassis)->position;
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        vec3 moved = phys3d_get_body(w, chassis)->position - start;
+        printf("info  car drove %.2f m along z, drifted %.2f in x\n", moved.z, moved.x);
+        check(fabsf(moved.z) > 3.0f && fabsf(moved.x) < 0.3f, "car drives straight under its wheel motors");
+        // steer the front wheels: the car turns
+        for (int i = 2; i < 4; i++) phys3d_get_joint(w, wj[i])->steer = 0.4f;
+        quat before = phys3d_get_body(w, chassis)->rotation;
+        for (int i = 0; i < 90; i++) phys3d_step(w, dt);
+        quat after = phys3d_get_body(w, chassis)->rotation;
+        float yaw_change = 2.0f * acosf(clampf(fabsf(before.x * after.x + before.y * after.y + before.z * after.z + before.w * after.w), 0, 1));
+        printf("info  steering turned the car %.2f rad\n", yaw_change);
+        check(yaw_change > 0.2f, "car turns when steered");
+        check(phys3d_get_body(w, chassis)->position.y > 0.5f, "car stays upright on its wheels");
+        phys3d_destroy_world(w);
+
+        // gears: a driven wheel and a geared one, ratio 2
+        phys3d_create_world(w);
+        w.gravity = v3(0, 0, 0);
+        idx g1 = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.5f), v3(0, 0, 0));
+        idx g2 = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.5f), v3(3, 0, 0));
+        idx h1 = phys3d_add_hinge(w, PIX_INVALID, g1, v3(0, 0, 0), v3(0, 0, 1));
+        phys3d_add_hinge(w, PIX_INVALID, g2, v3(3, 0, 0), v3(0, 0, 1));
+        phys3d_add_gear(w, g1, g2, v3(0, 0, 1), v3(0, 0, 1), 2.0f);
+        phys3d_joint* motor = phys3d_get_joint(w, h1);
+        motor->enable_motor = true; motor->motor_speed = 3.0f; motor->max_motor_force = 100.0f;
+        for (int i = 0; i < 120; i++) phys3d_step(w, dt);
+        float s1 = phys3d_get_body(w, g1)->angular_velocity.z, s2 = phys3d_get_body(w, g2)->angular_velocity.z;
+        printf("info  gear: driver %.3f, follower %.3f rad/s\n", s1, s2);
+        near_eq(s2, -2.0f * s1, 0.05f, "gear: the follower turns at -ratio times the driver");
+        phys3d_destroy_world(w);
+
+        // a pulley: 1 kg against 3 kg; the heavy one sinks, the rope keeps its length
+        phys3d_create_world(w);
+        phys3d_body light = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(0.5f, 0.5f, 0.5f)), v3(-2, 2, 0));
+        light.density = 8.0f;
+        phys3d_body heavy = light; heavy.position = v3(2, 2, 0); heavy.density = 24.0f;
+        idx pl = phys3d_add_body(w, light), ph = phys3d_add_body(w, heavy);
+        phys3d_add_pulley(w, pl, ph, v3(-2, 6, 0), v3(2, 6, 0), v3(-2, 2.25f, 0), v3(2, 2.25f, 0), 1.0f);
+        for (int i = 0; i < 60; i++) phys3d_step(w, dt);
+        float yl = phys3d_get_body(w, pl)->position.y, yh = phys3d_get_body(w, ph)->position.y;
+        printf("info  pulley after 1 s: light %.3f heavy %.3f (sum %.3f, was 4)\n", yl, yh, yl + yh);
+        check(yl > 2.5f && yh < 1.5f, "pulley: the heavy side sinks and lifts the light one");
+        near_eq(yl + yh, 4.0f, 0.03f, "pulley: the rope keeps its length");
+        // a = (3 - 1) / (3 + 1) g: after 1 s each has moved a / 2
+        near_eq(yl - 2.0f, 0.5f * 0.5f * 9.81f, 0.15f, "pulley: Atwood's machine acceleration");
+        phys3d_destroy_world(w);
+
+        // motor joint: a body held 2 m to the side of a static post, with a capped force
+        phys3d_create_world(w);
+        w.gravity = v3(0, 0, 0);
+        idx post = phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(0.2f, 0.2f, 0.2f)), v3(0, 0, 0));
+        idx follower = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_sphere(0.3f), v3(5, 1, 0));
+        // the ball is 113 kg (water's density): 5 kN moves it smartly
+        idx mj = phys3d_add_motor_joint(w, post, follower, 5000.0f, 500.0f);
+        phys3d_get_joint(w, mj)->target = v3(2, 0, 0);
+        for (int i = 0; i < 240; i++) phys3d_step(w, dt);
+        vec3 fp = phys3d_get_body(w, follower)->position;
+        printf("info  motor joint brought the body to %.3f %.3f %.3f\n", fp.x, fp.y, fp.z);
+        check(v3dist(fp, v3(2, 0, 0)) < 0.05f, "motor joint: reaches its target offset");
+        phys3d_destroy_world(w);
+
+        // generic: all locked holds like a weld; angular z freed swings like a hinge
+        phys3d_create_world(w);
+        idx weld = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 0.2f, 0.2f)), v3(0.5f, 5, 0));
+        phys3d_add_generic(w, PIX_INVALID, weld, v3(0, 5, 0));
+        idx pend = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 0.2f, 0.2f)), v3(5.5f, 5, 0));
+        idx gj = phys3d_add_generic(w, PIX_INVALID, pend, v3(5, 5, 0));
+        phys3d_get_joint(w, gj)->axis_mode[5] = PHYS3D_AXIS_FREE;
+        float lowest = 10.0f, max_z = 0.0f;
+        for (int i = 0; i < 120; i++) {
+            phys3d_step(w, dt);
+            lowest = minf(lowest, phys3d_get_body(w, pend)->position.y);
+            max_z = maxf(max_z, fabsf(phys3d_get_body(w, pend)->position.z));
+        }
+        vec3 wp = phys3d_get_body(w, weld)->position;
+        printf("info  generic weld at %.3f %.3f; hinge swung down to y %.3f (max |z| %.4f)\n", wp.x, wp.y, lowest, max_z);
+        check(v3dist(wp, v3(0.5f, 5, 0)) < 0.03f, "generic joint, all locked: a weld");
+        check(lowest < 4.6f && max_z < 0.02f, "generic joint, angular z free: swings in its plane like a hinge");
+        phys3d_destroy_world(w);
+    }
+
+    // ---- 2D convex polygons ----
+    {
+        // a square given as a point cloud: the hull is the square, centred, with a box's mass
+        vec2 sq[9] = { v2(10, 10), v2(30, 10), v2(30, 30), v2(10, 30), v2(20, 20), v2(15, 25), v2(20, 10), v2(25, 15), v2(12, 28) };
+        phys2d_shape poly = phys2d_polygon(sq, 9);
+        check(poly.count == 4, "2d polygon: hull of a square's points is 4 corners");
+        near_eq(poly.offset.x, 20.0f, 1e-4f, "2d polygon: centred on its centroid");
+        phys2d_body pb = phys2d_make_body(PHYS2D_DYNAMIC, poly, v2(0, 0));
+        phys2d_body bb = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_box(20, 20), v2(0, 0));
+        phys2d_world w;
+        phys2d_create_world(w);
+        idx ip = phys2d_add_body(w, pb), ib = phys2d_add_body(w, bb);
+        near_eq(phys2d_get_body(w, ip)->inv_mass, phys2d_get_body(w, ib)->inv_mass, 1e-7f, "2d polygon square: same mass as the box");
+        near_eq(phys2d_get_body(w, ip)->inv_inertia, phys2d_get_body(w, ib)->inv_inertia, 1e-9f, "2d polygon square: same inertia as the box");
+        phys2d_destroy_world(w);
+        // many points on a circle: at most 8 corners kept
+        vec2 ring[40];
+        for (int i = 0; i < 40; i++) ring[i] = v2(cosf(i * PIX_TAU / 40), sinf(i * PIX_TAU / 40)) * 30.0f;
+        check(phys2d_polygon(ring, 40).count == PHYS2D_MAX_POLYGON, "2d polygon: a round cloud keeps 8 corners");
+        vec2 line[3] = { v2(0, 0), v2(1, 1), v2(2, 2) };
+        check(phys2d_polygon(line, 3).count == 0, "2d polygon: collinear points are refused");
+
+        // triangles and hexagons fall, land and stack on a floor
+        phys2d_create_world(w);
+        phys2d_add(w, PHYS2D_STATIC, phys2d_box(2000, 40), v2(0, 520));
+        vec2 tri[3] = { v2(-30, 20), v2(30, 20), v2(0, -32) };
+        vec2 hex[6];
+        for (int i = 0; i < 6; i++) hex[i] = v2(cosf(i * PIX_TAU / 6), sinf(i * PIX_TAU / 6)) * 20.0f;
+        idx t1 = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_polygon(tri, 3), v2(-200, 300));
+        idx hexes[5];
+        for (int i = 0; i < 5; i++) hexes[i] = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_polygon(hex, 6), v2(200, 480 - i * 36.0f));
+        for (int i = 0; i < 300; i++) phys2d_step(w, 1.0f / 60.0f);
+        phys2d_body* tb = phys2d_get_body(w, t1);
+        printf("info  2d triangle rests at y %.2f angle %.3f; hexagon stack top %.2f %.2f\n", tb->position.y, tb->angle,
+               phys2d_get_body(w, hexes[4])->position.x, phys2d_get_body(w, hexes[4])->position.y);
+        // a triangle with its centroid 52/3 above its base, base on the floor top (500)
+        near_eq(tb->position.y, 500.0f - 52.0f / 3.0f, 0.5f, "2d triangle lands on its long side");
+        check(fabsf(phys2d_get_body(w, hexes[4])->position.x - 200.0f) < 2.0f, "2d hexagons stack straight");
+        phys2d_ray_hit rh;
+        check(phys2d_raycast(w, v2(-200, 0), v2(0, 1), 1000, &rh) && rh.body == t1, "2d ray hits the triangle");
+        near_eq(rh.point.y, 500.0f - 52.0f, 0.6f, "2d ray stops on the triangle's tip");
+        phys2d_destroy_world(w);
+    }
+
+    // ---- 3D raycast vehicle ----
+    {
+        const float dt = 1.0f / 60.0f;
+        phys3d_world w;
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        phys3d_body cb = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(1.8f, 0.6f, 4.0f)), v3(0, 1.2f, 0));
+        cb.density = 280.0f;   // about 1.2 t
+        idx chassis = phys3d_add_body(w, cb);
+        phys3d_vehicle car = phys3d_make_vehicle(chassis);
+        for (int i = 0; i < 4; i++)
+            phys3d_vehicle_add_wheel(car, v3((i & 1) ? 0.8f : -0.8f, -0.2f, (i & 2) ? 1.4f : -1.4f), 0.35f, 0.3f);
+        phys3d_add_vehicle(w, car);
+        for (int i = 0; i < 180; i++) phys3d_update(w, dt);
+        phys3d_body* c = phys3d_get_body(w, chassis);
+        vec3 cup = quat_rotate(c->rotation, v3(0, 1, 0));
+        printf("info  car settles at y %.3f, level %.4f, wheels %d%d%d%d\n", c->position.y, cup.y,
+               car.wheels[0].contact, car.wheels[1].contact, car.wheels[2].contact, car.wheels[3].contact);
+        check(car.wheels[0].contact && car.wheels[3].contact && cup.y > 0.999f, "raycast car stands level on its four wheels");
+        check(c->position.y > 0.7f && c->position.y < 1.0f, "raycast car rides on its springs");
+        for (int i = 0; i < 2; i++) car.wheels[i].engine_force = 3000.0f;   // rear-wheel drive
+        for (int i = 0; i < 180; i++) phys3d_update(w, dt);
+        float speed = phys3d_vehicle_speed(w, car);
+        c = phys3d_get_body(w, chassis);
+        printf("info  car after 3 s of throttle: %.2f m/s, at %.2f %.2f\n", speed, c->position.x, c->position.z);
+        check(speed > 6.0f && fabsf(c->position.x) < 0.2f, "raycast car accelerates in a straight line");
+        quat before = c->rotation;
+        car.wheels[2].steer = car.wheels[3].steer = 0.3f;
+        for (int i = 0; i < 60; i++) phys3d_update(w, dt);
+        c = phys3d_get_body(w, chassis);
+        float turned = 2.0f * acosf(clampf(fabsf(before.x * c->rotation.x + before.y * c->rotation.y + before.z * c->rotation.z + before.w * c->rotation.w), 0, 1));
+        printf("info  car turned %.2f rad in 1 s of steering\n", turned);
+        check(turned > 0.3f, "raycast car turns when steered");
+        check(quat_rotate(c->rotation, v3(0, 1, 0)).y > 0.9f, "raycast car stays upright in the turn");
+        for (int i = 0; i < 4; i++) { car.wheels[i].engine_force = 0.0f; car.wheels[i].steer = 0.0f; car.wheels[i].brake = 6000.0f; }
+        for (int i = 0; i < 240; i++) phys3d_update(w, dt);
+        printf("info  car after braking: %.3f m/s\n", phys3d_vehicle_speed(w, car));
+        check(fabsf(phys3d_vehicle_speed(w, car)) < 0.1f, "raycast car brakes to a stop");
+        phys3d_destroy_world(w);
+    }
+
+    // ---- 3D character controller ----
+    {
+        const float dt = 1.0f / 60.0f;
+        phys3d_world w;
+        phys3d_create_world(w);
+        phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
+        // stairs along +z at x = 0: 6 steps of 0.25 m
+        for (int i = 0; i < 6; i++) phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(2, 0.25f * (i + 1), 1)), v3(0, 0.125f * (i + 1), 3.0f + i));
+        // a wall at x = 10
+        phys3d_add(w, PHYS3D_STATIC, phys3d_box(v3(0.5f, 3, 20)), v3(10, 1.5f, 0));
+        // a 60 degree ramp and a 20 degree ramp, both rising toward +z
+        phys3d_body steep = phys3d_make_body(PHYS3D_STATIC, phys3d_box(v3(2, 0.2f, 8)), v3(-6, 0, 4));
+        steep.rotation = quat_from_axis_angle(v3(1, 0, 0), -60.0f * PIX_DEG2RAD);
+        phys3d_add_body(w, steep);
+        phys3d_body gentle = phys3d_make_body(PHYS3D_STATIC, phys3d_box(v3(2, 0.2f, 8)), v3(-12, 0, 4));
+        gentle.rotation = quat_from_axis_angle(v3(1, 0, 0), -20.0f * PIX_DEG2RAD);
+        phys3d_add_body(w, gentle);
+
+        auto walk = [&](phys3d_character& c, vec3 v, int frames, bool jump_first = false) {
+            for (int i = 0; i < frames; i++) phys3d_character_update(w, c, v, jump_first && i == 0, dt);
+        };
+        phys3d_character up_stairs = phys3d_make_character(v3(0, 0, 0));
+        walk(up_stairs, v3(0, 0, 0), 10);
+        check(up_stairs.on_ground && fabsf(up_stairs.position.y) < 0.02f, "character stands on the ground");
+        walk(up_stairs, v3(0, 0, 3), 150);
+        printf("info  character after the stairs: %.2f %.2f %.2f ground %d\n", up_stairs.position.x, up_stairs.position.y, up_stairs.position.z, up_stairs.on_ground);
+        near_eq(up_stairs.position.y, 1.5f, 0.05f, "character climbs 25 cm stairs");
+        walk(up_stairs, v3(0, 0, -3), 150);
+        check(up_stairs.on_ground && fabsf(up_stairs.position.y) < 0.05f, "character walks back down the stairs on the ground");
+
+        phys3d_character runner = phys3d_make_character(v3(6, 0, 0));
+        walk(runner, v3(0, 0, 0), 5);
+        walk(runner, v3(4, 0, 2), 120);   // into the wall at an angle: stops at it, slides along
+        printf("info  character at the wall: %.2f %.2f %.2f\n", runner.position.x, runner.position.y, runner.position.z);
+        check(runner.position.x < 9.75f - 0.3f && runner.position.x > 9.75f - 0.4f, "character stops at a wall");
+        check(runner.position.z > 3.0f, "character slides along a wall it walks into at an angle");
+
+        phys3d_character climber = phys3d_make_character(v3(-6, 0, -2));
+        walk(climber, v3(0, 0, 0), 5);
+        walk(climber, v3(0, 0, 3), 180);
+        printf("info  character on the 60 degree ramp reached y %.2f\n", climber.position.y);
+        check(climber.position.y < 0.6f, "character cannot walk up a 60 degree slope");
+        phys3d_character hiker = phys3d_make_character(v3(-12, 0, -2));
+        walk(hiker, v3(0, 0, 0), 5);
+        walk(hiker, v3(0, 0, 3), 150);   // to z = 5.5: the ramp is about 0.65 m high there
+        printf("info  character on the 20 degree ramp reached y %.2f (z %.2f)\n", hiker.position.y, hiker.position.z);
+        check(hiker.position.y > 0.5f && hiker.on_ground, "character walks up a 20 degree slope");
+
+        phys3d_character jumper = phys3d_make_character(v3(20, 0, 0));
+        walk(jumper, v3(0, 0, 0), 5);
+        float peak = 0.0f;
+        for (int i = 0; i < 90; i++) { phys3d_character_update(w, jumper, v3(0, 0, 0), i == 0, dt); peak = maxf(peak, jumper.position.y); }
+        printf("info  jump peak %.3f (v^2 / 2g = %.3f)\n", peak, 25.0f / (2.0f * 9.81f));
+        near_eq(peak, 25.0f / (2.0f * 9.81f), 0.08f, "character jump reaches v^2 / 2g");
+        check(jumper.on_ground && jumper.position.y < 0.02f, "character lands");
+
+        // a platform sliding along x carries it; a crate it walks into gets shoved
+        phys3d_body plat = phys3d_make_body(PHYS3D_KINEMATIC, phys3d_box(v3(3, 0.5f, 3)), v3(30, 0.25f, 0));
+        plat.velocity = v3(2, 0, 0);
+        idx pid = phys3d_add_body(w, plat);
+        phys3d_character rider = phys3d_make_character(v3(30, 0.51f, 0));
+        phys3d_body crate_b = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(40, 0.5f, 5));
+        crate_b.density = 50.0f;   // 50 kg: a person can shove that
+        idx crate = phys3d_add_body(w, crate_b);
+        phys3d_character pusher = phys3d_make_character(v3(40, 0, 3));
+        phys3d_add_character_body(w, pusher);
+        for (int i = 0; i < 60; i++) {
+            phys3d_step(w, dt);
+            phys3d_character_update(w, rider, v3(0, 0, 0), false, dt);
+            phys3d_character_update(w, pusher, v3(0, 0, 2), false, dt);
+        }
+        printf("info  rider moved to x %.2f (platform %.2f), crate z %.2f\n", rider.position.x, phys3d_get_body(w, pid)->position.x,
+               phys3d_get_body(w, crate)->position.z);
+        near_eq(rider.position.x - 30.0f, phys3d_get_body(w, pid)->position.x - 30.0f, 0.1f, "character rides a moving platform");
+        check(phys3d_get_body(w, crate)->position.z > 5.3f, "character shoves a crate it walks into");
+        phys3d_destroy_world(w);
+    }
+
+    // ---- geometry pool holes: unloaded meshes leave ranges the next load reuses ----
+    {
+        pix__free_list f = {};
+        size_t cursor = 100, at = 0;
+        pix__free_give(f, 10, 10, cursor);                    // [10,20)
+        pix__free_give(f, 30, 10, cursor);                    // [30,40)
+        check(f.count == 2, "pool two separate holes");
+        pix__free_give(f, 20, 10, cursor);                    // joins both: [10,40)
+        check(f.count == 1 && f.ranges[0].start == 10 && f.ranges[0].count == 30, "pool hole merges both sides");
+        pix__free_give(f, 90, 10, cursor);                    // touches the cursor
+        check(cursor == 90 && f.count == 1, "pool a hole at the end lowers the cursor");
+        check(pix__free_take(f, 25, &at) && at == 10, "pool first fit takes the hole");
+        check(f.ranges[0].start == 35 && f.ranges[0].count == 5, "pool hole trimmed from the front");
+        check(!pix__free_take(f, 6, &at), "pool too big for any hole");
+        check(pix__free_take(f, 5, &at) && at == 35 && f.count == 0, "pool exact fit removes the hole");
+        pix__free_give(f, 40, 50, cursor);                    // [40,90) reaches cursor 90
+        check(cursor == 40 && f.count == 0, "pool freeing the last mesh shrinks to the high-water mark");
+        for (size_t i = 0; i < 40; i++) pix__free_give(f, i * 3 + 200, 1, cursor);   // past the first capacity
+        check(f.count == 40, "pool hole list grows");
+        pix_free(f.ranges);
+    }
+
+    // ---- tangents: +u along x, bitangent toward image-up (decreasing v) ----
+    {
+        vertex v[4] = {};
+        v[0].position = v3(-1, 0, -1); v[0].uv = v2(0, 0);
+        v[1].position = v3( 1, 0, -1); v[1].uv = v2(1, 0);
+        v[2].position = v3( 1, 0,  1); v[2].uv = v2(1, 1);
+        v[3].position = v3(-1, 0,  1); v[3].uv = v2(0, 1);
+        for (int i = 0; i < 4; i++) v[i].normal = v3(0, 1, 0);
+        uint32_t ind[6] = { 0, 2, 1, 0, 3, 2 };
+        check(pix_tangents_missing(v, 4, sizeof(vertex), offsetof(vertex, tangent)), "tangents missing before");
+        v[3].tangent = v4(0, 0, 1, 1);   // one already set: only_missing must keep it
+        pix_compute_tangents(v, 4, sizeof(vertex), offsetof(vertex, tangent), ind, 6, true);
+        near_eq(v[0].tangent.x, 1.0f, 1e-5f, "tangent follows +u");
+        vec3 b = v3scale(v3cross(v[0].normal, v3(v[0].tangent.x, v[0].tangent.y, v[0].tangent.z)), v[0].tangent.w);
+        near_eq(b.z, -1.0f, 1e-5f, "bitangent points up the image (-v)");
+        check(v[3].tangent.z == 1.0f, "only_missing keeps a set tangent");
+        pix_mesh_data md = pix_mesh_copy_data(v, 4, ind, 6);
+        pix_mesh_transform(md, mat4_scale(-1, 1, 1));   // a mirror flips handedness
+        check(md.vertices[0].tangent.w == -v[0].tangent.w && md.vertices[0].tangent.x < 0, "mirror flips tangent and sign");
+        pix_mesh_free(md);
+    }
+
+    // ---- HDR environment: SH diffuse and the .hdr decoder ----
+    {
+        const int W = 128, H = 64;
+        float* img = pix_new<float>(W * H * 3);
+        for (int i = 0; i < W * H * 3; i++) img[i] = 1.0f;
+        vec3 sh[9];
+        pix_environment_sh(img, W, H, sh);
+        // uniform radiance 1: irradiance pi, over pi = 1 from every side
+        near_eq(pix__sh_eval(sh, v3(0, 1, 0)).x, 1.0f, 0.01f, "sh uniform sky, up");
+        near_eq(pix__sh_eval(sh, v3(1, 0, 0)).y, 1.0f, 0.01f, "sh uniform sky, sideways");
+        for (int y = H / 2; y < H; y++) for (int x = 0; x < W * 3; x++) img[y * W * 3 + x] = 0.0f;   // dark below
+        pix_environment_sh(img, W, H, sh);
+        // a lit upper hemisphere: exactly 1 up, 0 down, 1/2 sideways; order 2 gets close
+        float up = pix__sh_eval(sh, v3(0, 1, 0)).x, down = pix__sh_eval(sh, v3(0, -1, 0)).x;
+        float side = pix__sh_eval(sh, v3(0, 0, 1)).x;
+        printf("info  sh half sky: up %.3f down %.3f side %.3f\n", up, down, side);
+        check(up > 0.9f && down < 0.1f, "sh half sky: lit from above only");
+        near_eq(side, 0.5f, 0.02f, "sh half sky: half from the side");
+        pix_free(img);
+
+        // one 8-pixel scanline, run-length encoded channel by channel
+        const char head[] = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 8\n";
+        unsigned char file[128];
+        size_t n = strlen(head);
+        memcpy(file, head, n);
+        const unsigned char line[] = { 2, 2, 0, 8,
+            128 + 8, 128,                         // r: a run of 8
+            8, 0, 32, 64, 96, 128, 160, 192, 224, // g: 8 literals
+            128 + 8, 0,                           // b
+            128 + 8, 129 };                       // e: 2^(129-136) = 1/128
+        memcpy(file + n, line, sizeof(line));
+        int w = 0, h = 0;
+        float* px = hdr_load_memory(file, n + sizeof(line), &w, &h);
+        check(px && w == 8 && h == 1, "hdr decodes an rle scanline");
+        if (px) {
+            near_eq(px[0], 1.0f, 1e-6f, "hdr red 128 at e 129 is 1.0");
+            near_eq(px[3 * 5 + 1], 160.0f / 128.0f, 1e-6f, "hdr literal green");
+            pix_free(px);
+        }
+        file[n + 4] = 128 + 9;   // a run past the line's end must fail, not overrun
+        check(!hdr_load_memory(file, n + sizeof(line), &w, &h), "hdr rejects a run past the line");
     }
 
     if (failures == 0) printf("all checks passed\n");

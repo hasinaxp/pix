@@ -53,6 +53,7 @@
 #include "loader/asset_types.hpp"
 #include "loader/png_loader.hpp"
 #include "loader/png_writer.hpp"
+#include "loader/hdr_loader.hpp"
 #include "loader/obj_loader.hpp"
 #include "loader/json.hpp"
 #include "loader/gltf_loader.hpp"

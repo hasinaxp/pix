@@ -6,10 +6,13 @@
 // Data model shared by the individual file loaders (obj/gltf/png) and by
 // data_loader.hpp, which owns the tables these get parsed into.
 
+// `tangent` is last so {position, normal, uv} initialisers keep working. Leave
+// it zero and the renderer derives it from the uvs when the mesh is loaded.
 struct vertex {
     vec3 position;
     vec3 normal;
     vec2 uv;
+    vec4 tangent;       // xyz along +u, w = +-1: bitangent = cross(normal, tangent) * w
 };
 
 struct vertex_rigged {
@@ -18,6 +21,7 @@ struct vertex_rigged {
     vec2 uv;
     vec4 bone_ids;      // indices into skeleton_file_data::bones (whole numbers held as floats)
     vec4 bone_weights;  // normalized, sums to 1
+    vec4 tangent;       // as vertex::tangent
 };
 
 // A named `g`/`o` run inside one OBJ file: a contiguous slice of the emitted
@@ -52,6 +56,19 @@ struct image_file_data {
     int   height;
     int   channel;
     char* data;
+};
+
+// A glTF material's metal/rough inputs beyond the base colour. Images are
+// indices into pix_data_loader::image_files, -1 when absent.
+struct pbr_file_data {
+    vec3    base_color;        // linear factor on the base texture (1,1,1 under a generated palette)
+    int32_t normal_image;     // tangent-space normals
+    int32_t orm_image;         // r occlusion, g roughness, b metallic (glTF packing)
+    int32_t emissive_image;    // sRGB
+    float   metallic, roughness;       // factors, multiplied with the map
+    float   normal_scale;
+    float   occlusion_strength;
+    vec3    emissive;          // linear factor
 };
 
 // decoded pcm, always 16-bit signed and interleaved, at the file's own rate
@@ -127,6 +144,7 @@ struct model_file_data {
     // a uv-mapped texture, so it must be sampled with NEAREST or neighbouring
     // cells bleed into each other
     bool    image_is_palette;
+    pbr_file_data pbr;
     // Where a single-node load's geometry stood in the file it came out of.
     //
     // A one-node load is re-based on that node's own origin (see

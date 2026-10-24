@@ -161,6 +161,17 @@ m->emissive = v3(4, 1, 0);   m->toon = 1;   m->unlit = true;   m->double_sided =
 | `int fx = pix_add_effect(PIX_EFFECT_CRT, v4(...));` | `GRAYSCALE`, `SEPIA`, `PIXELATE`, `CHROMATIC`, `CRT`, `OUTLINE`, `DEPTH_BLUR` |
 | `pix_effect_enable(fx, on)` | |
 | `pix_set_fog(r, color, density)` | `r` = `pix_get_renderer()` |
+| `pix_load_environment(r, "sky.hdr")` | HDR panorama: sky, reflections, ambient light |
+| `r.aa.taa = true;  r.aa.msaa = 4;` | temporal AA (default on), multisampling |
+| `pix_generate_mesh_lods(r, mesh)` | automatic levels of detail, cross-faded |
+
+| more 3D | |
+|---|---|
+| `pix_draw_mesh(m, mat, t, tint, motion_id)` | a `motion_id` keeps fast movers sharp under TAA |
+| `pix_draw_billboard(tex, pos, height)` | picture facing the camera (`PIX_FACE_UPRIGHT`: trees) |
+| `pix_draw_text3d("Bob", pos, 0.25f, PIX_WHITE)` | text in the world |
+| `pix_unload_model(model)`, `pix_unload_sound(id)` | free what a level no longer needs |
+| `pix_screenshot("shot.png")` | saves this frame |
 
 | debug and picking | |
 |---|---|
@@ -222,7 +233,7 @@ value_noise2(x, y, seed)   fbm2(x, y, octaves, seed)    // smooth noise, 0..1
 phys2d_world w;  phys2d_create_world(w);                 // gravity (0, 980): pixels, y down
 phys2d_add(w, PHYS2D_STATIC, phys2d_box(800, 40), v2(400, 600));
 idx id = phys2d_add(w, PHYS2D_DYNAMIC, phys2d_circle(16), v2(400, 0));
-// shapes: phys2d_circle(r)  phys2d_box(w, h)  phys2d_aabb(w, h)  phys2d_capsule(r, h)
+// shapes: phys2d_circle(r)  phys2d_box(w, h)  phys2d_aabb(w, h)  phys2d_capsule(r, h)  phys2d_polygon(points, n)
 // types:  PHYS2D_STATIC  PHYS2D_DYNAMIC  PHYS2D_KINEMATIC
 
 phys2d_body b = phys2d_make_body(PHYS2D_DYNAMIC, phys2d_capsule(16, 64), pos);
@@ -249,10 +260,17 @@ phys3d_add(w, PHYS3D_STATIC, phys3d_plane(v3(0, 1, 0)), v3(0, 0, 0));
 idx crate = phys3d_add(w, PHYS3D_DYNAMIC, phys3d_box(v3(1, 1, 1)), v3(0, 3, 0));
 // shapes: phys3d_sphere(r)  phys3d_box(size)  phys3d_capsule(r, h)  phys3d_plane(n)  phys3d_mesh_shape(mesh)
 phys3d_mesh terrain;  phys3d_create_heightfield(terrain, heights, cols, rows, 1.0f);
+phys3d_hull h;  phys3d_create_hull(h, points, n);           // any convex shape: phys3d_hull_shape(h)
+phys3d_compound c;  phys3d_create_compound(c, parts, n);    // several shapes, one body: phys3d_compound_shape(c)
+pix_draw_model(rock, phys3d_body_draw_transform(w, *b));    // hulls/compounds: lines the model up
 
 phys3d_update(w, pix_dt());
 pix_draw_mesh(cube, mat, phys3d_body_transform(w, *phys3d_get_body(w, crate)));
-// joints: phys3d_add_ball / _hinge / _slider / _fixed / _distance / _mouse
+// joints: phys3d_add_ball / _hinge / _slider / _fixed / _distance / _mouse / _wheel / _motor_joint / _gear / _pulley / _generic
+phys3d_vehicle car = phys3d_make_vehicle(chassis);  phys3d_vehicle_add_wheel(car, attach, 0.35f, 0.3f);  phys3d_add_vehicle(w, car);
+car.wheels[0].engine_force = 3000;  car.wheels[2].steer = 0.3f;  car.wheels[1].brake = 6000;
+phys3d_character hero = phys3d_make_character(feet);       // walks, slides, steps, slopes
+phys3d_character_update(w, hero, walk_velocity, jump, pix_dt());
 phys3d_raycast(w, from, dir, max, &hit);   phys3d_overlap_sphere(w, c, r, out, cap);
 pix_draw_physics3d(w);                                    // debug view
 ```

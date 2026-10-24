@@ -79,6 +79,8 @@ and throwing balls. Build it with `build physics_3d run`.
 | `phys3d_capsule(radius, height)` | a pill standing along the body's y axis, `height` from top to bottom | any |
 | `phys3d_plane(normal)` | an endless flat floor (or wall) through the body's position | static, kinematic |
 | `phys3d_mesh_shape(mesh)` | triangles: a level, a terrain | static, kinematic |
+| `phys3d_hull_shape(hull)` | any convex shape: a rock, a crate's model, a car body | any |
+| `phys3d_compound_shape(compound)` | several shapes as one body: a table, a hammer, a boat | any |
 
 A body's `position` is its centre (for a plane, any point on it), and its
 `rotation` is a quaternion (`quat_from_axis_angle(axis, radians)`).
@@ -110,6 +112,54 @@ Mesh triangles are **one-sided**. A triangle's front is the side its corners
 run counter-clockwise from. Bodies collide with the front and pass through
 from behind, so something that ends up under the terrain falls out instead
 of getting stuck. Rays from behind pass through too.
+
+### Convex hulls: any convex shape
+
+A hull is the tightest convex shape around a set of points - usually the
+vertices of the model you draw. Build it once, keep it alive while bodies use
+it:
+
+```cpp
+phys3d_hull rock_hull;
+phys3d_create_hull(rock_hull, rock_vertices, rock_vertex_count);   // vec3 points, any order
+idx rock = phys3d_add(world, PHYS3D_DYNAMIC, phys3d_hull_shape(rock_hull), v3(0, 3, 0));
+// ...
+phys3d_destroy_hull(rock_hull);
+```
+
+Hulls tumble, stack and rest like boxes do. A hull keeps at most
+`PHYS3D_MAX_HULL_VERTICES` (256) corners; fewer is faster - 20 to 60 is
+plenty for most props. It must not be flat.
+
+A hull is centred on its **centre of mass**, which is usually not where your
+model's origin is. `rock_hull.offset` is where that centre sat among your
+points. Draw the model with `phys3d_body_draw_transform`, which undoes the
+offset for you:
+
+```cpp
+pix_draw_model(rock_model, phys3d_body_draw_transform(world, *phys3d_get_body(world, rock)));
+```
+
+### Compounds: several shapes, one body
+
+```cpp
+phys3d_compound_child parts[] = {
+    phys3d_child(phys3d_box(v3(2, 0.1f, 1)), v3(0, 0.75f, 0)),        // the top
+    phys3d_child(phys3d_box(v3(0.1f, 0.7f, 0.1f)), v3(-0.9f, 0.35f, -0.4f)),   // the legs...
+    phys3d_child(phys3d_box(v3(0.1f, 0.7f, 0.1f)), v3( 0.9f, 0.35f, -0.4f)),
+    phys3d_child(phys3d_box(v3(0.1f, 0.7f, 0.1f)), v3(-0.9f, 0.35f,  0.4f)),
+    phys3d_child(phys3d_box(v3(0.1f, 0.7f, 0.1f)), v3( 0.9f, 0.35f,  0.4f)),
+};
+phys3d_compound table;
+phys3d_create_compound(table, parts, 5);
+idx t = phys3d_add(world, PHYS3D_DYNAMIC, phys3d_compound_shape(table), v3(0, 2, 0));
+```
+
+Parts can be spheres, boxes, capsules and hulls (each with its own position
+and rotation in the compound). Like a hull, a compound is centred on its
+centre of mass (`table.offset`), its weight is spread the way its parts are
+- a hammer falls head first - and `phys3d_body_draw_transform` gives the
+transform for the model you built it from.
 
 ## Body types
 
@@ -172,6 +222,40 @@ the world, call `phys3d_update_mass(world, id)`.
 - **Teleport it:** `phys3d_teleport(world, id, position, rotation)`.
 
 ### A walking character
+
+The character controller is usually what you want: a capsule that is not
+simulated, but goes where you tell it as far as the world allows. It slides
+along walls, climbs steps, walks up gentle slopes and stops at steep ones,
+stays on the ground going down stairs, rides moving platforms and shoves
+crates:
+
+```cpp
+phys3d_character hero = phys3d_make_character(v3(0, 0, 0));   // feet position; radius 0.35, height 1.8
+phys3d_add_character_body(world, hero);    // optional: dynamic bodies bump into it, rays see it
+
+// each frame
+vec2 in = pix_input_axis();
+vec3 walk = v3(in.x, 0, -in.y) * 5.0f;                       // metres per second
+phys3d_character_update(world, hero, walk, pix_key_pressed(KEY_SPACE), pix_dt());
+pix_draw_model(hero_model, mat4_translate(hero.position.x, hero.position.y, hero.position.z));
+// hero.on_ground, hero.ground_normal, hero.velocity (what it really moved)
+```
+
+| field | default | |
+|---|---|---|
+| `max_slope` | 50 degrees | steeper ground is a wall |
+| `step_height` | 0.35 m | ledges it walks up without jumping |
+| `snap_distance` | 0.35 m | how far down it follows the ground |
+| `jump_speed` | 5 m/s | |
+| `push_force` | 600 N | how hard it shoves dynamic bodies |
+| `mask` | everything | what stops it |
+
+`phys3d_character_move(world, hero, displacement)` is the lower level: it
+moves by exactly that much (sliding and stepping), and gravity and jumping are
+yours.
+
+If you want the character to be a real physics body instead (pushed by
+explosions, knocked over), use a capsule with `fixed_rotation`:
 
 ```cpp
 phys3d_body p = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_capsule(0.35f, 1.8f), v3(0, 0.9f, 0));
@@ -253,6 +337,11 @@ and axes are given in world space, at the bodies' current poses.
 | `phys3d_add_fixed(w, a, b, anchor)` | glues two bodies together | breakable things, attachments |
 | `phys3d_add_distance(w, a, b, anchor_a, anchor_b)` | keeps two points apart | rods, springs, ropes |
 | `phys3d_add_mouse(w, body, grab)` | pulls the point under `grab` toward `target` | picking things up |
+| `phys3d_add_wheel(w, chassis, wheel, centre, suspension, spin)` | a sprung, steerable, driven wheel | cars built from bodies, carts |
+| `phys3d_add_motor_joint(w, a, b, max_force, max_torque)` | pulls b toward a pose relative to a, within limits | moving platforms carrying things, a character's root following animation |
+| `phys3d_add_gear(w, a, b, axis_a, axis_b, ratio)` | two spins locked: `ratio` turns of a for one of b, opposite ways | gears, belts |
+| `phys3d_add_pulley(w, a, b, ground_a, ground_b, anchor_a, anchor_b, ratio)` | two ropes over fixed points | lifts, counterweights |
+| `phys3d_add_generic(w, a, b, anchor, frame)` | six axes, each locked, free or limited | anything the others are not |
 
 `phys3d_get_joint(w, id)` gives the joint to edit, and
 `phys3d_remove_joint(w, id)` removes it. Jointed bodies don't collide with each
@@ -269,6 +358,16 @@ All off until turned on:
 | `enable_motor`, `motor_speed`, `max_motor_force` | | speed (rad/s), torque (N·m) | speed (m/s), force (N) | |
 | `enable_spring`, `hertz`, `damping_ratio` | | | | spring at `length` |
 
+The wheel joint uses `enable_spring`, `hertz` (5) and `damping_ratio` (0.7)
+for its suspension, `enable_limit` / `lower` / `upper` for its travel,
+`enable_motor` / `motor_speed` / `max_motor_force` to drive it and `steer`
+(radians) to turn it. The motor joint aims for `target` (b's offset in a's
+frame) and `relative_rotation`. The generic joint starts as a weld: open axes
+with `axis_mode[i]` (`PHYS3D_AXIS_FREE`, `_LOCKED`, `_LIMITED`; 0-2 linear
+x y z, 3-5 angular), limits in `axis_lower` / `axis_upper`, motors in
+`axis_motor_speed` / `axis_motor_force`. Its angles are X-Y-Z Euler angles,
+so keep the middle (y) one within +-80 degrees.
+
 `phys3d_hinge_angle(w, joint)` reads a hinge's current angle. Springs, ropes,
 the soft fixed joint (`hertz` > 0), the mouse joint and `break_force` all work
 the same way as in 2D ([2D physics: joints](physics-2d.md#joints)).
@@ -281,6 +380,46 @@ hips, neck) and hinges with limits (elbows, knees). `add_ragdoll` in
 phys3d_joint* knee = phys3d_get_joint(w, phys3d_add_hinge(w, thigh, shin, knee_point, v3(1, 0, 0)));
 knee->enable_limit = true;  knee->lower = 0;  knee->upper = 2.4f;     // bends one way only
 ```
+
+## Vehicles
+
+The usual game car is one body for the chassis and a ray per wheel - cheaper
+and steadier at speed than wheel bodies on joints:
+
+```cpp
+phys3d_body body = phys3d_make_body(PHYS3D_DYNAMIC, phys3d_box(v3(1.8f, 0.6f, 4)), v3(0, 1.2f, 0));
+body.density = 280;                                   // about 1.2 tonnes
+idx chassis = phys3d_add_body(world, body);
+phys3d_vehicle car = phys3d_make_vehicle(chassis);    // forward is the chassis's +z, up its +y
+for (int i = 0; i < 4; i++)                           // where each suspension hangs, wheel radius, spring length
+    phys3d_vehicle_add_wheel(car, v3(i & 1 ? 0.8f : -0.8f, -0.2f, i & 2 ? 1.4f : -1.4f), 0.35f, 0.3f);
+phys3d_add_vehicle(world, car);                       // keep `car` alive while added
+
+// each frame, before phys3d_update
+car.wheels[0].engine_force = car.wheels[1].engine_force = throttle * 3000;   // newtons, rear wheels
+car.wheels[2].steer = car.wheels[3].steer = steering * 0.5f;                 // radians, front wheels
+for (int i = 0; i < 4; i++) car.wheels[i].brake = braking * 6000;
+// draw: the chassis with phys3d_body_transform, wheel i with phys3d_vehicle_wheel_transform(world, car, i)
+```
+
+Springs default to holding the car's weight 10 cm compressed. Per wheel:
+`stiffness`, `damping`, `max_travel`, `friction` (grip), `roll_influence`
+(lower keeps it from rolling over in corners). Read back `contact`,
+`suspension_length`, `skid` (0 gripping .. 1 sliding: skid marks, squeal) and
+`phys3d_vehicle_speed(world, car)`.
+
+The vehicle runs inside every physics step through an **action**:
+`phys3d_add_action(world, fn, user)` runs your own `fn(world, dt, user)` the
+same way, for buoyancy, wind or anything else that should push bodies every
+step.
+
+## Fast and spinning bodies
+
+A body that moves or turns farther in one step than it is thick could pass
+through a thin wall. `world.continuous` (on) catches that against static and
+kinematic bodies: it sweeps the body's motion, turning included, and stops it
+where it would first touch. A bullet at 900 m/s stops at a 2 cm wall; a long
+spinning blade does not slice through.
 
 ## Sleeping
 
@@ -388,10 +527,14 @@ and nothing escapes. A 12-box stack stands and sleeps, and an 80:1 mass ratio
 | `PHYS3D_MAX_BODIES` | 4096 |
 | `PHYS3D_MAX_JOINTS` | 4096 |
 
-Not done yet: convex hulls and compound bodies (several shapes on one
-body), gyroscopic effects, threading, continuous collision for fast-spinning
-bodies, and smoothing of the small bumps a box can catch on where two mesh
-triangles meet.
+| `PHYS3D_MAX_HULL_VERTICES` | 256 corners per hull |
+| `PHYS3D_MAX_VEHICLE_WHEELS` | 8 |
+| `PHYS3D_MAX_ACTIONS` | 32 |
+
+Not done yet: gyroscopic effects, threading, continuous collision between two
+moving bodies (it covers moving against static and kinematic), and smoothing
+of the small bumps a box can catch on where two mesh triangles meet. A query
+shape (shape cast, overlap) cannot be a compound.
 
 ## Reference
 
@@ -404,7 +547,13 @@ triangles meet.
 | `idx phys3d_add(w, type, shape, position)`, `phys3d_make_body(type, shape, position)`, `phys3d_add_body(w, body)` | |
 | `phys3d_get_body(w, id)`, `phys3d_remove_body(w, id)`, `phys3d_update_mass(w, id)`, `phys3d_teleport(w, id, p, q)`, `phys3d_wake(w, id)` | |
 | `phys3d_apply_force`, `_impulse`, `_torque`, `_angular_impulse`, `_force_centre`, `_impulse_centre` | |
-| `phys3d_body_transform(w, b)`, `phys3d_lerp_position(w, b)`, `phys3d_lerp_rotation(w, b)` | for drawing |
+| `phys3d_body_transform(w, b)`, `phys3d_body_draw_transform(w, b)`, `phys3d_lerp_position(w, b)`, `phys3d_lerp_rotation(w, b)` | for drawing |
+| `phys3d_create_hull(h, points, count)`, `phys3d_destroy_hull(h)`, `phys3d_hull_shape(h)` | convex hulls |
+| `phys3d_create_compound(c, children, count)`, `phys3d_destroy_compound(c)`, `phys3d_child(shape, pos, rot)`, `phys3d_compound_shape(c)` | compounds |
+| `phys3d_add_wheel`, `_motor_joint`, `_gear`, `_pulley`, `_generic` | more joints |
+| `phys3d_make_vehicle(chassis)`, `phys3d_vehicle_add_wheel(v, attach, radius, rest)`, `phys3d_add_vehicle(w, v)`, `phys3d_remove_vehicle(w, v)`, `phys3d_vehicle_wheel_transform(w, v, i)`, `phys3d_vehicle_speed(w, v)` | raycast vehicle |
+| `phys3d_make_character(feet, radius, height)`, `phys3d_character_update(w, c, walk, jump, dt)`, `phys3d_character_move(w, c, d)`, `phys3d_add_character_body(w, c)` | character controller |
+| `phys3d_add_action(w, fn, user)`, `phys3d_remove_action(w, handle)` | code that runs every step |
 | `phys3d_add_ball`, `_hinge`, `_slider`, `_fixed`, `_distance`, `_mouse`, `phys3d_add_joint(w, joint)` | |
 | `phys3d_get_joint(w, id)`, `phys3d_remove_joint(w, id)`, `phys3d_joint_anchors(w, j, &a, &b)`, `phys3d_hinge_angle(w, j)` | |
 | `phys3d_raycast(w, origin, dir, max, &hit, mask, ignore)` | |
